@@ -99,6 +99,13 @@ kk_encoder_start_render(struct kk_cmd_buffer *cmd,
                             0u, 1u);
       mtl_set_fragment_buffer(encoder->main.encoder,
                               dev->samplers.table.bo->map, 0u, 1u);
+
+      /* limina: fresh encoder = fresh binding tables — drop the bind cache. */
+      struct kk_graphics_state *gfx = &cmd->state.gfx;
+      memset(&gfx->bind_cache_v0, 0, sizeof(gfx->bind_cache_v0));
+      memset(&gfx->bind_cache_f0, 0, sizeof(gfx->bind_cache_f0));
+      memset(&gfx->bind_cache_v2, 0, sizeof(gfx->bind_cache_v2));
+      memset(&gfx->bind_cache_f2, 0, sizeof(gfx->bind_cache_f2));
    }
    encoder->main.last_used = KK_ENC_RENDER;
    return encoder->main.encoder;

@@ -275,6 +275,26 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   switch (pool->vk.query_type) {
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+      /* Accumulated CPU-side per draw (command replay is sequential). */
+      cmd->state.gfx.xfb.pg_pool = pool;
+      cmd->state.gfx.xfb.pg_query = query;
+      cmd->state.gfx.xfb.pg_count = 0;
+      return;
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      cmd->state.gfx.xfb.tf_pool = pool;
+      cmd->state.gfx.xfb.tf_query = query;
+      cmd->state.gfx.xfb.tf_written = 0;
+      cmd->state.gfx.xfb.tf_needed = 0;
+      if (getenv("LIMINA_KK_RTLOG"))
+         fprintf(stderr, "[LIMINA-KK-XFB] BeginQuery(tf) q=%u\n", query);
+      return;
+   default:
+      break;
+   }
+
    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
@@ -283,12 +303,66 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->state.gfx.occlusion.index = oq_index[query];
 }
 
+/* Write a CPU-computed query result. The value is final at replay time, but
+ * it must be written in GPU command order: vkCmdResetQueryPool is a GPU
+ * dispatch, so a host-side store here would be clobbered when the GPU later
+ * executes a reset recorded BEFORE this query. Route the stores through the
+ * imm-write list (flushed before query copies at every encoder transition).
+ */
+static void
+kk_query_write_cpu_result(struct kk_cmd_buffer *cmd,
+                          struct kk_query_pool *pool, uint32_t query,
+                          const uint64_t *values, uint32_t value_count)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   uint64_t report_addr = kk_query_report_addr(dev, pool, query);
+
+   assert(value_count == kk_reports_per_query(pool));
+   for (uint32_t i = 0; i < value_count; i++) {
+      kk_cmd_write(cmd, (struct libkk_imm_write){
+                           report_addr + i * sizeof(struct kk_query_report),
+                           (uint32_t)values[i]});
+      kk_cmd_write(cmd, (struct libkk_imm_write){
+                           report_addr + i * sizeof(struct kk_query_report) +
+                              sizeof(uint32_t),
+                           (uint32_t)(values[i] >> 32)});
+   }
+
+   if (kk_has_available(pool)) {
+      uint64_t addr = kk_query_available_addr(pool, query);
+      kk_cmd_write(cmd, (struct libkk_imm_write){addr, 1});
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                uint32_t query)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   switch (pool->vk.query_type) {
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      uint64_t value = cmd->state.gfx.xfb.pg_count;
+      kk_query_write_cpu_result(cmd, pool, query, &value, 1);
+      cmd->state.gfx.xfb.pg_pool = NULL;
+      return;
+   }
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
+      uint64_t values[2] = {cmd->state.gfx.xfb.tf_written,
+                            cmd->state.gfx.xfb.tf_needed};
+      kk_query_write_cpu_result(cmd, pool, query, values, 2);
+      if (getenv("LIMINA_KK_RTLOG"))
+         fprintf(stderr, "[LIMINA-KK-XFB] EndQuery(tf) q=%u written=%llu needed=%llu\n",
+                 query, (unsigned long long)values[0],
+                 (unsigned long long)values[1]);
+      cmd->state.gfx.xfb.tf_pool = NULL;
+      return;
+   }
+   default:
+      break;
+   }
+
    cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
 
@@ -297,6 +371,24 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
       uint64_t addr = kk_query_available_addr(pool, query);
       kk_cmd_write(cmd, (struct libkk_imm_write){addr, true});
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer,
+                           VkQueryPool queryPool, uint32_t query,
+                           VkQueryControlFlags flags, uint32_t index)
+{
+   /* Only vertex stream 0 exists (no geometry shaders). */
+   assert(index == 0);
+   kk_CmdBeginQuery(commandBuffer, queryPool, query, flags);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                         uint32_t query, uint32_t index)
+{
+   assert(index == 0);
+   kk_CmdEndQuery(commandBuffer, queryPool, query);
 }
 
 static bool

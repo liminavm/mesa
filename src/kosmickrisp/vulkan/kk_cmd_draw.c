@@ -27,6 +27,75 @@
 #include "vulkan/runtime/vk_render_pass.h"
 #include "vulkan/util/vk_format.h"
 
+/* limina: NEVER getenv on a draw path — it takes the environ lock and
+ * serializes the thread (leaf samples undercount it badly). Presence-tested
+ * opt-in debug knob, cached once. */
+static inline bool
+kk_limina_rtlog(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RTLOG") != NULL;
+   return v;
+}
+
+/* limina: hot per-draw buffer rebinds. The root table (index 0) and per-draw
+ * data (index 2) live in the upload pool, so consecutive draws bind the SAME
+ * MTLBuffer at a new offset — Metal's setBufferOffset skips setBuffer's
+ * residency/binding-table work, and a fully unchanged bind is skipped
+ * outright. Per-encoder cache in kk_graphics_state, zeroed on encoder
+ * creation. LIMINA_KK_FASTBIND=0 restores plain setBuffer calls. */
+static inline bool
+kk_limina_fastbind(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_FASTBIND");
+      v = !e || e[0] != '0';
+   }
+   return v;
+}
+
+static inline void
+kk_bind_vbuf_cached(mtl_render_encoder *enc, struct kk_bound_buf *slot,
+                    mtl_buffer *buf, uint32_t offset, uint32_t index)
+{
+   if (!kk_limina_fastbind()) {
+      mtl_set_vertex_buffer(enc, buf, offset, index);
+      return;
+   }
+   if (slot->buf == buf) {
+      if (slot->offset != offset) {
+         mtl_set_vertex_buffer_offset(enc, offset, index);
+         slot->offset = offset;
+      }
+   } else {
+      mtl_set_vertex_buffer(enc, buf, offset, index);
+      slot->buf = buf;
+      slot->offset = offset;
+   }
+}
+
+static inline void
+kk_bind_fbuf_cached(mtl_render_encoder *enc, struct kk_bound_buf *slot,
+                    mtl_buffer *buf, uint32_t offset, uint32_t index)
+{
+   if (!kk_limina_fastbind()) {
+      mtl_set_fragment_buffer(enc, buf, offset, index);
+      return;
+   }
+   if (slot->buf == buf) {
+      if (slot->offset != offset) {
+         mtl_set_fragment_buffer_offset(enc, offset, index);
+         slot->offset = offset;
+      }
+   } else {
+      mtl_set_fragment_buffer(enc, buf, offset, index);
+      slot->buf = buf;
+      slot->offset = offset;
+   }
+}
+
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
 {
@@ -709,11 +778,10 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
 }
 
 static inline uint32_t
-kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
+kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, uint32_t elsize_B,
                        uint32_t size_B, uint32_t stride_B, uint32_t offset_B,
                        uint64_t *vbuf_out)
 {
-   unsigned elsize_B = util_format_get_blocksize(format);
    unsigned subtracted_B = offset_B + elsize_B;
 
    /* If at least one index is valid, determine the max. Otherwise, direct reads
@@ -1266,6 +1334,18 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
        IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB) {
       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+
+      /* limina: format block sizes change only with VI state, not with vertex
+       * buffer binds — and VB binds re-enter this branch per draw on real
+       * (zink) streams. Cache them so the per-bind path skips the
+       * vk_format_to_pipe_format/util_format_description chain. */
+      if (IS_DIRTY(VI)) {
+         u_foreach_bit(i, dyn->vi->attributes_valid) {
+            gfx->attrib_elsize_B[i] = util_format_get_blocksize(
+               vk_format_to_pipe_format(dyn->vi->attributes[i].format));
+         }
+      }
+
       unsigned slot = 0;
       u_foreach_bit(i, vs->info.vs.attribs_read) {
          if (dyn->vi->attributes_valid & BITFIELD_BIT(i)) {
@@ -1273,9 +1353,31 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
             struct kk_addr_range vb = gfx->vb.addr_range[attr.binding];
 
             desc->root.draw.attrib_clamps[slot] = kk_calculate_vbo_clamp(
-               vb.addr, 0, vk_format_to_pipe_format(attr.format), vb.range,
+               vb.addr, 0, gfx->attrib_elsize_B[i], vb.range,
                dyn->vi_binding_strides[attr.binding], attr.offset,
                &desc->root.draw.attrib_base[slot]);
+            if (kk_limina_rtlog()) {
+               mtl_buffer *h = gfx->vb.handles[attr.binding];
+               const float *cf = NULL;
+               if (h) {
+                  uint64_t gpu_base = mtl_buffer_get_gpu_address(h);
+                  char *cpu = (char *)mtl_get_contents(h);
+                  if (cpu && vb.addr >= gpu_base)
+                     cf = (const float *)(cpu + (vb.addr - gpu_base));
+               }
+               fprintf(stderr,
+                       "[LIMINA-KK-ATTR] slot=%u binding=%u vb.addr=0x%llx range=%llu "
+                       "stride=%u attroff=%u -> base=0x%llx clamp=%u data=(%.1f %.1f "
+                       "%.1f %.1f %.1f %.1f %.1f %.1f)\n",
+                       slot, attr.binding, (unsigned long long)vb.addr,
+                       (unsigned long long)vb.range,
+                       dyn->vi_binding_strides[attr.binding], attr.offset,
+                       (unsigned long long)desc->root.draw.attrib_base[slot],
+                       desc->root.draw.attrib_clamps[slot],
+                       cf ? cf[0] : -99, cf ? cf[1] : -99, cf ? cf[2] : -99,
+                       cf ? cf[3] : -99, cf ? cf[4] : -99, cf ? cf[5] : -99,
+                       cf ? cf[6] : -99, cf ? cf[7] : -99);
+            }
             desc->root.draw.buffer_strides[attr.binding] =
                dyn->vi_binding_strides[attr.binding];
          }
@@ -1289,8 +1391,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
 
    struct kk_ptr root_buffer = desc->root.root_buffer;
    if (root_buffer.gpu) {
-      mtl_set_vertex_buffer(enc, root_buffer.buffer, root_buffer.offset, 0);
-      mtl_set_fragment_buffer(enc, root_buffer.buffer, root_buffer.offset, 0);
+      kk_bind_vbuf_cached(enc, &gfx->bind_cache_v0, root_buffer.buffer,
+                          root_buffer.offset, 0);
+      kk_bind_fbuf_cached(enc, &gfx->bind_cache_f0, root_buffer.buffer,
+                          root_buffer.offset, 0);
    }
 
    if (gfx->dirty & KK_DIRTY_OCCLUSION) {
@@ -1590,6 +1694,20 @@ requires_unroll_restart(struct kk_cmd_buffer *cmd,
        * restart flag enabled while using list primitives without any restarts,
        * and in these cases we can avoid the cost of unroll, even though they
        * are technically against spec. */
+      /* limina: WebGL2/GLES3 mandate always-on restart, so zink sets
+       * restartEnable on EVERY indexed draw and each list draw pays a full
+       * GPU index-unroll even when no restart index is present (the common
+       * case; round 17: 16→60fps on the aquarium). Default ON;
+       * LIMINA_KK_NOLISTRESTART=0 restores the spec-strict unroll. */
+      {
+         static int limina_skip = -1;
+         if (limina_skip < 0) {
+            const char *e = getenv("LIMINA_KK_NOLISTRESTART");
+            limina_skip = !e || e[0] != '0';
+         }
+         if (limina_skip)
+            return false;
+      }
       return dev->vk.enabled_features.primitiveTopologyListRestart;
    default:
       break;
@@ -1703,25 +1821,39 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
       }
    }
 
-   struct kk_ptr shader_data_gpu =
-      kk_pool_upload(cmd, &gfx->per_draw_data, sizeof(gfx->per_draw_data), 8u);
-   if (unlikely(!shader_data_gpu.gpu))
-      return;
+   /* limina: non-tess draws usually repeat the same per-draw content (draw_id
+    * varies only across multidraw), so the upload can reuse the previous pool
+    * location — pool data is immutable for the life of the cmd buffer. Tess
+    * never matches (it pool-allocs fresh param addresses into the struct
+    * above). */
+   struct kk_ptr shader_data_gpu;
+   if (kk_limina_fastbind() && !tess && gfx->per_draw_gpu.gpu &&
+       memcmp(&gfx->per_draw_data, &gfx->last_per_draw_data,
+              sizeof(gfx->per_draw_data)) == 0) {
+      shader_data_gpu = gfx->per_draw_gpu;
+   } else {
+      shader_data_gpu = kk_pool_upload(cmd, &gfx->per_draw_data,
+                                       sizeof(gfx->per_draw_data), 8u);
+      if (unlikely(!shader_data_gpu.gpu))
+         return;
+      gfx->per_draw_gpu = shader_data_gpu;
+      gfx->last_per_draw_data = gfx->per_draw_data;
+   }
 
    mtl_render_encoder *enc = kk_render_encoder(cmd);
    if (upload_mask & BITFIELD_BIT(MESA_SHADER_VERTEX)) {
-      mtl_set_vertex_buffer(enc, shader_data_gpu.buffer, shader_data_gpu.offset,
-                            2);
+      kk_bind_vbuf_cached(enc, &gfx->bind_cache_v2, shader_data_gpu.buffer,
+                          shader_data_gpu.offset, 2);
    }
    if (tess) {
       mtl_compute_set_buffer(kk_encoder_pre_gfx_encoder(cmd),
                              shader_data_gpu.buffer, shader_data_gpu.offset, 2);
-      mtl_set_vertex_buffer(enc, shader_data_gpu.buffer, shader_data_gpu.offset,
-                            2);
+      kk_bind_vbuf_cached(enc, &gfx->bind_cache_v2, shader_data_gpu.buffer,
+                          shader_data_gpu.offset, 2);
    }
    if (upload_mask & BITFIELD_BIT(MESA_SHADER_FRAGMENT)) {
-      mtl_set_fragment_buffer(enc, shader_data_gpu.buffer,
-                              shader_data_gpu.offset, 2);
+      kk_bind_fbuf_cached(enc, &gfx->bind_cache_f2, shader_data_gpu.buffer,
+                          shader_data_gpu.offset, 2);
    }
 }
 
@@ -1875,6 +2007,306 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    return draw;
 }
 
+/* Primitives for a vertex count; list topologies exact, strips/fans best
+ * effort (GLES3 only permits lists while transform feedback is active). */
+static uint32_t
+kk_prims_for_vertices(enum mesa_prim mode, uint32_t count)
+{
+   switch (mode) {
+   case MESA_PRIM_POINTS:
+      return count;
+   case MESA_PRIM_LINES:
+      return count / 2;
+   case MESA_PRIM_LINE_STRIP:
+      return count >= 2 ? count - 1 : 0;
+   case MESA_PRIM_LINE_LOOP:
+      return count >= 2 ? count : 0;
+   case MESA_PRIM_TRIANGLES:
+      return count / 3;
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN:
+      return count >= 3 ? count - 2 : 0;
+   default:
+      return 0;
+   }
+}
+
+static void
+kk_xfb_counter_shadow_store(struct kk_device *dev, mtl_buffer *buffer,
+                            uint64_t offset, uint64_t value)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(dev->xfb_counters.entries); i++) {
+      if (dev->xfb_counters.entries[i].buffer == buffer &&
+          dev->xfb_counters.entries[i].offset == offset) {
+         dev->xfb_counters.entries[i].value = value;
+         return;
+      }
+   }
+   uint32_t slot = dev->xfb_counters.next++ % ARRAY_SIZE(dev->xfb_counters.entries);
+   dev->xfb_counters.entries[slot].buffer = buffer;
+   dev->xfb_counters.entries[slot].offset = offset;
+   dev->xfb_counters.entries[slot].value = value;
+}
+
+static bool
+kk_xfb_counter_shadow_load(struct kk_device *dev, mtl_buffer *buffer,
+                           uint64_t offset, uint64_t *value)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(dev->xfb_counters.entries); i++) {
+      if (dev->xfb_counters.entries[i].buffer == buffer &&
+          dev->xfb_counters.entries[i].offset == offset) {
+         *value = dev->xfb_counters.entries[i].value;
+         return true;
+      }
+   }
+   return false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
+                                      uint32_t firstBinding,
+                                      uint32_t bindingCount,
+                                      const VkBuffer *pBuffers,
+                                      const VkDeviceSize *pOffsets,
+                                      const VkDeviceSize *pSizes)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      uint32_t idx = firstBinding + i;
+      VK_FROM_HANDLE(kk_buffer, buffer, pBuffers[i]);
+      VkDeviceSize size =
+         pSizes && pSizes[i] != VK_WHOLE_SIZE
+            ? pSizes[i]
+            : (buffer ? buffer->vk.size - pOffsets[i] : 0);
+
+      struct kk_addr_range range =
+         kk_buffer_addr_range(buffer, pOffsets[i], size);
+      gfx->xfb.buf[idx].gpu_base = range.addr;
+      gfx->xfb.buf[idx].size = range.range;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+                                uint32_t firstCounterBuffer,
+                                uint32_t counterBufferCount,
+                                const VkBuffer *pCounterBuffers,
+                                const VkDeviceSize *pCounterBufferOffsets)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+
+   gfx->xfb.enabled = true;
+   for (unsigned i = 0; i < 4; i++) {
+      gfx->xfb.buf[i].offset_B = 0;
+      gfx->xfb.buf[i].counter_handle = NULL;
+   }
+
+   for (uint32_t i = 0; i < counterBufferCount; i++) {
+      uint32_t idx = firstCounterBuffer + i;
+      VK_FROM_HANDLE(kk_buffer, buffer,
+                     pCounterBuffers ? pCounterBuffers[i] : VK_NULL_HANDLE);
+      if (!buffer)
+         continue;
+
+      uint64_t off = pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0;
+      gfx->xfb.buf[idx].counter_handle = buffer->mtl_handle;
+      gfx->xfb.buf[idx].counter_offset = off;
+
+      /* Resume from the shadowed counter value (see kk_device.h). */
+      uint64_t value;
+      if (kk_xfb_counter_shadow_load(dev, buffer->mtl_handle, off, &value))
+         gfx->xfb.buf[idx].offset_B = value;
+      if (kk_limina_rtlog())
+         fprintf(stderr, "[LIMINA-KK-XFB] Begin buf%u counter=%p+%llu resume=%llu\n",
+                 idx, (void *)buffer->mtl_handle, (unsigned long long)off,
+                 (unsigned long long)gfx->xfb.buf[idx].offset_B);
+   }
+   if (kk_limina_rtlog())
+      fprintf(stderr, "[LIMINA-KK-XFB] Begin count=%u (first=%u)\n",
+              counterBufferCount, firstCounterBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+                              uint32_t firstCounterBuffer,
+                              uint32_t counterBufferCount,
+                              const VkBuffer *pCounterBuffers,
+                              const VkDeviceSize *pCounterBufferOffsets)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+
+   for (uint32_t i = 0; i < counterBufferCount; i++) {
+      uint32_t idx = firstCounterBuffer + i;
+      VK_FROM_HANDLE(kk_buffer, buffer,
+                     pCounterBuffers ? pCounterBuffers[i] : VK_NULL_HANDLE);
+      if (!buffer)
+         continue;
+
+      uint64_t off = pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0;
+      kk_xfb_counter_shadow_store(dev, buffer->mtl_handle, off,
+                                  gfx->xfb.buf[idx].offset_B);
+      if (kk_limina_rtlog())
+         fprintf(stderr, "[LIMINA-KK-XFB] End buf%u counter=%p+%llu store=%llu\n",
+                 idx, (void *)buffer->mtl_handle, (unsigned long long)off,
+                 (unsigned long long)gfx->xfb.buf[idx].offset_B);
+   }
+
+   gfx->xfb.enabled = false;
+   gfx->descriptors.root.draw.xfb_active_mask = 0;
+   gfx->descriptors.root_dirty = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
+                               uint32_t instanceCount, uint32_t firstInstance,
+                               VkBuffer counterBuffer,
+                               VkDeviceSize counterBufferOffset,
+                               uint32_t counterOffset, uint32_t vertexStride)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(kk_buffer, buffer, counterBuffer);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   uint64_t counter = 0;
+   if (!kk_xfb_counter_shadow_load(dev, buffer->mtl_handle,
+                                   counterBufferOffset, &counter)) {
+      vk_logw(VK_LOG_OBJS(&cmd->vk.base),
+              "DrawIndirectByteCount: counter buffer value unknown, "
+              "skipping draw");
+      return;
+   }
+
+   uint32_t vertexCount =
+      counter > counterOffset ? (counter - counterOffset) / vertexStride : 0;
+   kk_CmdDraw(commandBuffer, vertexCount, instanceCount, 0, firstInstance);
+}
+
+/* Per-draw transform feedback setup: point the root descriptor's capture
+ * base at the current append offsets (pre-folded with firstVertex) and
+ * re-upload the root. Only direct, non-indexed, non-tess draws capture —
+ * exactly the GLES3-legal surface; everything else masks capture off. */
+static void
+kk_xfb_pre_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+                uint32_t draw_id, bool *captured, uint32_t *fit_prims,
+                uint32_t *gen_prims)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_descriptor_state *desc = &gfx->descriptors;
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+
+   *captured = false;
+   *fit_prims = 0;
+   *gen_prims = 0;
+
+   bool capturable = vs && vs->info.vs.has_xfb && !tess && !data->indirect &&
+                     !data->indexed;
+
+   if (!capturable) {
+      if (!gfx->xfb.warned_indirect && (data->indirect || data->indexed)) {
+         vk_logw(VK_LOG_OBJS(&cmd->vk.base),
+                 "transform feedback capture skipped for indexed/indirect "
+                 "draw (unsupported; GLES3 forbids these during XFB)");
+         gfx->xfb.warned_indirect = true;
+      }
+      if (desc->root.draw.xfb_active_mask) {
+         desc->root.draw.xfb_active_mask = 0;
+         desc->root_dirty = true;
+      }
+      if (data->indirect)
+         return; /* primitive counts unknown */
+
+      uint32_t count = data->indexed ? data->indexed_draws[draw_id].indexCount
+                                     : data->draws[draw_id].vertexCount;
+      uint32_t instances = data->indexed
+                              ? data->indexed_draws[draw_id].instanceCount
+                              : data->draws[draw_id].instanceCount;
+      *gen_prims = kk_prims_for_vertices(data->prim, count) * instances;
+      return;
+   }
+
+   VkDrawIndirectCommand dc = data->draws[draw_id];
+   uint32_t prims = kk_prims_for_vertices(data->prim, dc.vertexCount);
+   *gen_prims = prims * dc.instanceCount;
+
+   /* Whole-draw fit check: capture all of it or nothing (no partial capture
+    * yet — avoids out-of-bounds GPU stores). */
+   uint32_t mask = 0;
+   bool fits = true;
+   u_foreach_bit(b, vs->info.vs.xfb_buffers_written) {
+      uint32_t stride = vs->info.vs.xfb_stride_B[b];
+      if (!gfx->xfb.buf[b].gpu_base || !stride)
+         continue;
+      uint64_t need = (uint64_t)dc.vertexCount * dc.instanceCount * stride;
+      if (gfx->xfb.buf[b].offset_B + need > gfx->xfb.buf[b].size) {
+         fits = false;
+         break;
+      }
+      mask |= BITFIELD_BIT(b);
+   }
+
+   if (!fits || !mask) {
+      if (desc->root.draw.xfb_active_mask) {
+         desc->root.draw.xfb_active_mask = 0;
+         desc->root_dirty = true;
+      }
+      return;
+   }
+
+   u_foreach_bit(b, mask) {
+      uint32_t stride = vs->info.vs.xfb_stride_B[b];
+      desc->root.draw.xfb_base[b] = gfx->xfb.buf[b].gpu_base +
+                                    gfx->xfb.buf[b].offset_B -
+                                    (uint64_t)dc.firstVertex * stride;
+   }
+   desc->root.draw.xfb_active_mask = mask;
+   desc->root.draw.xfb_verts_per_instance = dc.vertexCount;
+   desc->root.draw.xfb_first_instance = dc.firstInstance;
+   desc->root_dirty = true;
+
+   *captured = true;
+   *fit_prims = *gen_prims;
+
+   if (kk_limina_rtlog())
+      fprintf(stderr,
+              "[LIMINA-KK-XFB] capture mask=0x%x base0=0x%llx off0=%llu "
+              "verts=%u inst=%u prims=%u\n",
+              mask, (unsigned long long)desc->root.draw.xfb_base[0],
+              (unsigned long long)gfx->xfb.buf[0].offset_B, dc.vertexCount,
+              dc.instanceCount, prims);
+}
+
+static void
+kk_xfb_post_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+                 uint32_t draw_id, bool captured, uint32_t fit_prims,
+                 uint32_t gen_prims)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+
+   if (captured) {
+      VkDrawIndirectCommand dc = data->draws[draw_id];
+      u_foreach_bit(b, gfx->descriptors.root.draw.xfb_active_mask) {
+         gfx->xfb.buf[b].offset_B += (uint64_t)dc.vertexCount *
+                                     dc.instanceCount *
+                                     vs->info.vs.xfb_stride_B[b];
+      }
+   }
+
+   if (gfx->xfb.tf_pool) {
+      gfx->xfb.tf_written += fit_prims;
+      gfx->xfb.tf_needed += gen_prims;
+   }
+   if (gfx->xfb.pg_pool)
+      gfx->xfb.pg_count += gen_prims;
+}
+
 static void
 kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
@@ -1899,8 +2331,27 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    if (requires_unroll && !kk_unroll_geometry(cmd, data))
       return;
 
+   bool xfb_track =
+      unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);
+
    for (uint32_t i = 0; i < data->draw_count; i++) {
       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
+
+      bool xfb_captured = false;
+      uint32_t xfb_fit = 0, xfb_gen = 0;
+      if (xfb_track) {
+         kk_xfb_pre_draw(cmd, data, i, &xfb_captured, &xfb_fit, &xfb_gen);
+         if (cmd->state.gfx.descriptors.root_dirty) {
+            kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+            struct kk_ptr root_buffer =
+               cmd->state.gfx.descriptors.root.root_buffer;
+            mtl_render_encoder *enc = kk_render_encoder(cmd);
+            kk_bind_vbuf_cached(enc, &cmd->state.gfx.bind_cache_v0,
+                                root_buffer.buffer, root_buffer.offset, 0);
+            kk_bind_fbuf_cached(enc, &cmd->state.gfx.bind_cache_f0,
+                                root_buffer.buffer, root_buffer.offset, 0);
+         }
+      }
 
       if (data->upload_mask)
          kk_upload_per_draw_data(cmd, data->upload_mask, i, &draw_data);
@@ -1908,6 +2359,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       if (tess)
          draw_data = kk_launch_tess(cmd, draw_data);
       kk_dispatch_draw(kk_render_encoder(cmd), draw_data);
+
+      if (xfb_track)
+         kk_xfb_post_draw(cmd, data, i, xfb_captured, xfb_fit, xfb_gen);
    }
 }
 

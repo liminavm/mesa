@@ -545,6 +545,8 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
    /* VK_KHR_incremental_present */
    VkPresentRegionsKHR *_pr;
    VkPresentRegionKHR *_pr_regions;
+   VkRectLayerKHR *_pr_rects;
+   uint32_t _pr_rect_count = 0;
 
    /* VK_KHR_present_id */
    VkPresentIdKHR *_id;
@@ -587,6 +589,16 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
       vk_multialloc_add(&ma, &_pr, __typeof__(*_pr), 1);
       vk_multialloc_add(&ma, &_pr_regions, __typeof__(*_pr_regions),
                         pr->swapchainCount);
+      /* limina: pRegions[i].pRectangles must be deep-copied too — the caller
+       * (e.g. zink kopper) frees its rectangle storage as soon as
+       * vkQueuePresentKHR returns, but this clone outlives it on the async
+       * present thread (use-after-free -> garbage damage rects / assert). */
+      for (uint32_t i = 0; i < pr->swapchainCount; i++) {
+         if (pr->pRegions[i].pRectangles)
+            _pr_rect_count += pr->pRegions[i].rectangleCount;
+      }
+      vk_multialloc_add(&ma, &_pr_rects, __typeof__(*_pr_rects),
+                        _pr_rect_count);
    }
    if (id) {
       vk_multialloc_add(&ma, &_id, __typeof__(*_id), 1);
@@ -645,6 +657,19 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
 
    if (pr) {
       typed_memcpy(_pr_regions, pr->pRegions, pr->swapchainCount);
+
+      uint32_t rect_off = 0;
+      for (uint32_t i = 0; i < pr->swapchainCount; i++) {
+         const VkPresentRegionKHR *region = &pr->pRegions[i];
+         if (region->pRectangles && region->rectangleCount) {
+            typed_memcpy(_pr_rects + rect_off, region->pRectangles,
+                         region->rectangleCount);
+            _pr_regions[i].pRectangles = _pr_rects + rect_off;
+            rect_off += region->rectangleCount;
+         } else {
+            _pr_regions[i].pRectangles = NULL;
+         }
+      }
 
       *_pr = (VkPresentRegionsKHR){
          .sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR,

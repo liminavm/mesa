@@ -84,6 +84,7 @@ kk_files = files(
   'kk_nir_lower_textures.c',
   'kk_nir_lower_vbo.h',
   'kk_nir_lower_vbo.c',
+  'kk_nir_lower_xfb.c',
   'kk_physical_device.h',
   'kk_physical_device.c',
   'kk_query_pool.h',

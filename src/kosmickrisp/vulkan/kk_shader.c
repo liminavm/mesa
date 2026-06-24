@@ -22,6 +22,7 @@
 
 #include "nir_builder.h"
 #include "nir_lower_blend.h"
+#include "nir_xfb_info.h"
 
 #include "poly/nir/poly_nir.h"
 
@@ -321,6 +322,7 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
          binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
    }
    bool robustness2 =
+      !kk_limina_norobust() &&
       rs->vertex_inputs ==
       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
@@ -470,8 +472,9 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
    }
    /* Check https://github.com/KhronosGroup/Vulkan-Portability/issues/54 for
     * explanation on why we need this. */
-   else if (nir->info.fs.needs_full_quad_helper_invocations ||
-            nir->info.fs.needs_coarse_quad_helper_invocations)
+   else if ((nir->info.fs.needs_full_quad_helper_invocations ||
+             nir->info.fs.needs_coarse_quad_helper_invocations) &&
+            !kk_limina_earlyz())
       NIR_PASS(_, nir, msl_lower_static_sample_mask, 0xFFFFFFFF);
 
    /* KK_WORKAROUND_5 */
@@ -516,7 +519,8 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
       NIR_PASS(_, nir, kk_nir_lower_fs_multiview, state->mv->view_mask);
 
       if (state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED &&
-          state->ial && state->ial->depth_att != MESA_VK_ATTACHMENT_NO_INDEX) {
+          state->ial && state->ial->depth_att != MESA_VK_ATTACHMENT_NO_INDEX &&
+          !kk_limina_earlyz()) {
          NIR_PASS(_, nir, msl_ensure_depth_write);
       }
    }
@@ -672,6 +676,15 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
       nir_shader_intrinsics_pass(nir, gather_vs_inputs, nir_metadata_all,
                                  &shader->info.vs.attribs_read);
       shader->info.vs.outputs_written = nir->info.outputs_written;
+
+      /* Transform feedback is captured by VS stores (kk_nir_lower_xfb); the
+       * tessellation path drops xfb_info (unsupported there). */
+      if (nir->xfb_info && nir->info.next_stage != MESA_SHADER_TESS_CTRL) {
+         shader->info.vs.has_xfb = true;
+         shader->info.vs.xfb_buffers_written = nir->xfb_info->buffers_written;
+         for (unsigned i = 0; i < 4; i++)
+            shader->info.vs.xfb_stride_B[i] = nir->info.xfb_stride[i] * 4;
+      }
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       /* Some meta shaders like vk-meta-resolve will have depth_layout as NONE
        * which is not a valid Metal layout */
@@ -785,11 +798,15 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
          memset(&nir->info.cs, 0, sizeof(nir->info.cs));
          nir->xfb_info = NULL;
          NIR_PASS(_, nir, poly_nir_lower_sw_vs);
-      } else
+      } else {
          /* Metal's instance_id contains base_instance. When the emulation path
           * is taken, since we launch compute, they correctly get translated.
           * For the non-emulated path we need to subtract base_instance... */
          NIR_PASS(_, nir, msl_nir_lower_instance_id);
+
+         if (nir->xfb_info)
+            NIR_PASS(_, nir, kk_nir_lower_xfb);
+      }
    } else if (stage == MESA_SHADER_TESS_CTRL) {
       NIR_PASS(_, nir, poly_nir_lower_tcs);
 
@@ -1298,6 +1315,13 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       if (nir->info.stage == MESA_SHADER_VERTEX)
          vertex_robustness = info->robustness;
 
+      if (nir->xfb_info) {
+         /* Fold constant offset srcs for IO, then attach xfb to the
+          * store_output intrinsics so kk_nir_lower_xfb can consume it. */
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         nir_io_add_intrinsic_xfb_info(nir);
+      }
+
       nir_shaders[i] = nir;
    }
 
@@ -1319,6 +1343,28 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
                          UINT32_MAX, nir_opts, NULL);
 
+   /* limina: per-shader bound on the addressable root-table prefix (see
+    * kk_shader_info::root_used_size). Shaders read root members at static
+    * offsets; without dynamic descriptors nothing past sets[set_layout_count]
+    * is reachable. The synthesized pass-through fragment reads no
+    * descriptors at all. */
+   uint16_t root_bounds[shader_count + 1u];
+   for (uint32_t i = 0u; i < shader_count; ++i) {
+      const struct vk_shader_compile_info *info = &infos[i];
+      bool has_dynamic = false;
+      for (uint32_t s = 0; s < info->set_layout_count; s++) {
+         if (info->set_layouts[s] &&
+             info->set_layouts[s]->dynamic_descriptor_count > 0)
+            has_dynamic = true;
+      }
+      root_bounds[i] =
+         has_dynamic ? sizeof(struct kk_root_descriptor_table)
+                     : offsetof(struct kk_root_descriptor_table, sets) +
+                          info->set_layout_count * sizeof(uint64_t);
+   }
+   root_bounds[shader_count] =
+      offsetof(struct kk_root_descriptor_table, sets);
+
    for (uint32_t i = 0; i < total_shaders; i++) {
       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
       result =
@@ -1339,6 +1385,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
 
          return result;
       }
+
+      shaders[i]->info.root_used_size = root_bounds[i];
    }
 
    /* Compile pipeline:
@@ -1502,6 +1550,12 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
 {
    cmd->state.shaders[stage] = shader;
    cmd->state.dirty_shaders |= BITFIELD_BIT(stage);
+
+   if (getenv("LIMINA_KK_RTLOG"))
+      fprintf(stderr, "[LIMINA-KK-BIND] stage=%d shader=%p pso=%p\n", stage,
+              (void *)shader,
+              shader && stage == MESA_SHADER_VERTEX
+                 ? (void *)shader->pipeline.gfx.render : NULL);
 
    /* Relevant pipeline data is only stored in vertex shaders */
    if (stage != MESA_SHADER_VERTEX)
