@@ -14,6 +14,17 @@
 
 #include <Metal/MTLTexture.h>
 
+/* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
+ * ~7% of the hot ring core in __findenv_locked). */
+static inline bool
+limina_kk_rtlog_cached(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RTLOG") != NULL;
+   return v;
+}
+
 uint64_t
 mtl_texture_get_gpu_resource_id(mtl_texture *texture)
 {
@@ -92,7 +103,13 @@ mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *lay
                                                                         mtl_texture_swizzle(layout->swizzle.green),
                                                                         mtl_texture_swizzle(layout->swizzle.blue),
                                                                         mtl_texture_swizzle(layout->swizzle.alpha));
-      return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices swizzle:swizzle];
+      id<MTLTexture> v = [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices swizzle:swizzle];
+      if (limina_kk_rtlog_cached() && (!v || tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s parent=%p(linear=%d %lux%lu) type=%lu fmt=%lu -> %p\n",
+                 v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
+                 (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
+      return v;
    }
 }
 
@@ -104,7 +121,13 @@ mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_
       MTLTextureType type = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
       NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
       NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
-      return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
+      id<MTLTexture> v = [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
+      if (limina_kk_rtlog_cached() && (!v || tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s(nosw) parent=%p(linear=%d %lux%lu) type=%lu fmt=%lu -> %p\n",
+                 v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
+                 (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
+      return v;
    }
 }
 
