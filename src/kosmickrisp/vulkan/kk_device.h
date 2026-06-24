@@ -103,6 +103,21 @@ struct kk_device {
    /* Geomtry heap */
    struct kk_bo *heap;
    util_once_flag heap_init_once;
+
+   /* Transform feedback counter-buffer shadow: command replay is sequential
+    * on the queue thread and zink only consumes counter values through
+    * vkCmdBeginTransformFeedbackEXT resume / vkCmdDrawIndirectByteCountEXT,
+    * both of which we serve from this CPU-side map (the buffer itself is
+    * not written -- TODO for full conformance). Small ring, newest wins.
+    */
+   struct {
+      struct {
+         mtl_buffer *buffer;
+         uint64_t offset;
+         uint64_t value;
+      } entries[32];
+      uint32_t next;
+   } xfb_counters;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
