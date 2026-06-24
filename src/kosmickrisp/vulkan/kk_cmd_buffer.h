@@ -39,6 +39,19 @@ struct kk_root_descriptor_table {
 
          float blend_constant[4];
          float clip_z_coeff;
+
+         /* Transform feedback: per-buffer write base for THIS draw,
+          * pre-adjusted so the vertex shader stores at
+          * xfb_base[b] + vertex_id * stride + output_offset
+          * (bound base + current append offset - firstVertex * stride).
+          * xfb_active_mask has bit b set when capture to buffer b is on.
+          */
+         uint64_t xfb_base[4];
+         uint32_t xfb_active_mask;
+         /* For instanced capture: slot = (instance_id - first_instance) *
+          * verts_per_instance + vertex_id. */
+         uint32_t xfb_verts_per_instance;
+         uint32_t xfb_first_instance;
       } draw;
       struct {
          uint32_t base_group[3];
@@ -163,6 +176,29 @@ struct kk_graphics_state {
       struct kk_addr_range addr_range[KK_MAX_VBUFS];
    } vb;
 
+   /* limina: per-attribute format block size, cached when VI dirties so the
+    * per-VB-bind clamp recompute (per draw on zink streams) skips the
+    * util_format_description chain. */
+   uint8_t attrib_elsize_B[KK_MAX_ATTRIBS];
+
+   /* limina: per-encoder binding cache for the hot per-draw buffer binds
+    * (root table at index 0, per-draw data at index 2). The bound buffers
+    * live in the upload pool, so consecutive draws rebind the SAME MTLBuffer
+    * at a new offset — Metal's setBufferOffset skips the residency/binding-
+    * table work of setBuffer, and a fully unchanged bind is skipped outright.
+    * Zeroed when a new render encoder is created (fresh binding tables). */
+   struct kk_bound_buf {
+      mtl_buffer *buf;
+      uint32_t offset;
+   } bind_cache_v0, bind_cache_f0, bind_cache_v2, bind_cache_f2;
+
+   /* limina: last-uploaded per-draw data + its pool location; non-tess draws
+    * usually repeat the same content (draw_id varies only across multidraw),
+    * so the per-draw pool upload can be skipped (pool data is immutable).
+    * .gpu == 0 = invalid (cmd->state is zeroed at Begin). */
+   struct kk_per_draw_data last_per_draw_data;
+   struct kk_ptr per_draw_gpu;
+
    /* Tessellation state */
    struct {
       /* Grid buffer for when the draw is indirect */
@@ -171,6 +207,32 @@ struct kk_graphics_state {
       struct kk_tess_info info;
       enum mesa_prim prim;
    } tess;
+
+   /* Transform feedback state (CPU-tracked; command replay is sequential).
+    * Capture is lowered to vertex-shader global stores, so it is correct
+    * for non-indexed list topologies — exactly the surface GLES3 permits
+    * while transform feedback is active.
+    */
+   struct {
+      bool enabled;
+      struct {
+         uint64_t gpu_base; /* bound buffer GPU address (0 = unbound) */
+         uint64_t size;
+         mtl_buffer *counter_handle; /* counter buffer from Begin, for End */
+         uint64_t counter_offset;
+         uint64_t offset_B; /* current append offset within the buffer */
+      } buf[4];
+
+      /* Query accumulation while queries are active (CPU-side; counts are
+       * known at replay time for direct draws). */
+      struct kk_query_pool *pg_pool; /* PRIMITIVES_GENERATED / pipeline stats */
+      uint32_t pg_query;
+      uint64_t pg_count;
+      struct kk_query_pool *tf_pool; /* TRANSFORM_FEEDBACK_STREAM */
+      uint32_t tf_query;
+      uint64_t tf_written, tf_needed;
+      bool warned_indirect;
+   } xfb;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;

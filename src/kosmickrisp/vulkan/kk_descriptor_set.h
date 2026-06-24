@@ -63,6 +63,13 @@ kk_descriptor_set_addr(const struct kk_descriptor_set *set)
 struct kk_push_descriptor_set {
    uint8_t data[KK_PUSH_DESCRIPTOR_SET_SIZE];
    struct kk_descriptor_set_layout *layout;
+   /* limina (LIMINA_KK_SLIMPUSH): high-water mark of
+    * layout->non_variable_descriptor_buffer_size over every push into this
+    * set. Pushed descriptors ACCUMULATE (a push overwrites only the bindings
+    * it names; the rest are retained), so sizing an upload by the LATEST
+    * push's layout can truncate retained bindings a smaller layout doesn't
+    * cover. Monotonic per command buffer; zalloc'd to 0. */
+   uint32_t limina_used_size;
 };
 
 void kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,

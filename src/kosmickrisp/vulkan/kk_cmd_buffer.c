@@ -527,6 +527,9 @@ kk_cmd_push_descriptors(struct kk_cmd_buffer *cmd,
 
    /* Pushing descriptors replaces whatever sets are bound */
    desc->push[set]->layout = set_layout;
+   desc->push[set]->limina_used_size =
+      MAX2(desc->push[set]->limina_used_size,
+           set_layout->non_variable_descriptor_buffer_size);
    desc->sets[set] = NULL;
    desc->push_dirty |= BITFIELD_BIT(set);
 
@@ -697,6 +700,24 @@ kk_pool_upload(struct kk_cmd_buffer *cmd, const void *data, uint32_t size,
    return T;
 }
 
+/* limina: upload only the root-table prefix the bound shaders can address
+ * instead of the full ~2.2 KiB table. Zink-shaped pipelines (no dynamic
+ * descriptors) never read past sets[], so the dynamic_buffers tail (~half
+ * the table) is dead weight on a memcpy that runs PER DRAW (every push-
+ * descriptor flush re-dirties the root). Bound comes from the pipeline's
+ * set layouts at compile time (kk_shader_info::root_used_size; 0 = unknown
+ * -> full size). LIMINA_KK_SLIMROOT=0 restores full-size uploads. */
+static inline bool
+kk_limina_slimroot(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_SLIMROOT");
+      v = !e || e[0] != '0';
+   }
+   return v;
+}
+
 uint64_t
 kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
                           VkPipelineBindPoint bind_point)
@@ -715,19 +736,62 @@ kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
    return root_ptr.gpu;
 }
 
+/* limina: upload only the bytes the set layout actually uses instead of the
+ * full KK_PUSH_DESCRIPTOR_SET_SIZE (2 KiB). Zink pushes descriptors per draw,
+ * so this directly scales the upload-pool burn rate (and BO/residency churn).
+ * Matches regular descriptor sets, which already size by the layout. */
+static inline bool
+kk_limina_slimpush(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      /* Default ON (round 19; sized by per-set high-water mark, see
+       * limina_used_size); LIMINA_KK_SLIMPUSH=0 restores full-size uploads. */
+      const char *e = getenv("LIMINA_KK_SLIMPUSH");
+      v = !e || e[0] != '0';
+   }
+   return v;
+}
+
 void
 kk_cmd_buffer_flush_push_descriptors(struct kk_cmd_buffer *cmd,
                                      struct kk_descriptor_state *desc)
 {
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct kk_push_descriptor_set *push_set = desc->push[set_idx];
-      struct kk_ptr push_gpu = kk_pool_upload(
-         cmd, push_set->data, sizeof(push_set->data), KK_MIN_UBO_ALIGNMENT);
+      uint32_t size = sizeof(push_set->data);
+      if (kk_limina_slimpush()) {
+         /* Size by the per-set high-water mark, NOT the latest push's layout:
+          * retained bindings from earlier (larger-layout) pushes must stay in
+          * the upload. Latest-layout sizing truncated them — visible as
+          * flickering/transparent frames in glmark2 texture/shading/effect2d
+          * (round 19 regression, caught by eyeball). */
+         static int limina_stats = -1;
+         if (limina_stats < 0)
+            limina_stats = getenv("LIMINA_KK_STATS") != NULL;
+         if (limina_stats &&
+             push_set->limina_used_size >
+                push_set->layout->non_variable_descriptor_buffer_size) {
+            static int truncs = 0;
+            if (truncs++ % 1000 == 0)
+               fprintf(stderr,
+                       "[LIMINA-KK-SLIMPUSH] retained-binding carry: used=%u > "
+                       "latest-layout=%u (x%d) — latest-layout sizing would "
+                       "truncate\n",
+                       push_set->limina_used_size,
+                       push_set->layout->non_variable_descriptor_buffer_size,
+                       truncs);
+         }
+         size = align(push_set->limina_used_size, KK_MIN_UBO_ALIGNMENT);
+         size = CLAMP(size, KK_MIN_UBO_ALIGNMENT, sizeof(push_set->data));
+      }
+      struct kk_ptr push_gpu =
+         kk_pool_upload(cmd, push_set->data, size, KK_MIN_UBO_ALIGNMENT);
       if (unlikely(!push_gpu.gpu))
          return;
 
       desc->root.sets[set_idx] = push_gpu.gpu;
-      desc->set_sizes[set_idx] = sizeof(push_set->data);
+      desc->set_sizes[set_idx] = size;
    }
 
    desc->root_dirty = true;

@@ -12,6 +12,61 @@
 #include <Metal/MTL4RenderCommandEncoder.h>
 #include <Metal/MTLRenderPass.h>
 
+/* limina: LIMINA_KK_STATS=1 — once-per-second aggregate counters to stderr.
+ * Measures render-pass split rate (renc + Load-action reloads) vs draw rate. */
+#include <stdatomic.h>
+#include <time.h>
+
+/* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
+ * ~7% of the hot ring core in __findenv_locked). */
+static inline bool
+limina_kk_rtlog_cached(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RTLOG") != NULL;
+   return v;
+}
+static _Atomic uint64_t limina_st_renc, limina_st_benc, limina_st_cenc,
+   limina_st_draw, limina_st_loadc, limina_st_loadds;
+static bool
+limina_stats_on(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = getenv("LIMINA_KK_STATS") != NULL;
+   return enabled;
+}
+static void
+limina_stats_bump(_Atomic uint64_t *ctr)
+{
+   if (!limina_stats_on())
+      return;
+   atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+   /* clock_gettime per bump sat on the per-draw path (round 25: ~3% of the
+    * hot ring thread); only poll the clock every 1024 bumps — at >1k events/s
+    * the once-per-second print cadence is unaffected. */
+   static _Atomic uint64_t bumps;
+   if (atomic_fetch_add_explicit(&bumps, 1, memory_order_relaxed) & 1023)
+      return;
+   static _Atomic long last_sec;
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   long prev = atomic_load_explicit(&last_sec, memory_order_relaxed);
+   if (ts.tv_sec != prev &&
+       atomic_compare_exchange_strong(&last_sec, &prev, ts.tv_sec)) {
+      fprintf(stderr,
+              "[LIMINA-KK-STATS] renc=%llu loadC=%llu loadDS=%llu benc=%llu "
+              "cenc=%llu draw=%llu (last interval)\n",
+              (unsigned long long)atomic_exchange(&limina_st_renc, 0),
+              (unsigned long long)atomic_exchange(&limina_st_loadc, 0),
+              (unsigned long long)atomic_exchange(&limina_st_loadds, 0),
+              (unsigned long long)atomic_exchange(&limina_st_benc, 0),
+              (unsigned long long)atomic_exchange(&limina_st_cenc, 0),
+              (unsigned long long)atomic_exchange(&limina_st_draw, 0));
+   }
+}
+
 /* Common encoder utils */
 void
 mtl_end_encoding(void *encoder)
@@ -249,6 +304,11 @@ mtl_set_viewports(mtl_render_encoder *encoder, struct mtl_viewport *viewports,
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       MTLViewport *vps = (MTLViewport *)viewports;
+      if (limina_kk_rtlog_cached())
+         for (uint32_t i = 0; i < count; i++)
+            fprintf(stderr, "[LIMINA-KK-VP] enc=%p vp[%u]=(%.1f,%.1f %.1fx%.1f z=%.2f..%.2f)\n",
+                    (void *)enc, i, vps[i].originX, vps[i].originY, vps[i].width,
+                    vps[i].height, vps[i].znear, vps[i].zfar);
       [enc setViewports:vps count:count];
    }
 }
@@ -260,6 +320,11 @@ mtl_set_scissor_rects(mtl_render_encoder *encoder,
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       MTLScissorRect *rects = (MTLScissorRect *)scissor_rects;
+      if (limina_kk_rtlog_cached())
+         for (uint32_t i = 0; i < count; i++)
+            fprintf(stderr, "[LIMINA-KK-SC] enc=%p sc[%u]=(%lu,%lu %lux%lu)\n",
+                    (void *)enc, i, (unsigned long)rects[i].x, (unsigned long)rects[i].y,
+                    (unsigned long)rects[i].width, (unsigned long)rects[i].height);
       [enc setScissorRects:rects count:count];
    }
 }
@@ -382,6 +447,10 @@ mtl_draw_primitives(mtl_render_encoder *encoder,
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       MTLPrimitiveType type = (MTLPrimitiveType)primitve_type;
+      if (limina_kk_rtlog_cached())
+         fprintf(stderr, "[LIMINA-KK-DRAW] enc=%p type=%lu count=%u\n", (void *)enc,
+                 (unsigned long)type, vertexCount);
+      limina_stats_bump(&limina_st_draw);
       [enc drawPrimitives:type vertexStart:vertexStart vertexCount:vertexCount instanceCount:instanceCount baseInstance:baseInstance];
    }
 }

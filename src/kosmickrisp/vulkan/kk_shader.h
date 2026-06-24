@@ -52,6 +52,15 @@ struct kk_shader_info {
    /* Required for fragment shader cull distance discards. */
    uint8_t num_cull_distances;
 
+   /* limina: upper bound (bytes) on the root-descriptor-table prefix this
+    * shader can address — offsetof(sets) + set_layout_count * 8 when the
+    * pipeline layout has no dynamic descriptors (nothing past sets[] is
+    * addressable then), full table size otherwise. 0 = unknown (compiled
+    * without layout info) -> upload the full table. Consumed by
+    * kk_upload_descriptor_root to skip the dynamic_buffers tail (~half the
+    * table) on the per-draw upload. */
+   uint16_t root_used_size;
+
    union {
       /* Vertex shader is the pipeline, store all relevant data here. */
       struct {
@@ -88,6 +97,11 @@ struct kk_shader_info {
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
+
+         /* Transform feedback (capture lowered to VS global stores). */
+         bool has_xfb;
+         uint8_t xfb_buffers_written; /* mask */
+         uint16_t xfb_stride_B[4];    /* per-buffer stride in bytes */
       } vs;
 
       struct {
@@ -137,9 +151,39 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
 
+/* limina A/B sizing knob: LIMINA_KK_NOROBUST=1 drops ALL robust-access lowering
+ * (bounded UBO/SSBO loads, vertex-attrib clamps). NOT spec-conformant — for
+ * measuring the cost of per-scalar bounds checks only. */
+static inline bool
+kk_limina_norobust(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_NOROBUST") != NULL;
+   return v;
+}
+
+/* limina: skip the injected FS depth write (msl_ensure_depth_write) and the
+ * helper-quad [[sample_mask]] write — both force late-Z on Metal, disabling
+ * early-Z/HSR for effectively all real content. Default ON since round 20
+ * (10.9k-case CTS early-Z A/B status-identical + battery clean);
+ * LIMINA_KK_EARLYZ=0 restores the stock blanket injections. */
+static inline bool
+kk_limina_earlyz(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_EARLYZ");
+      v = !e || e[0] != '0';
+   }
+   return v;
+}
+
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
 {
+   if (kk_limina_norobust())
+      return nir_address_format_64bit_global_32bit_offset;
    switch (robustness) {
    case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED:
       return nir_address_format_64bit_global_32bit_offset;
@@ -156,6 +200,9 @@ kk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
                          uint32_t set_layout_count,
                          struct vk_descriptor_set_layout *const *set_layouts);
+
+bool
+kk_nir_lower_xfb(nir_shader *nir);
 
 bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
