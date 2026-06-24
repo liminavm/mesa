@@ -213,6 +213,20 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
    layout->layers = image->array_layers;
    layout->levels = image->mip_levels;
    layout->linear = image->tiling != VK_IMAGE_TILING_OPTIMAL;
+   /* limina: a DRM-format-modifier image used as a render target must NOT become
+    * a buffer-backed linear Metal texture — Metal cannot build a render command
+    * encoder for one, so mtl_new_render_command_encoder_with_descriptor returns
+    * nil and kk_render_encoder (kk_encoder.c) asserts on the nil encoder. In a VM
+    * the guest's DRM modifier is host-meaningless (the real backing is a host
+    * heap, not a guest-readable linear buffer), so lay such attachment images out
+    * tiled / heap-backed, which IS a valid Metal render target. Plain
+    * VK_IMAGE_TILING_LINEAR images are left linear: that path is vkr's
+    * IOSurface-backed scanout image (renderable via newBufferWithBytesNoCopy),
+    * which must keep its linear layout. */
+   if (image->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+       (image->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+      layout->linear = false;
    layout->optimized_layout = kk_image_layout_can_optimize(
       image->usage, image->tiling, image->create_flags, format);
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
