@@ -11,6 +11,17 @@
 #include <Metal/MTL4CommandBuffer.h>
 #include <Metal/MTL4Counters.h>
 
+/* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
+ * ~7% of the hot ring core in __findenv_locked). */
+static inline bool
+limina_kk_rtlog_cached(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RTLOG") != NULL;
+   return v;
+}
+
 void
 mtl_command_allocator_reset(mtl_command_allocator *allocator)
 {

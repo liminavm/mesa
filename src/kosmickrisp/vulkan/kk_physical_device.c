@@ -200,6 +200,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_nested_command_buffer = true,
       .EXT_post_depth_coverage = true,
       .EXT_primitive_restart_index = true,
+      .EXT_primitives_generated_query = true,
       .EXT_primitive_topology_list_restart = true,
       .EXT_provoking_vertex = true,
       /* Constant-only (VK_QUEUE_FAMILY_FOREIGN_EXT, no entry points). One queue
@@ -216,6 +217,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
 #ifdef KK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
 #endif
+      .EXT_transform_feedback = true,
       .EXT_vertex_attribute_robustness = true,
 
       .GOOGLE_decorate_string = true,
@@ -502,6 +504,12 @@ kk_get_device_features(
       /* VK_EXT_primitive_restart_index */
       .primitiveRestartIndex = true,
 
+      /* VK_EXT_primitives_generated_query (CPU-side accumulation; rasterizer
+       * discard is emulated via an empty scissor so the VS still runs). */
+      .primitivesGeneratedQuery = true,
+      .primitivesGeneratedQueryWithRasterizerDiscard = true,
+      .primitivesGeneratedQueryWithNonZeroStreams = false,
+
       /* VK_EXT_primitive_topology_list_restart */
       .primitiveTopologyListRestart = true,
       .primitiveTopologyPatchListRestart = false,
@@ -511,6 +519,10 @@ kk_get_device_features(
 
       /* VK_EXT_shader_replicated_composites */
       .shaderReplicatedComposites = true,
+
+      /* VK_EXT_transform_feedback (no geometry shaders => single stream) */
+      .transformFeedback = true,
+      .geometryStreams = false,
 
       /* VK_KHR_shader_subgroup_uniform_control_flow */
       .shaderSubgroupUniformControlFlow = true,
@@ -890,7 +902,7 @@ kk_get_device_properties(
       .shaderBinaryVersion = 0,
 
       /* VK_EXT_transform_feedback */
-      .maxTransformFeedbackStreams = 4,
+      .maxTransformFeedbackStreams = 1,
       .maxTransformFeedbackBuffers = 4,
       .maxTransformFeedbackBufferSize = UINT32_MAX,
       .maxTransformFeedbackStreamDataSize = 2048,
@@ -898,7 +910,7 @@ kk_get_device_properties(
       .maxTransformFeedbackBufferDataStride = 2048,
       .transformFeedbackQueries = true,
       .transformFeedbackStreamsLinesTriangles = false,
-      .transformFeedbackRasterizationStreamSelect = true,
+      .transformFeedbackRasterizationStreamSelect = false,
       .transformFeedbackDraw = true,
 
       /* VK_KHR_vertex_attribute_divisor */
