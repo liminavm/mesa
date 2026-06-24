@@ -14,6 +14,17 @@
 
 #include <Metal/MTLTexture.h>
 
+/* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
+ * ~7% of the hot ring core in __findenv_locked). */
+static inline bool
+limina_kk_rtlog_cached(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RTLOG") != NULL;
+   return v;
+}
+
 uint64_t
 mtl_texture_get_gpu_resource_id(mtl_texture *texture)
 {
@@ -110,7 +121,13 @@ mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *lay
          desc.minLOD = layout->min_lod_clamp;
       }
 #endif
-      return [tex newTextureViewWithDescriptor:desc];
+      id<MTLTexture> v = [tex newTextureViewWithDescriptor:desc];
+      if (limina_kk_rtlog_cached() && (!v || tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s%s parent=%p(linear=%d %lux%lu) type=%lu fmt=%lu -> %p\n",
+                 v ? "ok" : "NIL", swizzle ? "" : "(nosw)", (void *)tex, tex.buffer ? 1 : 0,
+                 (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)desc.textureType, (unsigned long)layout->format.mtl, (void *)v);
+      return v;
    }
 }
 
