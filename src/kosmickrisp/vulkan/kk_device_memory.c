@@ -197,6 +197,19 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
           * only be usable for buffers */
          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
+         /* limina: newBufferWithBytesNoCopy returns nil on a rejected pointer/length;
+          * adding nil to the residency set makes the AGX residency commit segfault
+          * at the next submit. Fail the allocation loudly instead. */
+         if (!mem->bo->map) {
+            fprintf(stderr,
+                    "[LIMINA-KK-IMPORT] newBufferWithBytesNoCopy FAILED ptr=%p "
+                    "size=%llu (page-aligned ptr + page-multiple size required)\n",
+                    host_info->pHostPointer, (unsigned long long)mem->vk.size);
+            FREE(mem->bo);
+            result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                               "host pointer import rejected by Metal");
+            goto fail_alloc;
+         }
          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
       }
@@ -298,6 +311,11 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
    assert(!fixed_addr || mapped_addr == fixed_addr);
    mem->map = mapped_addr;
    *ppData = mem->map + offset;
+
+   if (getenv("LIMINA_KK_RTLOG"))
+      fprintf(stderr, "[LIMINA-KK-MAP] mem=%p size=%llu cpu=%p heap=%d\n", (void *)mem,
+              (unsigned long long)mem->vk.size, mem->bo->cpu,
+              mem->bo->mtl_handle ? 1 : 0);
 
    return result;
 }
