@@ -287,7 +287,12 @@ kk_render_encoder(struct kk_cmd_buffer *cmd)
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
    if (gfx->need_to_start_render_pass) {
-      gfx->render.samples = gfx->pipeline_sample_count;
+      /* limina: Metal requires defaultRasterSampleCount >= 1; an attachment-less
+       * render pass has no attachment to derive it from and a draw can reach here
+       * before a pipeline sets it, leaving 0 -> mtl_new_render_command_encoder
+       * returns nil -> the assert below. Clamp. */
+      gfx->render.samples =
+         gfx->pipeline_sample_count ? gfx->pipeline_sample_count : 1u;
       mtl_render_pass_descriptor_set_default_raster_sample_count(
          cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
       gfx->need_to_start_render_pass = false;
