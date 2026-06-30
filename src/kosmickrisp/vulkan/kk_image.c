@@ -7,6 +7,7 @@
 
 #include "kk_image.h"
 
+#include "kk_bo.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
 #include "kk_entrypoints.h"
@@ -585,6 +586,9 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
       mtl_release(plane->mtl_handle);
    if (plane->mtl_handle_array != NULL)
       mtl_release(plane->mtl_handle_array);
+   /* limina: free the private heap-backed bo, if this plane got one (heap-less backing). */
+   if (plane->private_bo != NULL)
+      kk_destroy_bo(dev, plane->private_bo);
 }
 
 static void
@@ -837,6 +841,12 @@ kk_image_plane_create_texture(struct kk_image_plane *plane,
       return mtl_new_texture_with_descriptor_linear(plane->mem->bo->map, layout,
                                                     mem_offset_B);
 
+   /* limina: a tiled plane bound to heap-less (venus host-imported) memory was given its own
+    * dedicated heap-backed bo in kk_image_plane_bind; texture it from that heap at offset 0. */
+   if (plane->private_bo != NULL)
+      return mtl_new_texture_with_descriptor(plane->private_bo->mtl_handle, layout,
+                                             0u);
+
    return mtl_new_texture_with_descriptor(plane->mem->bo->mtl_handle, layout,
                                           mem_offset_B);
 }
@@ -851,7 +861,19 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
                                &plane_align_B);
    *offset_B = align64(*offset_B, plane_align_B);
 
-   assert(plane->layout.linear || mem->bo->mtl_handle);
+   /* limina: venus host-imports some VkDeviceMemory as a plain Metal buffer with NO heap
+    * (mem->bo->mtl_handle == NULL) — observed with wgpu, which maps the only host-visible memory
+    * type, so venus imports the guest pages. A non-linear (tiled) image cannot be textured from a
+    * buffer, so give this plane its own heap-backed bo and texture from that. Safe: an OPTIMAL
+    * image is opaque to the guest CPU (touched only via GPU copies/renders), so its host storage
+    * living in a private heap rather than the imported buffer is transparent. */
+   if (!plane->layout.linear && mem->bo->mtl_handle == NULL) {
+      VkResult result = kk_alloc_bo(dev, &dev->vk.base, plane_size_B, plane_align_B,
+                                    &plane->private_bo);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   assert(plane->layout.linear || mem->bo->mtl_handle || plane->private_bo);
 
    /* Linear textures in Metal need to be allocated through a buffer... */
    plane->mem = mem;
@@ -869,8 +891,10 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
       array_layout.type = MTL_TEXTURE_TYPE_2D_ARRAY;
       array_layout.layers = array_layout.layers * array_layout.depth_px;
       array_layout.depth_px = 1u;
+      /* limina: honor the private heap-backed bo (heap-less host-imported backing) here too. */
       plane->mtl_handle_array = mtl_new_texture_with_descriptor(
-         mem->bo->mtl_handle, &array_layout, *offset_B);
+         plane->private_bo ? plane->private_bo->mtl_handle : mem->bo->mtl_handle,
+         &array_layout, plane->private_bo ? 0u : *offset_B);
    }
 
    *offset_B += plane_size_B;

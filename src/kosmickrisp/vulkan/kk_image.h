@@ -20,6 +20,7 @@
 struct kk_device_memory;
 struct kk_physical_device;
 struct kk_queue;
+struct kk_bo;
 
 VkFormatFeatureFlags2
 kk_get_image_format_features(struct kk_physical_device *pdevice,
@@ -39,6 +40,9 @@ struct kk_image_plane {
    /* Metal handle with 2D array type for 3D images */
    mtl_texture *mtl_handle_array;
    uint64_t addr;
+   /* limina: a private heap-backed bo for a tiled plane bound to heap-less (venus
+    * host-imported) memory; NULL otherwise. Freed in kk_image_plane_finish. */
+   struct kk_bo *private_bo;
 };
 
 struct kk_image {
