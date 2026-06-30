@@ -159,6 +159,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_blend_operation_advanced = true,
       .EXT_calibrated_timestamps = true,
       .EXT_conditional_rendering = true,
+      .EXT_custom_border_color = true,
       .EXT_custom_resolve = true,
       .EXT_debug_marker = true,
       .EXT_depth_clip_control = true,
@@ -396,6 +397,12 @@ kk_get_device_features(
       /* VK_EXT_conditional_rendering */
       .conditionalRendering = true,
       .inheritedConditionalRendering = true,
+
+      /* VK_EXT_custom_border_color (impl: kk_sampler.c; property: maxCustomBorderColorSamplers).
+       * zink lists this as a base requirement; advertising it lifts zink-on-KK (and zink-on-venus)
+       * above the GL 3.1 ceiling so core-profile context creation stops failing EGL_BAD_MATCH. */
+      .customBorderColors = true,
+      .customBorderColorWithoutFormat = true,
 
       /* VK_EXT_custom_resolve */
       .customResolve = true,
