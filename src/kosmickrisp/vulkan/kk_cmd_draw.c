@@ -1317,10 +1317,16 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
          mtl_set_depth_bias(enc, 0.0f, 0.0f, 0.0f);
    }
 
-   if (IS_DIRTY(RS_DEPTH_CLAMP_ENABLE)) {
-      enum mtl_depth_clip_mode mode = dyn->rs.depth_clamp_enable
-                                         ? MTL_DEPTH_CLIP_MODE_CLAMP
-                                         : MTL_DEPTH_CLIP_MODE_CLIP;
+   if (IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE)) {
+      /* Metal exposes a single clip/clamp knob. vk_rasterization_state_depth_clip_enable()
+       * resolves the VK_EXT_depth_clip_enable tri-state, including the default
+       * NOT_CLAMP == !depth_clamp_enable coupling, so this handles both the core (clamp-only)
+       * and the extension (clip decoupled from clamp) cases. Clipping disabled -> clamp:
+       * Metal can't do "neither clip nor clamp", and clamp is what depthClipEnable=false
+       * wants (keep out-of-range fragments, clamp their depth). */
+      bool clip = vk_rasterization_state_depth_clip_enable(&dyn->rs);
+      enum mtl_depth_clip_mode mode =
+         clip ? MTL_DEPTH_CLIP_MODE_CLIP : MTL_DEPTH_CLIP_MODE_CLAMP;
       mtl_set_depth_clip_mode(enc, mode);
    }
 

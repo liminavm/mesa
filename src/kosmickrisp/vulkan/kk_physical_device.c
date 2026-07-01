@@ -163,6 +163,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_custom_resolve = true,
       .EXT_debug_marker = true,
       .EXT_depth_clip_control = true,
+      .EXT_depth_clip_enable = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
       .EXT_external_memory_host = true,
@@ -409,6 +410,10 @@ kk_get_device_features(
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
+
+      /* VK_EXT_depth_clip_enable (impl: kk_cmd_draw.c maps clip-disabled -> Metal clamp).
+       * zink wants it for GL_ARB_depth_clamp; Metal supports the clip/clamp choice. */
+      .depthClipEnable = true,
 
       /* VK_EXT_extended_dynamic_state3 */
       .extendedDynamicState3DepthClampEnable = true,
