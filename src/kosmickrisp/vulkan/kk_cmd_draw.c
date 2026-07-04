@@ -2089,6 +2089,13 @@ kk_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < bindingCount; i++) {
       uint32_t idx = firstBinding + i;
+      /* firstBinding/bindingCount are guest-controlled (venus). A conformant
+       * app keeps firstBinding + bindingCount <= maxTransformFeedbackBuffers,
+       * but a non-conformant guest can overrun the fixed buf[] and write a
+       * guest-supplied address/size past the array. idx is monotonic in i, so
+       * stop once it leaves range rather than corrupting host memory. */
+      if (idx >= ARRAY_SIZE(gfx->xfb.buf))
+         break;
       VK_FROM_HANDLE(kk_buffer, buffer, pBuffers[i]);
       VkDeviceSize size =
          pSizes && pSizes[i] != VK_WHOLE_SIZE
@@ -2121,6 +2128,10 @@ kk_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < counterBufferCount; i++) {
       uint32_t idx = firstCounterBuffer + i;
+      /* Guest-controlled index; clamp to the fixed buf[] (see the note in
+       * kk_CmdBindTransformFeedbackBuffersEXT). */
+      if (idx >= ARRAY_SIZE(gfx->xfb.buf))
+         break;
       VK_FROM_HANDLE(kk_buffer, buffer,
                      pCounterBuffers ? pCounterBuffers[i] : VK_NULL_HANDLE);
       if (!buffer)
@@ -2157,6 +2168,10 @@ kk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < counterBufferCount; i++) {
       uint32_t idx = firstCounterBuffer + i;
+      /* Guest-controlled index; clamp to the fixed buf[] (see the note in
+       * kk_CmdBindTransformFeedbackBuffersEXT). */
+      if (idx >= ARRAY_SIZE(gfx->xfb.buf))
+         break;
       VK_FROM_HANDLE(kk_buffer, buffer,
                      pCounterBuffers ? pCounterBuffers[i] : VK_NULL_HANDLE);
       if (!buffer)
