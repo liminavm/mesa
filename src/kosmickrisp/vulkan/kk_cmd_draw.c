@@ -248,6 +248,8 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
+   cmd->in_render_pass = true;
+
    struct kk_rendering_state *render = &cmd->state.gfx.render;
 
    memset(render, 0, sizeof(*render));
@@ -619,6 +621,11 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    if (need_resolve) {
       kk_meta_resolve_rendering(cmd, &vk_render);
    }
+
+   /* Now outside the render pass: emit any timestamps deferred from inside it
+    * (sampled at the pass-end stage boundary — a spec-legal later latch). */
+   cmd->in_render_pass = false;
+   kk_encoder_flush_deferred_timestamps(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL

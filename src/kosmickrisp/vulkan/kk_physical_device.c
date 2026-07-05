@@ -584,7 +584,8 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
       .sampledImageStencilSampleCounts = sample_counts,
       .storageImageSampleCounts = sample_counts,
       .maxSampleMaskWords = 1,
-      .timestampComputeAndGraphics = false,
+      .timestampComputeAndGraphics =
+         mtl_device_supports_timestamps(pdev->mtl_dev_handle),
       .timestampPeriod = 1,
       .maxClipDistances = 8,
       .maxCullDistances = 8,
@@ -1237,6 +1238,11 @@ kk_GetPhysicalDeviceQueueFamilyProperties2(
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, pQueueFamilyProperties,
                           pQueueFamilyPropertyCount);
 
+   /* GPU timestamps are sampled at command-encoder stage boundaries and are in
+    * the CPU nanosecond domain (timestampPeriod=1). Full 64-bit range. */
+   const uint32_t timestamp_valid_bits =
+      mtl_device_supports_timestamps(pdev->mtl_dev_handle) ? 64u : 0u;
+
    for (uint8_t i = 0; i < pdev->queue_family_count; i++) {
       const struct kk_queue_family *queue_family = &pdev->queue_families[i];
 
@@ -1244,8 +1250,7 @@ kk_GetPhysicalDeviceQueueFamilyProperties2(
       {
          p->queueFamilyProperties.queueFlags = queue_family->queue_flags;
          p->queueFamilyProperties.queueCount = queue_family->queue_count;
-         p->queueFamilyProperties.timestampValidBits =
-            0; /* TODO_KOSMICKRISP Timestamp queries */
+         p->queueFamilyProperties.timestampValidBits = timestamp_valid_bits;
          p->queueFamilyProperties.minImageTransferGranularity =
             (VkExtent3D){1, 1, 1};
 

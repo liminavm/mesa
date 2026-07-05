@@ -266,7 +266,21 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                       VkPipelineStageFlags2 stage, VkQueryPool queryPool,
                       uint32_t query)
 {
-   /* TODO_KOSMICKRISP */
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   /* Apple GPUs only sample the timestamp counter at encoder stage boundaries,
+    * so we latch after all prior work (~bottom of pipe) regardless of `stage` —
+    * a spec-legal, logically-later latch point. A TIMESTAMP report is one
+    * uint64 in pool->bo; resolveCounters writes the ns value straight in, and
+    * a value != UINT64_MAX marks it available. */
+   mtl_buffer *dst = pool->bo->map;
+   uint64_t offset = kk_query_offset(pool, query);
+
+   if (cmd->in_render_pass)
+      kk_encoder_defer_timestamp(cmd, dst, offset);
+   else
+      kk_encoder_write_timestamp(cmd, dst, offset);
 }
 
 VKAPI_ATTR void VKAPI_CALL

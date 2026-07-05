@@ -7,9 +7,11 @@
 #include "mtl_encoder.h"
 
 #include <Metal/MTLBlitCommandEncoder.h>
+#include <Metal/MTLBlitPass.h>
 #include <Metal/MTLCaptureManager.h>
 #include <Metal/MTLCaptureScope.h>
 #include <Metal/MTLComputeCommandEncoder.h>
+#include <Metal/MTLCounters.h>
 #include <Metal/MTLRenderCommandEncoder.h>
 
 /* limina: LIMINA_KK_STATS=1 — once-per-second aggregate counters to stderr.
@@ -107,6 +109,51 @@ mtl_blit_wait_for_fence(mtl_blit_encoder *encoder,
       id<MTLBlitCommandEncoder> enc = (id<MTLBlitCommandEncoder>)encoder;
       id<MTLFence> f = (id<MTLFence>)fence;
       [enc waitForFence:f];
+   }
+}
+
+/* A blit encoder that samples the GPU timestamp counter at its START stage
+ * boundary into `sample_index` of `sample_buffer` (the only sampling point
+ * Apple GPUs support). The sample is taken when the encoder begins, i.e. after
+ * all prior (fence-ordered) work — a valid latch point for vkCmdWriteTimestamp. */
+mtl_blit_encoder *
+mtl_new_blit_command_encoder_timestamp(mtl_command_buffer *cmd_buffer,
+                                       mtl_counter_sample_buffer *sample_buffer,
+                                       uint32_t sample_index)
+{
+   @autoreleasepool {
+      id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>)cmd_buffer;
+      id<MTLCounterSampleBuffer> sb =
+         (id<MTLCounterSampleBuffer>)sample_buffer;
+
+      MTLBlitPassDescriptor *desc = [MTLBlitPassDescriptor blitPassDescriptor];
+      MTLBlitPassSampleBufferAttachmentDescriptor *att =
+         desc.sampleBufferAttachments[0];
+      att.sampleBuffer = sb;
+      att.startOfEncoderSampleIndex = sample_index;
+      att.endOfEncoderSampleIndex = MTLCounterDontSample;
+      return [[cmd_buf blitCommandEncoderWithDescriptor:desc] retain];
+   }
+}
+
+/* Resolve one timestamp sample into `dst` at `dst_offset` (8 bytes: the ns
+ * value). MUST be a different encoder than the one that took the sample —
+ * resolving a slot in its own sampling encoder reads zero (verified). */
+void
+mtl_blit_resolve_timestamp(mtl_blit_encoder *encoder,
+                           mtl_counter_sample_buffer *sample_buffer,
+                           uint32_t sample_index, mtl_buffer *dst,
+                           uint64_t dst_offset)
+{
+   @autoreleasepool {
+      id<MTLBlitCommandEncoder> blit = (id<MTLBlitCommandEncoder>)encoder;
+      id<MTLCounterSampleBuffer> sb =
+         (id<MTLCounterSampleBuffer>)sample_buffer;
+      id<MTLBuffer> dst_buf = (id<MTLBuffer>)dst;
+      [blit resolveCounters:sb
+                    inRange:NSMakeRange(sample_index, 1)
+          destinationBuffer:dst_buf
+          destinationOffset:dst_offset];
    }
 }
 

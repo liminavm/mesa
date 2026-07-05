@@ -41,6 +41,8 @@ kk_encoder_init(mtl_device *device, struct kk_queue *queue,
    enc->event = mtl_new_event(device);
    enc->imm_writes = UTIL_DYNARRAY_INIT;
    enc->copy_query_pool_result_infos = UTIL_DYNARRAY_INIT;
+   enc->timestamp_sample_buffers = UTIL_DYNARRAY_INIT;
+   enc->deferred_timestamps = UTIL_DYNARRAY_INIT;
 
    *encoder = enc;
    return VK_SUCCESS;
@@ -264,6 +266,11 @@ kk_post_execution_release(void *data)
    mtl_release(encoder->event);
    util_dynarray_fini(&encoder->imm_writes);
    util_dynarray_fini(&encoder->copy_query_pool_result_infos);
+   util_dynarray_foreach(&encoder->timestamp_sample_buffers,
+                         mtl_counter_sample_buffer *, sb)
+      mtl_release(*sb);
+   util_dynarray_fini(&encoder->timestamp_sample_buffers);
+   util_dynarray_fini(&encoder->deferred_timestamps);
    free(encoder);
 }
 
@@ -349,6 +356,72 @@ kk_blit_encoder(struct kk_cmd_buffer *cmd)
    }
    encoder->last_used = KK_ENC_BLIT;
    return (mtl_blit_encoder *)encoder->encoder;
+}
+
+void
+kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
+                           uint64_t dst_offset)
+{
+   struct kk_encoder *enc = cmd->encoder;
+   struct kk_encoder_internal *main = &enc->main;
+
+   /* Flush queued query/imm writes and close the current encoder so the GPU
+    * clock is sampled at a clean stage boundary, after all prior work. */
+   upload_queue_writes(cmd);
+   kk_encoder_signal_fence_and_end(cmd);
+
+   mtl_counter_sample_buffer *sb = mtl_new_timestamp_sample_buffer(enc->dev, 1u);
+   if (!sb) {
+      /* Out of resources: the report stays UINT64_MAX (unavailable). A missing
+       * result is safer than a wrong one; this path has no way to fail the cmd
+       * buffer, and timestamp queries are rare. */
+      return;
+   }
+   util_dynarray_append(&enc->timestamp_sample_buffers, sb);
+
+   /* Sampling encoder: latches the GPU clock at its start boundary. */
+   main->encoder =
+      mtl_new_blit_command_encoder_timestamp(main->cmd_buffer, sb, 0u);
+   if (main->wait_fence) {
+      mtl_blit_wait_for_fence(main->encoder,
+                              util_dynarray_top(&main->fences, mtl_fence *));
+      main->wait_fence = false;
+   }
+   main->last_used = KK_ENC_BLIT;
+   kk_encoder_signal_fence(enc);
+   kk_encoder_internal_end_encoding(main);
+
+   /* Resolve encoder: MUST be distinct from the sampling encoder (resolving a
+    * slot in its own sampling encoder reads zero). Writes the ns value into the
+    * query report in GPU command order, so it orders correctly against an
+    * in-stream CmdResetQueryPool / CmdCopyQueryPoolResults. */
+   main->encoder = mtl_new_blit_command_encoder(main->cmd_buffer);
+   if (main->wait_fence) {
+      mtl_blit_wait_for_fence(main->encoder,
+                              util_dynarray_top(&main->fences, mtl_fence *));
+      main->wait_fence = false;
+   }
+   main->last_used = KK_ENC_BLIT;
+   mtl_blit_resolve_timestamp(main->encoder, sb, 0u, dst, dst_offset);
+   kk_encoder_signal_fence(enc);
+   kk_encoder_internal_end_encoding(main);
+}
+
+void
+kk_encoder_defer_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
+                           uint64_t dst_offset)
+{
+   struct kk_deferred_timestamp entry = {.dst = dst, .offset = dst_offset};
+   util_dynarray_append(&cmd->encoder->deferred_timestamps, entry);
+}
+
+void
+kk_encoder_flush_deferred_timestamps(struct kk_cmd_buffer *cmd)
+{
+   struct util_dynarray *arr = &cmd->encoder->deferred_timestamps;
+   util_dynarray_foreach(arr, struct kk_deferred_timestamp, ts)
+      kk_encoder_write_timestamp(cmd, ts->dst, ts->offset);
+   util_dynarray_clear(arr);
 }
 
 mtl_compute_encoder *

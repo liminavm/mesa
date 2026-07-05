@@ -284,6 +284,12 @@ struct kk_cmd_buffer {
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
+
+   /* Inside a vkCmdBeginRendering/EndRendering pair (replay order). Timestamp
+    * writes here are deferred to pass end — we can only sample the GPU clock at
+    * encoder boundaries, and ending a render encoder mid-pass would re-run its
+    * loadOps. */
+   bool in_render_pass;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,

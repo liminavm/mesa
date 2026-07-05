@@ -37,6 +37,17 @@ uint64_t mtl_device_current_allocated_size(mtl_device *dev);
 /* Timestamp query */
 uint64_t mtl_device_get_gpu_timestamp(mtl_device *dev);
 
+/* Whether the device can sample the GPU timestamp counter at command-encoder
+ * stage boundaries (the only sampling point Apple GPUs support). Gates
+ * VkQueueFamilyProperties.timestampValidBits. */
+bool mtl_device_supports_timestamps(mtl_device *dev);
+
+/* Create a shared-storage counter sample buffer over the GPU timestamp counter
+ * set, holding `sample_count` samples. Returns NULL on failure. Release with
+ * mtl_release. */
+mtl_counter_sample_buffer *
+mtl_new_timestamp_sample_buffer(mtl_device *dev, uint32_t sample_count);
+
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,
                                                 uint64_t *size_B,

@@ -73,6 +73,19 @@ struct kk_encoder {
    struct util_dynarray imm_writes;
    /* Array of kk_copy_quer_pool_results_info structs */
    struct util_dynarray copy_query_pool_result_infos;
+
+   /* One-shot MTLCounterSampleBuffers created for timestamp writes; released in
+    * kk_post_execution_release. Array of mtl_counter_sample_buffer *. */
+   struct util_dynarray timestamp_sample_buffers;
+   /* Timestamp writes issued inside a render pass, flushed at its end (we can
+    * only sample at encoder boundaries). Array of kk_deferred_timestamp. */
+   struct util_dynarray deferred_timestamps;
+};
+
+/* A vkCmdWriteTimestamp deferred to the end of the enclosing render pass. */
+struct kk_deferred_timestamp {
+   mtl_buffer *dst; /* pool->bo->map */
+   uint64_t offset; /* byte offset of the query report in dst */
 };
 
 /* Allocates encoder and initialises/creates all resources required to start
@@ -105,5 +118,20 @@ mtl_blit_encoder *kk_blit_encoder(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *kk_encoder_pre_gfx_encoder(struct kk_cmd_buffer *cmd);
 
 void upload_queue_writes(struct kk_cmd_buffer *cmd);
+
+/* Sample the GPU timestamp at the current command-stream point and resolve it
+ * (in GPU command order) into `dst` at `dst_offset` (an 8-byte query report).
+ * Must NOT be called inside a render pass — use kk_encoder_defer_timestamp
+ * there and flush at pass end. */
+void kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
+                                uint64_t dst_offset);
+
+/* Queue a timestamp write to be emitted when the enclosing render pass ends. */
+void kk_encoder_defer_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
+                                uint64_t dst_offset);
+
+/* Emit all deferred (in-render-pass) timestamp writes. Call once the render
+ * encoder has been/will be closed (i.e. outside the pass). */
+void kk_encoder_flush_deferred_timestamps(struct kk_cmd_buffer *cmd);
 
 #endif /* KK_ENCODER_H */

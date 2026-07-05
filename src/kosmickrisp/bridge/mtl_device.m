@@ -12,6 +12,7 @@
 
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCaptureManager.h>
+#include <Metal/MTLCounters.h>
 
 /* Device creation */
 mtl_device *
@@ -165,6 +166,56 @@ mtl_device_get_gpu_timestamp(mtl_device *dev)
       [device sampleTimestamps:&cpu_ts gpuTimestamp:&gpu_ts];
 
       return (uint64_t)gpu_ts;
+   }
+}
+
+static id<MTLCounterSet>
+mtl_timestamp_counter_set(id<MTLDevice> device)
+{
+   for (id<MTLCounterSet> cs in device.counterSets)
+      if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp])
+         return cs;
+   return nil;
+}
+
+bool
+mtl_device_supports_timestamps(mtl_device *dev)
+{
+   @autoreleasepool {
+      id<MTLDevice> device = (id<MTLDevice>)dev;
+      /* Apple GPUs only expose stage-boundary sampling; a mid-encoder sample
+       * (draw/dispatch/blit boundary) is unsupported, so we sample at encoder
+       * boundaries. Also require the GPU timestamp counter set. */
+      return [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary] &&
+             mtl_timestamp_counter_set(device) != nil;
+   }
+}
+
+mtl_counter_sample_buffer *
+mtl_new_timestamp_sample_buffer(mtl_device *dev, uint32_t sample_count)
+{
+   @autoreleasepool {
+      id<MTLDevice> device = (id<MTLDevice>)dev;
+      id<MTLCounterSet> ts = mtl_timestamp_counter_set(device);
+      if (!ts)
+         return NULL;
+
+      MTLCounterSampleBufferDescriptor *desc =
+         [[MTLCounterSampleBufferDescriptor alloc] init];
+      desc.counterSet = ts;
+      desc.storageMode = MTLStorageModeShared;
+      desc.sampleCount = sample_count;
+
+      NSError *err = nil;
+      id<MTLCounterSampleBuffer> sb =
+         [device newCounterSampleBufferWithDescriptor:desc error:&err];
+      [desc release];
+      if (!sb)
+         return NULL;
+
+      /* newCounterSampleBuffer… returns +1; hand ownership to the caller
+       * (released via mtl_release). */
+      return (mtl_counter_sample_buffer *)sb;
    }
 }
 

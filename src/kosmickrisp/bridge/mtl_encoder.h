@@ -20,6 +20,18 @@ mtl_blit_encoder *mtl_new_blit_command_encoder(mtl_command_buffer *cmd_buffer);
 void mtl_blit_update_fence(mtl_blit_encoder *encoder, mtl_fence *fence);
 void mtl_blit_wait_for_fence(mtl_blit_encoder *encoder, mtl_fence *fence);
 
+/* Blit encoder that samples the GPU timestamp at its start boundary. */
+mtl_blit_encoder *mtl_new_blit_command_encoder_timestamp(
+   mtl_command_buffer *cmd_buffer, mtl_counter_sample_buffer *sample_buffer,
+   uint32_t sample_index);
+
+/* Resolve one timestamp sample (8 bytes) into dst at dst_offset. Must run in a
+ * different encoder than the one that sampled it. */
+void mtl_blit_resolve_timestamp(mtl_blit_encoder *encoder,
+                                mtl_counter_sample_buffer *sample_buffer,
+                                uint32_t sample_index, mtl_buffer *dst,
+                                uint64_t dst_offset);
+
 void mtl_copy_from_buffer_to_buffer(mtl_blit_encoder *blit_enc_handle,
                                     mtl_buffer *src_buf, size_t src_offset,
                                     mtl_buffer *dst_buf, size_t dst_offset,

@@ -35,6 +35,7 @@ typedef void mtl_resource;
 typedef void mtl_render_pass_descriptor;
 typedef void mtl_render_pipeline_descriptor;
 typedef void mtl_fence;
+typedef void mtl_counter_sample_buffer;
 typedef void mtl_stencil_descriptor;
 typedef void mtl_depth_stencil_descriptor;
 typedef void mtl_depth_stencil_state;
