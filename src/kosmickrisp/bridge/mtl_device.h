@@ -48,6 +48,21 @@ bool mtl_device_supports_timestamps(mtl_device *dev);
 mtl_counter_sample_buffer *
 mtl_new_timestamp_sample_buffer(mtl_device *dev, uint32_t sample_count);
 
+/* True when this GPU cannot resolve a counter sample from the SAME command
+ * buffer that took it, so the resolve has to be encoded into a later one.
+ *
+ * Measured on M4 Pro: the sample is taken correctly (a CPU resolveCounterRange:
+ * and a resolve encoded in a *later* command buffer both return real advancing
+ * timestamps) but -[MTLBlitCommandEncoder resolveCounters:...] encoded in the
+ * same command buffer writes ZERO -- silently, not MTLCounterErrorValue. M1 Max
+ * has no such restriction. Since a zero is indistinguishable from a resolved
+ * result to every caller, this is detected by measurement rather than assumed
+ * from a GPU family. Result is probed once and cached.
+ *
+ * LIMINA_KK_SPLIT_COUNTER_RESOLVE=1|0 forces the answer, so the split path can
+ * be exercised on hardware that does not need it. */
+bool mtl_device_needs_split_counter_resolve(mtl_device *dev);
+
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,
                                                 uint64_t *size_B,

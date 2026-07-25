@@ -60,6 +60,14 @@ struct kk_encoder {
    /* Compute only for pre gfx required work */
    struct kk_encoder_internal pre_gfx;
 
+   /* Queue `main` allocates command buffers from — kept so main can be split
+    * mid-recording (see extra_cmd_buffers). */
+   mtl_command_queue *main_queue;
+   /* Retired `main` command buffers, oldest first, from splits. Committed in
+    * order ahead of main at submission; released with it. Empty unless the GPU
+    * needs a split counter resolve. Array of mtl_command_buffer *. */
+   struct util_dynarray extra_cmd_buffers;
+
    /* Used to synchronize between main and pre_gfx encoders */
    mtl_event *event;
    uint64_t event_value;

@@ -38,6 +38,8 @@ kk_encoder_init(mtl_device *device, struct kk_queue *queue,
    enc->dev = device;
    kk_encoder_start_internal(&enc->main, device, queue->main.mtl_handle);
    kk_encoder_start_internal(&enc->pre_gfx, device, queue->pre_gfx.mtl_handle);
+   enc->main_queue = queue->main.mtl_handle;
+   enc->extra_cmd_buffers = UTIL_DYNARRAY_INIT;
    enc->event = mtl_new_event(device);
    enc->imm_writes = UTIL_DYNARRAY_INIT;
    enc->copy_query_pool_result_infos = UTIL_DYNARRAY_INIT;
@@ -261,6 +263,9 @@ static void
 kk_post_execution_release(void *data)
 {
    struct kk_encoder *encoder = data;
+   util_dynarray_foreach(&encoder->extra_cmd_buffers, mtl_command_buffer *, cb)
+      mtl_release(*cb);
+   util_dynarray_fini(&encoder->extra_cmd_buffers);
    kk_post_execution_release_internal(&encoder->main);
    kk_post_execution_release_internal(&encoder->pre_gfx);
    mtl_release(encoder->event);
@@ -283,6 +288,12 @@ kk_encoder_submit(struct kk_encoder *encoder)
                              kk_post_execution_release, encoder);
 
    mtl_command_buffer_commit(encoder->pre_gfx.cmd_buffer);
+   /* Command buffers execute in commit order on a queue, so committing the
+    * retired ones first keeps a split transparent to command order. `main` is
+    * committed last and carries the completion handler, so it is still the one
+    * whose completion releases the encoder. */
+   util_dynarray_foreach(&encoder->extra_cmd_buffers, mtl_command_buffer *, cb)
+      mtl_command_buffer_commit(*cb);
    mtl_command_buffer_commit(encoder->main.cmd_buffer);
 }
 
@@ -358,6 +369,31 @@ kk_blit_encoder(struct kk_cmd_buffer *cmd)
    return (mtl_blit_encoder *)encoder->encoder;
 }
 
+/* Retire the current `main` command buffer and continue recording into a fresh
+ * one. Everything already encoded keeps its place: the retired buffer is
+ * committed ahead of the new one, and the fence signalled by the last encoder
+ * before the split is waited on by the first encoder after it — the same
+ * fence-across-command-buffers chaining kk_queue_submit already uses to link
+ * consecutive submissions.
+ *
+ * Only used to work around GPUs that cannot resolve a counter sample from the
+ * command buffer that took it (mtl_device_needs_split_counter_resolve). The
+ * caller must have ended encoding first. */
+static void
+kk_encoder_split_main(struct kk_encoder *encoder)
+{
+   assert(encoder->main.encoder == NULL);
+
+   util_dynarray_append(&encoder->extra_cmd_buffers, encoder->main.cmd_buffer);
+
+   encoder->main.cmd_buffer = mtl_new_command_buffer(encoder->main_queue);
+   encoder->main.last_used = KK_ENC_NONE;
+   /* A fresh command buffer makes no heap resident. */
+   encoder->main.user_heap_hash = UINT32_MAX;
+   if (util_dynarray_num_elements(&encoder->main.fences, mtl_fence *) > 0)
+      encoder->main.wait_fence = true;
+}
+
 void
 kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
                            uint64_t dst_offset)
@@ -394,7 +430,16 @@ kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
    /* Resolve encoder: MUST be distinct from the sampling encoder (resolving a
     * slot in its own sampling encoder reads zero). Writes the ns value into the
     * query report in GPU command order, so it orders correctly against an
-    * in-stream CmdResetQueryPool / CmdCopyQueryPoolResults. */
+    * in-stream CmdResetQueryPool / CmdCopyQueryPoolResults.
+    *
+    * On some GPUs a distinct ENCODER is not enough — the sample is not visible
+    * to a resolve encoded in the same COMMAND BUFFER, which writes zero without
+    * failing (measured on M4 Pro; M1 Max is unaffected). There, split the
+    * command buffer so the resolve lands in the next one. Command buffers run
+    * in commit order, so the in-stream ordering above is preserved. */
+   if (mtl_device_needs_split_counter_resolve(enc->dev))
+      kk_encoder_split_main(enc);
+
    main->encoder = mtl_new_blit_command_encoder(main->cmd_buffer);
    if (main->wait_fence) {
       mtl_blit_wait_for_fence(main->encoder,
