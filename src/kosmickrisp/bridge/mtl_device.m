@@ -240,7 +240,15 @@ mtl_device_needs_split_counter_resolve(mtl_device *dev)
       if (cached_device == device)
          return cached_result;
 
-      bool needs_split = false;
+      /* Fail SAFE, not fail open. The defect is intermittent — on an M4 Pro this probe's own
+       * shape reads zero 48 times in 50, which means a single sample calls the device healthy
+       * about 4% of the time and then caches that for the process lifetime. Every setup failure
+       * below (no counter set, sample buffer or scratch allocation refused) used to land here
+       * too, silently reporting "unaffected". Both are the wrong default: taking the safe path
+       * on an unaffected GPU costs a command-buffer split, while skipping it on an affected one
+       * silently returns zeroed timestamps. So: start at "affected", and only a run of clean
+       * samples clears it. */
+      bool needs_split = true;
       id<MTLCounterSet> ts = mtl_timestamp_counter_set(device);
       id<MTLCommandQueue> queue = [device newCommandQueue];
       id<MTLCounterSampleBuffer> sb = nil;
@@ -264,37 +272,44 @@ mtl_device_needs_split_counter_resolve(mtl_device *dev)
       }
 
       if (sb && scratch && dst) {
-         memset([dst contents], 0, 2u * sizeof(uint64_t));
+         /* Sample repeatedly: one clean read proves nothing, because a device that fails 94%
+          * of the time still passes sometimes. Any zero across the run means affected; only an
+          * unbroken run of clean reads clears the flag. Eight iterations puts a false "healthy"
+          * on this M4 Pro at 0.04^8, and costs an unaffected device eight tiny blits once. */
+         needs_split = false;
+         for (unsigned i = 0u; i < 8u && !needs_split; ++i) {
+            memset([dst contents], 0, 2u * sizeof(uint64_t));
 
-         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-         MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];
-         pass.sampleBufferAttachments[0].sampleBuffer = sb;
-         pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = 0u;
-         pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = 1u;
+            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+            MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];
+            pass.sampleBufferAttachments[0].sampleBuffer = sb;
+            pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = 0u;
+            pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = 1u;
 
-         id<MTLBlitCommandEncoder> sampler =
-            [cmd_buf blitCommandEncoderWithDescriptor:pass];
-         /* The sampling encoder MUST carry real work. An empty blit encoder is
-          * elided before it reaches the GPU, so nothing samples and the resolve
-          * reads zero — which is indistinguishable from the defect we are
-          * probing for, and would make every GPU look affected. */
-         [sampler fillBuffer:scratch
-                       range:NSMakeRange(0, [scratch length])
-                       value:0u];
-         [sampler endEncoding];
+            id<MTLBlitCommandEncoder> sampler =
+               [cmd_buf blitCommandEncoderWithDescriptor:pass];
+            /* The sampling encoder MUST carry real work. An empty blit encoder is
+             * elided before it reaches the GPU, so nothing samples and the resolve
+             * reads zero — which is indistinguishable from the defect we are
+             * probing for, and would make every GPU look affected. */
+            [sampler fillBuffer:scratch
+                          range:NSMakeRange(0, [scratch length])
+                          value:0u];
+            [sampler endEncoding];
 
-         id<MTLBlitCommandEncoder> resolve = [cmd_buf blitCommandEncoder];
-         [resolve resolveCounters:sb
-                          inRange:NSMakeRange(0, 2)
-                destinationBuffer:dst
-                destinationOffset:0];
-         [resolve endEncoding];
+            id<MTLBlitCommandEncoder> resolve = [cmd_buf blitCommandEncoder];
+            [resolve resolveCounters:sb
+                             inRange:NSMakeRange(0, 2)
+                   destinationBuffer:dst
+                   destinationOffset:0];
+            [resolve endEncoding];
 
-         [cmd_buf commit];
-         [cmd_buf waitUntilCompleted];
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
 
-         const uint64_t *v = (const uint64_t *)[dst contents];
-         needs_split = (v[0] == 0u || v[1] == 0u);
+            const uint64_t *v = (const uint64_t *)[dst contents];
+            needs_split = (v[0] == 0u || v[1] == 0u);
+         }
       }
 
       [sb release];
