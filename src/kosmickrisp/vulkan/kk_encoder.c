@@ -49,6 +49,7 @@ kk_encoder_init(mtl_device *device, struct kk_queue *queue,
 
    memset(enc, 0u, sizeof(*enc));
    enc->dev = device;
+   enc->device = kk_queue_device(queue);
    kk_encoder_start_internal(&enc->main, device, queue->main.mtl_handle);
    kk_encoder_start_internal(&enc->pre_gfx, device, queue->pre_gfx.mtl_handle);
    enc->main_queue = queue->main.mtl_handle;
@@ -56,7 +57,6 @@ kk_encoder_init(mtl_device *device, struct kk_queue *queue,
    enc->event = mtl_new_event(device);
    enc->imm_writes = UTIL_DYNARRAY_INIT;
    enc->copy_query_pool_result_infos = UTIL_DYNARRAY_INIT;
-   enc->timestamp_sample_buffers = UTIL_DYNARRAY_INIT;
    enc->deferred_timestamps = UTIL_DYNARRAY_INIT;
 
    *encoder = enc;
@@ -272,6 +272,60 @@ kk_post_execution_release_internal(struct kk_encoder_internal *encoder)
    util_dynarray_fini(&encoder->fences);
 }
 
+void
+kk_timestamp_batch_publish(struct kk_timestamp_batch *batch)
+{
+   util_dynarray_foreach(&batch->samples, struct kk_timestamp_sample, s) {
+      uint64_t ns = mtl_counter_sample_buffer_resolve(s->sb, 0u);
+
+      if (kk_ts_trace())
+         fprintf(stderr, "[KKTS] resolve seq=%llu sb=%p report=%p value=%llu\n",
+                 (unsigned long long)batch->seq, (void *)s->sb,
+                 (void *)s->report, (unsigned long long)ns);
+
+      /* A sample that never materialised leaves the report at the UINT64_MAX
+       * the sampling encoder filled in, i.e. unavailable. Reporting nothing is
+       * the honest answer and the one every caller can act on; a zero would
+       * read back as a query that resolved to time zero. */
+      if (ns != 0u && ns != UINT64_MAX)
+         __atomic_store_n(s->report, ns, __ATOMIC_RELEASE);
+   }
+}
+
+static void
+kk_timestamp_batch_complete(void *data)
+{
+   struct kk_timestamp_batch *batch = data;
+
+   /* Off the in-flight list first: from here on nobody else may touch it. */
+   kk_timestamp_batch_untrack(batch->dev, batch);
+
+   kk_timestamp_batch_publish(batch);
+
+   util_dynarray_foreach(&batch->samples, struct kk_timestamp_sample, s)
+      mtl_release(s->sb);
+   util_dynarray_fini(&batch->samples);
+
+   /* Only now are the reports guaranteed visible, so only now may a waiter
+    * proceed. */
+   kk_timestamp_seq_retire(batch->dev, batch->seq);
+   free(batch);
+}
+
+/* Hand the pending samples to `cb`, whose completion resolves them. */
+static void
+kk_encoder_arm_timestamp_batch(struct kk_encoder *encoder,
+                               mtl_command_buffer *cb)
+{
+   struct kk_timestamp_batch *batch = encoder->ts_batch;
+   if (!batch)
+      return;
+
+   encoder->ts_batch = NULL;
+   kk_timestamp_batch_track(batch->dev, batch);
+   mtl_add_completed_handler(cb, kk_timestamp_batch_complete, batch);
+}
+
 static void
 kk_post_execution_release(void *data)
 {
@@ -284,19 +338,6 @@ kk_post_execution_release(void *data)
    mtl_release(encoder->event);
    util_dynarray_fini(&encoder->imm_writes);
    util_dynarray_fini(&encoder->copy_query_pool_result_infos);
-   util_dynarray_foreach(&encoder->timestamp_sample_buffers,
-                         mtl_counter_sample_buffer *, sb) {
-      /* limina LIMINA_KK_TS_TRACE: this runs after the command buffers have
-       * completed, so a CPU read here says whether the sample was ever TAKEN.
-       * Compared against the value the GPU resolve wrote into the report, it
-       * separates "never sampled" from "sampled, resolve lost it" — the two
-       * faults a zero in the report cannot tell apart. */
-      if (kk_ts_trace())
-         fprintf(stderr, "[KKTS] release sb=%p cpu_peek=%llu\n", (void *)*sb,
-                 (unsigned long long)mtl_counter_sample_buffer_cpu_peek(*sb, 0u));
-      mtl_release(*sb);
-   }
-   util_dynarray_fini(&encoder->timestamp_sample_buffers);
    util_dynarray_fini(&encoder->deferred_timestamps);
    free(encoder);
 }
@@ -305,6 +346,10 @@ void
 kk_encoder_submit(struct kk_encoder *encoder)
 {
    assert(encoder);
+
+   /* Ahead of the release handler: the batch must resolve its samples before
+    * anything else is torn down, and it is what unblocks GPU/CPU waiters. */
+   kk_encoder_arm_timestamp_batch(encoder, encoder->main.cmd_buffer);
 
    mtl_add_completed_handler(encoder->main.cmd_buffer,
                              kk_post_execution_release, encoder);
@@ -398,14 +443,15 @@ kk_blit_encoder(struct kk_cmd_buffer *cmd)
  * fence-across-command-buffers chaining kk_queue_submit already uses to link
  * consecutive submissions.
  *
- * Only used to work around GPUs that cannot resolve a counter sample from the
- * command buffer that took it (mtl_device_needs_split_counter_resolve). The
- * caller must have ended encoding first. */
+ * Used to close a command buffer that carries timestamp samples so it can
+ * complete — its completion is what makes those samples readable. The caller
+ * must have ended encoding first. */
 static void
 kk_encoder_split_main(struct kk_encoder *encoder)
 {
    assert(encoder->main.encoder == NULL);
 
+   kk_encoder_arm_timestamp_batch(encoder, encoder->main.cmd_buffer);
    util_dynarray_append(&encoder->extra_cmd_buffers, encoder->main.cmd_buffer);
 
    encoder->main.cmd_buffer = mtl_new_command_buffer(encoder->main_queue);
@@ -417,8 +463,8 @@ kk_encoder_split_main(struct kk_encoder *encoder)
 }
 
 void
-kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
-                           uint64_t dst_offset)
+kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd,
+                           const struct kk_timestamp_target *target)
 {
    struct kk_encoder *enc = cmd->encoder;
    struct kk_encoder_internal *main = &enc->main;
@@ -435,27 +481,44 @@ kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
        * buffer, and timestamp queries are rare. */
       return;
    }
-   util_dynarray_append(&enc->timestamp_sample_buffers, sb);
+
+   if (!enc->ts_batch) {
+      struct kk_timestamp_batch *batch = calloc(1u, sizeof(*batch));
+      if (!batch) {
+         mtl_release(sb);
+         return;
+      }
+      batch->dev = enc->device;
+      batch->seq = kk_timestamp_seq_alloc(enc->device);
+      batch->samples = (struct util_dynarray)UTIL_DYNARRAY_INIT;
+      enc->ts_batch = batch;
+   }
 
    /* Sampling encoder: latches the GPU clock at its start boundary. */
    main->encoder =
       mtl_new_blit_command_encoder_timestamp(main->cmd_buffer, sb, 0u);
-   /* The sampling encoder MUST carry real work.
+
+   /* Mark the report unavailable, in GPU command order, at exactly the point
+    * the clock is sampled. Two jobs in one fill:
     *
-    * Metal elides a blit encoder that encodes nothing, and an elided encoder
-    * never takes its counter sample — the report then reads 0 with the query
-    * marked available, which is indistinguishable from a GPU that ran
-    * instantly. Everything this encoder does otherwise (fence wait, fence
-    * signal) is synchronisation, not data movement, and does not count.
+    * 1. Correctness. The resolved value is written by the CPU when this command
+    *    buffer completes, so between here and there the report must not read as
+    *    a finished query. A TIMESTAMP pool has no availability word — the
+    *    convention is value != UINT64_MAX (libkk/kk_query.cl), so 0xff bytes
+    *    say "not yet". Ordering it here also means an earlier in-stream
+    *    vkCmdResetQueryPool cannot clobber it, and a later one wins over it.
     *
-    * Measured on M4 Pro: with no work here a CPU resolveCounterRange: of the
-    * sample buffer reads 0 in 20 runs out of 20 — the sample is never taken.
-    * With this fill it reads a real timestamp 20 out of 20. M1 Max does not
-    * elide it, which is why this went unnoticed there.
-    *
-    * Filling the 8 bytes at dst_offset is free in effect: the resolve encoder
-    * below overwrites exactly that slot with the resolved value. */
-   mtl_blit_fill_buffer(main->encoder, dst, dst_offset, sizeof(uint64_t), 0u);
+    * 2. The sampling encoder MUST carry real work. Metal elides a blit encoder
+    *    that encodes nothing, and an elided encoder never takes its counter
+    *    sample — the report then keeps whatever it held, with no hint that
+    *    anything went wrong. Fence waits and signals are synchronisation, not
+    *    data movement, and do not count. Measured on M4 Pro: with no work here
+    *    a CPU resolveCounterRange: of the sample buffer reads 0 in 20 runs out
+    *    of 20; with this fill it reads a real timestamp 20 out of 20. M1 Max
+    *    does not elide it, which is why this went unnoticed there. */
+   mtl_blit_fill_buffer(main->encoder, target->dst, target->offset,
+                        sizeof(uint64_t), 0xffu);
+
    if (main->wait_fence) {
       mtl_blit_wait_for_fence(main->encoder,
                               util_dynarray_top(&main->fences, mtl_fence *));
@@ -465,49 +528,83 @@ kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
    kk_encoder_signal_fence(enc);
    kk_encoder_internal_end_encoding(main);
 
-   /* Resolve encoder: MUST be distinct from the sampling encoder (resolving a
-    * slot in its own sampling encoder reads zero). Writes the ns value into the
-    * query report in GPU command order, so it orders correctly against an
-    * in-stream CmdResetQueryPool / CmdCopyQueryPoolResults.
+   /* No GPU resolve. -[MTLBlitCommandEncoder resolveCounters:] cannot be
+    * trusted: the sample only materialises when the command buffer that took it
+    * COMPLETES, and a resolve encoded before that silently writes zero rather
+    * than failing. On M4 Pro that is 94% of the time from the same command
+    * buffer and still 18% from a later one (50 runs each) — and since KK's
+    * availability test for a timestamp is "value != UINT64_MAX", a zero reads
+    * back as a query that legitimately resolved to zero. Nothing downstream can
+    * tell the two apart, which is what made this cost a day of guest-side
+    * investigation.
     *
-    * On some GPUs a distinct ENCODER is not enough — the sample is not visible
-    * to a resolve encoded in the same COMMAND BUFFER, which writes zero without
-    * failing (measured on M4 Pro; M1 Max is unaffected). There, split the
-    * command buffer so the resolve lands in the next one. Command buffers run
-    * in commit order, so the in-stream ordering above is preserved. */
-   const bool split = mtl_device_needs_split_counter_resolve(enc->dev);
+    * So the value is read on the CPU in the completion handler instead
+    * (mtl_counter_sample_buffer_resolve — 50 runs out of 50 on both M1 Max and
+    * M4 Pro), and everything that could observe the report earlier is ordered
+    * against that write through kk_encoder_timestamp_barrier. */
+   struct kk_timestamp_sample sample = {.sb = sb, .report = target->report};
+   util_dynarray_append_typed(&enc->ts_batch->samples,
+                              struct kk_timestamp_sample, sample);
+
+   /* Publish before returning: from here on, a consumer of this pool must
+    * barrier against this sequence number. Monotonic max rather than a plain
+    * store -- two threads may be recording timestamps into the same pool, and
+    * the pool has to end up naming the LATEST write to wait for. */
+   uint64_t seen = __atomic_load_n(target->pending_seq, __ATOMIC_RELAXED);
+   while (seen < enc->ts_batch->seq &&
+          !__atomic_compare_exchange_n(target->pending_seq, &seen,
+                                       enc->ts_batch->seq, true,
+                                       __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+      ;
+
    if (kk_ts_trace())
-      fprintf(stderr, "[KKTS] write_timestamp sb=%p dst=%p off=%llu split=%d\n",
-              (void *)sb, (void *)dst, (unsigned long long)dst_offset, (int)split);
-   if (split)
-      kk_encoder_split_main(enc);
-
-   main->encoder = mtl_new_blit_command_encoder(main->cmd_buffer);
-   if (main->wait_fence) {
-      mtl_blit_wait_for_fence(main->encoder,
-                              util_dynarray_top(&main->fences, mtl_fence *));
-      main->wait_fence = false;
-   }
-   main->last_used = KK_ENC_BLIT;
-   mtl_blit_resolve_timestamp(main->encoder, sb, 0u, dst, dst_offset);
-   kk_encoder_signal_fence(enc);
-   kk_encoder_internal_end_encoding(main);
+      fprintf(stderr, "[KKTS] write_timestamp seq=%llu sb=%p dst=%p off=%llu\n",
+              (unsigned long long)enc->ts_batch->seq, (void *)sb,
+              (void *)target->dst, (unsigned long long)target->offset);
 }
 
 void
-kk_encoder_defer_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
-                           uint64_t dst_offset)
+kk_encoder_timestamp_barrier(struct kk_cmd_buffer *cmd, uint64_t seq)
 {
-   struct kk_deferred_timestamp entry = {.dst = dst, .offset = dst_offset};
-   util_dynarray_append(&cmd->encoder->deferred_timestamps, entry);
+   struct kk_encoder *enc = cmd->encoder;
+   struct kk_device *dev = enc->device;
+
+   /* Already written, and a CPU write that has landed is visible to the GPU
+    * (the report lives in shared storage). Nothing to order. */
+   if (seq == 0u || seq <= kk_timestamp_seq_signalled(dev))
+      return;
+
+   /* The pending write happens in a completion handler, so it cannot happen
+    * while the command buffer that holds the samples is still running. Waiting
+    * for it from inside that same command buffer would deadlock — close it
+    * first. Splits are committed ahead of `main`, so command order survives. */
+   kk_encoder_signal_fence_and_end(cmd);
+   if (enc->ts_batch)
+      kk_encoder_split_main(enc);
+
+   mtl_encode_wait_for_event(enc->main.cmd_buffer, kk_timestamp_event(dev),
+                             seq);
+
+   if (kk_ts_trace())
+      fprintf(stderr, "[KKTS] barrier seq=%llu (signalled=%llu)\n",
+              (unsigned long long)seq,
+              (unsigned long long)kk_timestamp_seq_signalled(dev));
+}
+
+void
+kk_encoder_defer_timestamp(struct kk_cmd_buffer *cmd,
+                           const struct kk_timestamp_target *target)
+{
+   util_dynarray_append_typed(&cmd->encoder->deferred_timestamps,
+                              struct kk_timestamp_target, *target);
 }
 
 void
 kk_encoder_flush_deferred_timestamps(struct kk_cmd_buffer *cmd)
 {
    struct util_dynarray *arr = &cmd->encoder->deferred_timestamps;
-   util_dynarray_foreach(arr, struct kk_deferred_timestamp, ts)
-      kk_encoder_write_timestamp(cmd, ts->dst, ts->offset);
+   util_dynarray_foreach(arr, struct kk_timestamp_target, ts)
+      kk_encoder_write_timestamp(cmd, ts);
    util_dynarray_clear(arr);
 }
 

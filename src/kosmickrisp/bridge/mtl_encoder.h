@@ -25,18 +25,11 @@ mtl_blit_encoder *mtl_new_blit_command_encoder_timestamp(
    mtl_command_buffer *cmd_buffer, mtl_counter_sample_buffer *sample_buffer,
    uint32_t sample_index);
 
-/* Resolve one timestamp sample (8 bytes) into dst at dst_offset. Must run in a
- * different encoder than the one that sampled it. */
-void mtl_blit_resolve_timestamp(mtl_blit_encoder *encoder,
-                                mtl_counter_sample_buffer *sample_buffer,
-                                uint32_t sample_index, mtl_buffer *dst,
-                                uint64_t dst_offset);
-
 /* Fill `length` bytes of `buf` at `offset` with `value`.
  *
- * Exists so a counter-sampling encoder can carry real work: Metal elides a blit
- * encoder that encodes nothing, and an elided encoder never takes its counter
- * sample. See kk_encoder_write_timestamp. */
+ * Also what lets a counter-sampling encoder carry real work: Metal elides a
+ * blit encoder that encodes nothing, and an elided encoder never takes its
+ * counter sample. See kk_encoder_write_timestamp. */
 void mtl_blit_fill_buffer(mtl_blit_encoder *blit_enc_handle, mtl_buffer *buf,
                           size_t offset, size_t length, uint8_t value);
 

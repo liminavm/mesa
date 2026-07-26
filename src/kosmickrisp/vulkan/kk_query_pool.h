@@ -21,6 +21,13 @@ struct kk_query_pool {
    uint32_t query_stride;
 
    unsigned oq_queries;
+
+   /* Timestamp pools only: the highest kk_timestamp_sync sequence number whose
+    * report write targets this pool. Anything that observes a report has to be
+    * ordered against it, because that write comes from a command-buffer
+    * completion handler rather than from GPU command order. 0 = nothing
+    * pending. See kk_encoder_write_timestamp. */
+   uint64_t ts_pending_seq;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_query_pool, vk.base, VkQueryPool,

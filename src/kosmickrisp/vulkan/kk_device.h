@@ -26,6 +26,7 @@
 
 struct kk_bo;
 struct kk_physical_device;
+struct kk_timestamp_batch;
 struct vk_pipeline_cache;
 
 struct kk_residency_set {
@@ -75,6 +76,33 @@ struct kk_precompiled_cache {
    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
 };
 
+/* Ordering for timestamp queries, whose report is written by the CPU when the
+ * command buffer that sampled the GPU clock completes (see
+ * kk_encoder_write_timestamp). That write lands OUTSIDE GPU command order, so
+ * anything that observes the report -- an in-stream vkCmdResetQueryPool or
+ * vkCmdCopyQueryPoolResults, a host vkResetQueryPool, destroying the pool --
+ * has to be ordered against it explicitly.
+ *
+ * Every command buffer that carries timestamp samples takes a sequence number.
+ * Its completion handler writes the reports and then retires that number, and
+ * `event` is advanced to the largest CONTIGUOUS retired prefix -- so a waiter
+ * on N is released only once 1..N have all been written, whatever order the
+ * completion handlers happen to fire in. Consumers wait on `event`: on the GPU
+ * with encodeWaitForEvent:, on the CPU with waitUntilSignaledValue:. */
+struct kk_timestamp_sync {
+   simple_mtx_t mutex;
+   mtl_shared_event *event;
+   uint64_t next_seq;  /* last sequence number handed out */
+   uint64_t signalled; /* == event.signaledValue, the retired prefix */
+   /* Sequence numbers retired ahead of `signalled + 1`; drained into the
+    * prefix as the gaps fill. Normally empty. Array of uint64_t. */
+   struct util_dynarray retired_out_of_order;
+   /* Batches submitted but not yet retired, so a CPU reader can publish one
+    * early instead of losing a race with its completion handler. Array of
+    * struct kk_timestamp_batch *. */
+   struct util_dynarray in_flight;
+};
+
 struct kk_device {
    struct vk_device vk;
 
@@ -120,6 +148,8 @@ struct kk_device {
       } entries[32];
       uint32_t next;
    } xfb_counters;
+
+   struct kk_timestamp_sync timestamps;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
@@ -142,6 +172,43 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
 void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
                                                 mtl_buffer *buffer);
 void kk_device_make_resources_resident(struct kk_device *dev);
+
+/* Take the sequence number for a command buffer that is about to carry
+ * timestamp samples. Never returns 0 (0 means "no pending write"). */
+uint64_t kk_timestamp_seq_alloc(struct kk_device *dev);
+
+/* Called from the completion handler once `seq`'s reports have been written.
+ * Advances the shared event over the newly contiguous prefix. */
+void kk_timestamp_seq_retire(struct kk_device *dev, uint64_t seq);
+
+/* The retired prefix, i.e. every timestamp report with a sequence number <=
+ * this has already been written. Cheap; used to skip needless barriers. */
+uint64_t kk_timestamp_seq_signalled(struct kk_device *dev);
+
+/* Block until `seq` has been retired. For host-side observers of the report
+ * (vkResetQueryPool, vkDestroyQueryPool). */
+void kk_timestamp_wait_cpu(struct kk_device *dev, uint64_t seq);
+
+/* Write out the reports of every in-flight batch up to `seq` whose sample has
+ * already materialised, without waiting for its completion handler.
+ *
+ * Non-blocking and self-validating: a counter sample buffer is freshly
+ * allocated per timestamp and resolves to 0 (or MTLCounterErrorValue) until the
+ * GPU actually takes its sample, so a nonzero read is necessarily the real
+ * thing and a zero simply means "not yet" -- there is no window in which this
+ * can invent a value. Lets vkGetQueryPoolResults answer a poll issued the
+ * moment the queue goes idle, which otherwise loses to the completion handler
+ * every single time (0 successes in 10 runs; 4 in 5 with this). */
+void kk_timestamp_publish_ready(struct kk_device *dev, uint64_t seq);
+
+/* Track/untrack an in-flight batch. Internal to the timestamp path. */
+void kk_timestamp_batch_track(struct kk_device *dev,
+                              struct kk_timestamp_batch *batch);
+void kk_timestamp_batch_untrack(struct kk_device *dev,
+                                struct kk_timestamp_batch *batch);
+
+/* The shared event to encodeWaitForEvent: on for GPU-side observers. */
+mtl_shared_event *kk_timestamp_event(struct kk_device *dev);
 
 /* Required to create a sampler */
 mtl_sampler *kk_sampler_create(struct kk_device *dev,

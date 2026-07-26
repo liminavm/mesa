@@ -54,8 +54,42 @@ struct kk_copy_query_pool_results_info {
    uint32_t query_count;
 };
 
+/* Where one vkCmdWriteTimestamp puts its result.
+ *
+ * Both mappings of the same 8 bytes are needed: the GPU one so the report can
+ * be marked unavailable in command order at the point the clock is sampled, the
+ * CPU one so the resolved value can be written when the command buffer
+ * completes. See kk_encoder_write_timestamp. */
+struct kk_timestamp_target {
+   mtl_buffer *dst;       /* pool->bo->map */
+   uint64_t offset;       /* byte offset of the query report within dst */
+   uint64_t *report;      /* pool->bo->cpu + offset */
+   uint64_t *pending_seq; /* &pool->ts_pending_seq, published on write */
+};
+
+struct kk_timestamp_sample {
+   mtl_counter_sample_buffer *sb; /* owned */
+   uint64_t *report;              /* CPU map of the 8-byte query report */
+};
+
+/* One command buffer's worth of timestamp samples, resolved on the CPU once it
+ * completes. Self-contained: it owns everything it touches, so its completion
+ * handler can run in any order against the encoder's own. */
+struct kk_timestamp_batch {
+   struct kk_device *dev;
+   uint64_t seq;
+   /* Array of struct kk_timestamp_sample. */
+   struct util_dynarray samples;
+};
+
+/* Resolve this batch's samples and write them into their query reports. Safe to
+ * call more than once, and safe to call before the completion handler: a sample
+ * that has not been taken yet resolves to 0 and is skipped. */
+void kk_timestamp_batch_publish(struct kk_timestamp_batch *batch);
+
 struct kk_encoder {
    mtl_device *dev;
+   struct kk_device *device;
    struct kk_encoder_internal main;
    /* Compute only for pre gfx required work */
    struct kk_encoder_internal pre_gfx;
@@ -82,18 +116,13 @@ struct kk_encoder {
    /* Array of kk_copy_quer_pool_results_info structs */
    struct util_dynarray copy_query_pool_result_infos;
 
-   /* One-shot MTLCounterSampleBuffers created for timestamp writes; released in
-    * kk_post_execution_release. Array of mtl_counter_sample_buffer *. */
-   struct util_dynarray timestamp_sample_buffers;
+   /* Timestamp samples taken into the CURRENT main command buffer, awaiting the
+    * CPU resolve its completion handler will do. NULL when there are none.
+    * Handed to that command buffer by kk_encoder_split_main / _submit. */
+   struct kk_timestamp_batch *ts_batch;
    /* Timestamp writes issued inside a render pass, flushed at its end (we can
-    * only sample at encoder boundaries). Array of kk_deferred_timestamp. */
+    * only sample at encoder boundaries). Array of kk_timestamp_target. */
    struct util_dynarray deferred_timestamps;
-};
-
-/* A vkCmdWriteTimestamp deferred to the end of the enclosing render pass. */
-struct kk_deferred_timestamp {
-   mtl_buffer *dst; /* pool->bo->map */
-   uint64_t offset; /* byte offset of the query report in dst */
 };
 
 /* Allocates encoder and initialises/creates all resources required to start
@@ -127,16 +156,24 @@ mtl_compute_encoder *kk_encoder_pre_gfx_encoder(struct kk_cmd_buffer *cmd);
 
 void upload_queue_writes(struct kk_cmd_buffer *cmd);
 
-/* Sample the GPU timestamp at the current command-stream point and resolve it
- * (in GPU command order) into `dst` at `dst_offset` (an 8-byte query report).
+/* Sample the GPU timestamp at the current command-stream point. The report is
+ * marked unavailable in GPU command order here and written with the resolved
+ * value when this command buffer completes; *target->pending_seq is set to the
+ * sequence number to order that write against (see kk_timestamp_sync).
+ *
  * Must NOT be called inside a render pass — use kk_encoder_defer_timestamp
  * there and flush at pass end. */
-void kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
-                                uint64_t dst_offset);
+void kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd,
+                                const struct kk_timestamp_target *target);
 
 /* Queue a timestamp write to be emitted when the enclosing render pass ends. */
-void kk_encoder_defer_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
-                                uint64_t dst_offset);
+void kk_encoder_defer_timestamp(struct kk_cmd_buffer *cmd,
+                                const struct kk_timestamp_target *target);
+
+/* Order everything encoded after this point in `cmd` against the timestamp
+ * report writes up to `seq`. Cheap and no-op once they have landed. Must not be
+ * called inside a render pass (it may end the current command buffer). */
+void kk_encoder_timestamp_barrier(struct kk_cmd_buffer *cmd, uint64_t seq);
 
 /* Emit all deferred (in-render-pass) timestamp writes. Call once the render
  * encoder has been/will be closed (i.e. outside the pass). */

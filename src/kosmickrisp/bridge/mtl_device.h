@@ -48,25 +48,20 @@ bool mtl_device_supports_timestamps(mtl_device *dev);
 mtl_counter_sample_buffer *
 mtl_new_timestamp_sample_buffer(mtl_device *dev, uint32_t sample_count);
 
-/* True when this GPU cannot resolve a counter sample from the SAME command
- * buffer that took it, so the resolve has to be encoded into a later one.
+/* Read a counter sample back on the CPU (-[MTLCounterSampleBuffer
+ * resolveCounterRange:]). Only valid once the command buffer holding the
+ * sampling encoder has COMPLETED -- that is when the sample materialises.
  *
- * Measured on M4 Pro: the sample is taken correctly (a CPU resolveCounterRange:
- * and a resolve encoded in a *later* command buffer both return real advancing
- * timestamps) but -[MTLBlitCommandEncoder resolveCounters:...] encoded in the
- * same command buffer writes ZERO -- silently, not MTLCounterErrorValue. M1 Max
- * has no such restriction. Since a zero is indistinguishable from a resolved
- * result to every caller, this is detected by measurement rather than assumed
- * from a GPU family. Result is probed once and cached.
+ * This is the only reliable way to get the value out on some GPUs. On M4 Pro a
+ * GPU -[MTLBlitCommandEncoder resolveCounters:] writes ZERO -- silently, not
+ * MTLCounterErrorValue -- for a sample taken in the same command buffer (94% of
+ * the time) and even for one taken in an earlier command buffer that has not
+ * completed yet (18%). This path returned a real timestamp in 50 runs out of 50
+ * on both M1 Max and M4 Pro. See kk_encoder_write_timestamp.
  *
- * LIMINA_KK_SPLIT_COUNTER_RESOLVE=1|0 forces the answer, so the split path can
- * be exercised on hardware that does not need it. */
-bool mtl_device_needs_split_counter_resolve(mtl_device *dev);
-
-/* limina LIMINA_KK_TS_TRACE: CPU-side read of a counter sample, to tell "the
- * sample was never taken" apart from "the resolve lost it". See mtl_device.m. */
-uint64_t
-mtl_counter_sample_buffer_cpu_peek(mtl_counter_sample_buffer *sb, uint32_t index);
+ * Returns 0 if the sample is unavailable or the range cannot be resolved. */
+uint64_t mtl_counter_sample_buffer_resolve(mtl_counter_sample_buffer *sb,
+                                           uint32_t index);
 
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,

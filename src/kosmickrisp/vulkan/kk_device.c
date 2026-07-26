@@ -8,6 +8,7 @@
 #include "kk_device.h"
 
 #include "kk_cmd_buffer.h"
+#include "kk_encoder.h"
 #include "kk_entrypoints.h"
 #include "kk_instance.h"
 #include "kk_physical_device.h"
@@ -299,11 +300,18 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->mtl_compiler_handle == NULL)
       goto fail_init;
 
+   simple_mtx_init(&dev->timestamps.mutex, mtx_plain);
+   util_dynarray_init(&dev->timestamps.retired_out_of_order, NULL);
+   util_dynarray_init(&dev->timestamps.in_flight, NULL);
+   dev->timestamps.event = mtl_new_shared_event(dev->mtl_handle);
+   if (dev->timestamps.event == NULL)
+      goto fail_timestamps;
+
    /* We need to initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
    if (dev->residency_set.handle == NULL)
-      goto fail_compiler;
+      goto fail_residency_set;
 
    if (pCreateInfo->queueCreateInfoCount > 0) {
       result =
@@ -347,8 +355,13 @@ fail_mem_cache:
    }
 fail_vab_memory:
    mtl_release(dev->residency_set.handle);
+fail_residency_set:
    simple_mtx_destroy(&dev->residency_set.mutex);
-fail_compiler:
+   mtl_release(dev->timestamps.event);
+fail_timestamps:
+   util_dynarray_fini(&dev->timestamps.retired_out_of_order);
+   util_dynarray_fini(&dev->timestamps.in_flight);
+   simple_mtx_destroy(&dev->timestamps.mutex);
    kk_release_compiler(dev);
 fail_init:
    vk_device_finish(&dev->vk);
@@ -389,6 +402,16 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Release the residency set last once all BOs are released. */
    mtl_release(dev->residency_set.handle);
    simple_mtx_destroy(&dev->residency_set.mutex);
+
+   /* A timestamp batch retires from a command-buffer COMPLETION handler, which
+    * runs after the event a fence waits on has already been signalled -- so
+    * vkDeviceWaitIdle returning does not mean the handlers have run. Drain them
+    * explicitly before the state they touch goes away. */
+   kk_timestamp_wait_cpu(dev, dev->timestamps.next_seq);
+   mtl_release(dev->timestamps.event);
+   util_dynarray_fini(&dev->timestamps.retired_out_of_order);
+   util_dynarray_fini(&dev->timestamps.in_flight);
+   simple_mtx_destroy(&dev->timestamps.mutex);
 
    kk_release_compiler(dev);
 
@@ -458,4 +481,115 @@ kk_device_make_resources_resident(struct kk_device *dev)
    mtl_residency_set_commit(dev->residency_set.handle);
    mtl_residency_set_request_residency(dev->residency_set.handle);
    simple_mtx_unlock(&dev->residency_set.mutex);
+}
+
+/* Timestamp query completion ordering. See struct kk_timestamp_sync. */
+
+uint64_t
+kk_timestamp_seq_alloc(struct kk_device *dev)
+{
+   simple_mtx_lock(&dev->timestamps.mutex);
+   uint64_t seq = ++dev->timestamps.next_seq;
+   simple_mtx_unlock(&dev->timestamps.mutex);
+   return seq;
+}
+
+void
+kk_timestamp_seq_retire(struct kk_device *dev, uint64_t seq)
+{
+   struct kk_timestamp_sync *ts = &dev->timestamps;
+
+   simple_mtx_lock(&ts->mutex);
+   assert(seq > ts->signalled);
+
+   if (seq == ts->signalled + 1u) {
+      ts->signalled = seq;
+      /* Absorb anything that retired ahead of us. The array is tiny (it only
+       * ever holds command buffers whose completion handlers ran out of order),
+       * so a rescan per absorbed entry is cheaper than keeping it sorted. */
+      bool progress;
+      do {
+         progress = false;
+         util_dynarray_foreach(&ts->retired_out_of_order, uint64_t, other) {
+            if (*other != ts->signalled + 1u)
+               continue;
+            ts->signalled = *other;
+            /* Compact by swapping the tail element into this slot. */
+            *other = util_dynarray_pop(&ts->retired_out_of_order, uint64_t);
+            progress = true;
+            break;
+         }
+      } while (progress);
+
+      mtl_shared_event_set_signaled_value(ts->event, ts->signalled);
+   } else {
+      util_dynarray_append_typed(&ts->retired_out_of_order, uint64_t, seq);
+   }
+   simple_mtx_unlock(&ts->mutex);
+}
+
+uint64_t
+kk_timestamp_seq_signalled(struct kk_device *dev)
+{
+   simple_mtx_lock(&dev->timestamps.mutex);
+   uint64_t signalled = dev->timestamps.signalled;
+   simple_mtx_unlock(&dev->timestamps.mutex);
+   return signalled;
+}
+
+mtl_shared_event *
+kk_timestamp_event(struct kk_device *dev)
+{
+   return dev->timestamps.event;
+}
+
+void
+kk_timestamp_batch_track(struct kk_device *dev, struct kk_timestamp_batch *batch)
+{
+   simple_mtx_lock(&dev->timestamps.mutex);
+   util_dynarray_append_typed(&dev->timestamps.in_flight,
+                              struct kk_timestamp_batch *, batch);
+   simple_mtx_unlock(&dev->timestamps.mutex);
+}
+
+void
+kk_timestamp_batch_untrack(struct kk_device *dev,
+                           struct kk_timestamp_batch *batch)
+{
+   simple_mtx_lock(&dev->timestamps.mutex);
+   util_dynarray_foreach(&dev->timestamps.in_flight,
+                         struct kk_timestamp_batch *, slot) {
+      if (*slot != batch)
+         continue;
+      *slot = util_dynarray_pop(&dev->timestamps.in_flight,
+                                struct kk_timestamp_batch *);
+      break;
+   }
+   simple_mtx_unlock(&dev->timestamps.mutex);
+}
+
+void
+kk_timestamp_publish_ready(struct kk_device *dev, uint64_t seq)
+{
+   simple_mtx_lock(&dev->timestamps.mutex);
+   util_dynarray_foreach(&dev->timestamps.in_flight,
+                         struct kk_timestamp_batch *, slot) {
+      /* Publishing is idempotent -- it recomputes the same value from the same
+       * sample -- so racing the batch's own completion handler is harmless. */
+      if ((*slot)->seq <= seq)
+         kk_timestamp_batch_publish(*slot);
+   }
+   simple_mtx_unlock(&dev->timestamps.mutex);
+}
+
+void
+kk_timestamp_wait_cpu(struct kk_device *dev, uint64_t seq)
+{
+   if (seq == 0u || seq <= kk_timestamp_seq_signalled(dev))
+      return;
+
+   /* Same budget as kk_query_wait_for_available. A timeout here means the
+    * command buffer never completed, which the device-lost path owns; there is
+    * nothing useful to do about it from a query-pool teardown. */
+   mtl_shared_event_wait_until_signaled_value(dev->timestamps.event, seq, 2000u);
 }

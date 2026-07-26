@@ -139,23 +139,6 @@ mtl_new_blit_command_encoder_timestamp(mtl_command_buffer *cmd_buffer,
 /* Resolve one timestamp sample into `dst` at `dst_offset` (8 bytes: the ns
  * value). MUST be a different encoder than the one that took the sample —
  * resolving a slot in its own sampling encoder reads zero (verified). */
-void
-mtl_blit_resolve_timestamp(mtl_blit_encoder *encoder,
-                           mtl_counter_sample_buffer *sample_buffer,
-                           uint32_t sample_index, mtl_buffer *dst,
-                           uint64_t dst_offset)
-{
-   @autoreleasepool {
-      id<MTLBlitCommandEncoder> blit = (id<MTLBlitCommandEncoder>)encoder;
-      id<MTLCounterSampleBuffer> sb =
-         (id<MTLCounterSampleBuffer>)sample_buffer;
-      id<MTLBuffer> dst_buf = (id<MTLBuffer>)dst;
-      [blit resolveCounters:sb
-                    inRange:NSMakeRange(sample_index, 1)
-          destinationBuffer:dst_buf
-          destinationOffset:dst_offset];
-   }
-}
 
 void
 mtl_copy_from_buffer_to_buffer(mtl_blit_encoder *blit_enc_handle,

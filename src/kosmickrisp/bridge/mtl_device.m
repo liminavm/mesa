@@ -13,12 +13,6 @@
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCaptureManager.h>
 #include <Metal/MTLCounters.h>
-/* mtl_device_needs_split_counter_resolve encodes a probe command buffer. */
-#include <Metal/MTLBlitCommandEncoder.h>
-#include <Metal/MTLBlitPass.h>
-#include <Metal/MTLBuffer.h>
-#include <Metal/MTLCommandBuffer.h>
-#include <Metal/MTLCommandQueue.h>
 
 /* Device creation */
 mtl_device *
@@ -225,104 +219,6 @@ mtl_new_timestamp_sample_buffer(mtl_device *dev, uint32_t sample_count)
    }
 }
 
-bool
-mtl_device_needs_split_counter_resolve(mtl_device *dev)
-{
-   static id<MTLDevice> cached_device = nil;
-   static bool cached_result = false;
-
-   const char *force = getenv("LIMINA_KK_SPLIT_COUNTER_RESOLVE");
-   if (force)
-      return force[0] != '0';
-
-   @autoreleasepool {
-      id<MTLDevice> device = (id<MTLDevice>)dev;
-      if (cached_device == device)
-         return cached_result;
-
-      /* Fail SAFE, not fail open. The defect is intermittent — on an M4 Pro this probe's own
-       * shape reads zero 48 times in 50, which means a single sample calls the device healthy
-       * about 4% of the time and then caches that for the process lifetime. Every setup failure
-       * below (no counter set, sample buffer or scratch allocation refused) used to land here
-       * too, silently reporting "unaffected". Both are the wrong default: taking the safe path
-       * on an unaffected GPU costs a command-buffer split, while skipping it on an affected one
-       * silently returns zeroed timestamps. So: start at "affected", and only a run of clean
-       * samples clears it. */
-      bool needs_split = true;
-      id<MTLCounterSet> ts = mtl_timestamp_counter_set(device);
-      id<MTLCommandQueue> queue = [device newCommandQueue];
-      id<MTLCounterSampleBuffer> sb = nil;
-      id<MTLBuffer> scratch = nil;
-      id<MTLBuffer> dst = nil;
-
-      if (ts && queue) {
-         MTLCounterSampleBufferDescriptor *desc =
-            [[MTLCounterSampleBufferDescriptor alloc] init];
-         desc.counterSet = ts;
-         desc.storageMode = MTLStorageModeShared;
-         desc.sampleCount = 2u;
-         NSError *err = nil;
-         sb = [device newCounterSampleBufferWithDescriptor:desc error:&err];
-         [desc release];
-
-         scratch = [device newBufferWithLength:4096
-                                       options:MTLResourceStorageModeShared];
-         dst = [device newBufferWithLength:2u * sizeof(uint64_t)
-                                   options:MTLResourceStorageModeShared];
-      }
-
-      if (sb && scratch && dst) {
-         /* Sample repeatedly: one clean read proves nothing, because a device that fails 94%
-          * of the time still passes sometimes. Any zero across the run means affected; only an
-          * unbroken run of clean reads clears the flag. Eight iterations puts a false "healthy"
-          * on this M4 Pro at 0.04^8, and costs an unaffected device eight tiny blits once. */
-         needs_split = false;
-         for (unsigned i = 0u; i < 8u && !needs_split; ++i) {
-            memset([dst contents], 0, 2u * sizeof(uint64_t));
-
-            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-            MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];
-            pass.sampleBufferAttachments[0].sampleBuffer = sb;
-            pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = 0u;
-            pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = 1u;
-
-            id<MTLBlitCommandEncoder> sampler =
-               [cmd_buf blitCommandEncoderWithDescriptor:pass];
-            /* The sampling encoder MUST carry real work. An empty blit encoder is
-             * elided before it reaches the GPU, so nothing samples and the resolve
-             * reads zero — which is indistinguishable from the defect we are
-             * probing for, and would make every GPU look affected. */
-            [sampler fillBuffer:scratch
-                          range:NSMakeRange(0, [scratch length])
-                          value:0u];
-            [sampler endEncoding];
-
-            id<MTLBlitCommandEncoder> resolve = [cmd_buf blitCommandEncoder];
-            [resolve resolveCounters:sb
-                             inRange:NSMakeRange(0, 2)
-                   destinationBuffer:dst
-                   destinationOffset:0];
-            [resolve endEncoding];
-
-            [cmd_buf commit];
-            [cmd_buf waitUntilCompleted];
-
-            const uint64_t *v = (const uint64_t *)[dst contents];
-            needs_split = (v[0] == 0u || v[1] == 0u);
-         }
-      }
-
-      [sb release];
-      [scratch release];
-      [dst release];
-      [queue release];
-
-      cached_device = device;
-      cached_result = needs_split;
-      return needs_split;
-   }
-}
-
 /* Resource queries */
 /* TODO_KOSMICKRISP Return a struct */
 void
@@ -437,21 +333,16 @@ mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,
    }
 }
 
-/* limina LIMINA_KK_TS_TRACE: read a counter sample back on the CPU.
+/* Read a counter sample back on the CPU. This is how timestamp queries get
+ * their value out of the sample buffer -- see the header, and
+ * kk_encoder_write_timestamp for why the GPU resolve cannot be trusted.
  *
- * This is the discriminator the timestamp investigation needs. The GPU
- * `resolveCounters:` path writes 0 on an affected device without failing, and a
- * 0 in the query report is equally consistent with two very different faults:
- * the sample was never TAKEN (sampling encoder elided, wrong attachment, work
- * optimised away), or it was taken and the RESOLVE lost it. A CPU
- * resolveCounterRange: reads the sample buffer directly, so a nonzero here
- * against a zero in the report proves the sample exists and indicts the
- * resolve; zero in both moves the search upstream to the sampling encoder.
- *
- * Returns 0 if the sample is unavailable or the range cannot be resolved. */
+ * Returns 0 if the sample is unavailable or the range cannot be resolved.
+ * MTLCounterErrorValue (the documented "this sample failed" marker) is folded
+ * into the same 0, since neither is a usable timestamp. */
 uint64_t
-mtl_counter_sample_buffer_cpu_peek(mtl_counter_sample_buffer *sb_handle,
-                                   uint32_t index)
+mtl_counter_sample_buffer_resolve(mtl_counter_sample_buffer *sb_handle,
+                                  uint32_t index)
 {
    @autoreleasepool {
       id<MTLCounterSampleBuffer> sb = (id<MTLCounterSampleBuffer>)sb_handle;
@@ -462,6 +353,8 @@ mtl_counter_sample_buffer_cpu_peek(mtl_counter_sample_buffer *sb_handle,
          return 0u;
       const MTLCounterResultTimestamp *r =
          (const MTLCounterResultTimestamp *)[data bytes];
+      if (r[0].timestamp == MTLCounterErrorValue)
+         return 0u;
       return (uint64_t)r[0].timestamp;
    }
 }

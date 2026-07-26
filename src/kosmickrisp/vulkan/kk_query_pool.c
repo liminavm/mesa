@@ -22,6 +22,14 @@ struct kk_query_report {
    uint64_t value;
 };
 
+/* The pool's pending timestamp sequence number. Written from command recording
+ * (possibly on another thread), so read it atomically. */
+static inline uint64_t
+kk_query_pool_pending_seq(struct kk_query_pool *pool)
+{
+   return __atomic_load_n(&pool->ts_pending_seq, __ATOMIC_ACQUIRE);
+}
+
 static inline bool
 kk_has_available(const struct kk_query_pool *pool)
 {
@@ -142,6 +150,8 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    bool occlusion = pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION;
    unsigned occlusion_queries = occlusion ? pCreateInfo->queryCount : 0;
 
+   pool->ts_pending_seq = 0u;
+
    /* We place the availability first and then data */
    pool->query_start = 0;
    if (kk_has_available(pool)) {
@@ -207,6 +217,12 @@ kk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
    if (!pool)
       return;
 
+   /* A pending timestamp write is a store into pool->bo->cpu from a completion
+    * handler. The app having waited for its fences is not enough — that event
+    * is signalled while the command buffer executes, the handler runs after it
+    * completes. Drain before the memory goes away. */
+   kk_timestamp_wait_cpu(dev, kk_query_pool_pending_seq(pool));
+
    uint16_t *oq_index = kk_pool_oq_index_ptr(pool);
 
    for (unsigned i = 0; i < pool->oq_queries; ++i) {
@@ -224,6 +240,11 @@ kk_ResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery,
 {
    VK_FROM_HANDLE(kk_device, dev, device);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   /* Ordering, not just tidiness: a timestamp report is written by a completion
+    * handler, and one still in flight would land after this reset and hand the
+    * app a query it just cleared, marked available. */
+   kk_timestamp_wait_cpu(dev, kk_query_pool_pending_seq(pool));
 
    host_zero_queries(dev, pool, firstQuery, queryCount, false);
 }
@@ -258,6 +279,10 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
     * data races in the writes. This is save to do sice vkCmdResetQueryPool
     * cannot be called when a render pass is active. */
    upload_queue_writes(cmd);
+   /* Same hazard as the host reset, from the GPU side: hold the reset back
+    * until every in-flight timestamp report for this pool has been written, or
+    * one of them lands on top of it. */
+   kk_encoder_timestamp_barrier(cmd, kk_query_pool_pending_seq(pool));
    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
 }
 
@@ -272,15 +297,19 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    /* Apple GPUs only sample the timestamp counter at encoder stage boundaries,
     * so we latch after all prior work (~bottom of pipe) regardless of `stage` —
     * a spec-legal, logically-later latch point. A TIMESTAMP report is one
-    * uint64 in pool->bo; resolveCounters writes the ns value straight in, and
-    * a value != UINT64_MAX marks it available. */
-   mtl_buffer *dst = pool->bo->map;
-   uint64_t offset = kk_query_offset(pool, query);
+    * uint64 in pool->bo, and a value != UINT64_MAX marks it available. */
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   const struct kk_timestamp_target target = {
+      .dst = pool->bo->map,
+      .offset = kk_query_offset(pool, query),
+      .report = &kk_query_report_map(dev, pool, query)->value,
+      .pending_seq = &pool->ts_pending_seq,
+   };
 
    if (cmd->in_render_pass)
-      kk_encoder_defer_timestamp(cmd, dst, offset);
+      kk_encoder_defer_timestamp(cmd, &target);
    else
-      kk_encoder_write_timestamp(cmd, dst, offset);
+      kk_encoder_write_timestamp(cmd, &target);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -465,6 +494,25 @@ kk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
    if (vk_device_is_lost(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
+   const uint64_t pending_seq = kk_query_pool_pending_seq(pool);
+   if (pending_seq != 0u) {
+      if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+         /* Block on the event rather than letting kk_query_wait_for_available
+          * spin: for a timestamp the report appears when a completion handler
+          * writes it, and that is exactly what the event tracks. */
+         kk_timestamp_wait_cpu(dev, pending_seq);
+      } else {
+         /* A poll must not block, but it must not lose to the completion
+          * handler either. The handler runs strictly after the command buffer
+          * completes, which is strictly after the event vkQueueWaitIdle waits
+          * on -- so an app that synchronises and then polls once loses that
+          * race every single time (5 runs out of 5 before this). Publish any
+          * batch whose command buffer has already finished; batches still
+          * running are left alone and honestly report unavailable. */
+         kk_timestamp_publish_ready(dev, pending_seq);
+      }
+   }
+
    VkResult status = VK_SUCCESS;
    for (uint32_t i = 0; i < queryCount; i++) {
       const uint32_t query = firstQuery + i;
@@ -512,6 +560,19 @@ kk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
    VK_FROM_HANDLE(kk_buffer, dst_buf, dstBuffer);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   /* Anything queued before this point belongs ahead of the barrier: the
+    * barrier may retire the command buffer, and a later flush would land these
+    * in the next one. */
+   upload_queue_writes(cmd);
+
+   /* The copy kernel reads the reports on the GPU, so it must not run before
+    * the CPU has written the timestamps it is copying — otherwise it sees
+    * UINT64_MAX and reports the queries unavailable. This is the path venus
+    * uses for every guest vkGetQueryPoolResults (its query-feedback command
+    * buffer is appended to the same submission), so it is the common case, not
+    * a corner. */
+   kk_encoder_timestamp_barrier(cmd, kk_query_pool_pending_seq(pool));
 
    struct kk_copy_query_pool_results_info info = {
       .availability = kk_has_available(pool) ? pool->bo->gpu : 0,
