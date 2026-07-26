@@ -784,3 +784,14 @@ mtl_render_use_heaps(mtl_render_encoder *encoder, mtl_heap **heaps,
       [enc useHeaps:handles count:count stages:MTLRenderStageVertex|MTLRenderStageFragment];
    }
 }
+
+void
+mtl_blit_fill_buffer(mtl_blit_encoder *blit_enc_handle, mtl_buffer *buf,
+                     size_t offset, size_t length, uint8_t value)
+{
+   @autoreleasepool {
+      id<MTLBlitCommandEncoder> enc = (id<MTLBlitCommandEncoder>)blit_enc_handle;
+      id<MTLBuffer> b = (id<MTLBuffer>)buf;
+      [enc fillBuffer:b range:NSMakeRange(offset, length) value:value];
+   }
+}

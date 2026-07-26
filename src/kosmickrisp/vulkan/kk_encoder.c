@@ -16,6 +16,19 @@
 #include "kosmickrisp/libkk/kk_query.h"
 #include "libkk_shaders.h"
 
+/* limina LIMINA_KK_TS_TRACE=1: trace the timestamp query path. Off by default;
+ * this is a debugging oracle for the M4 Pro zero-timestamp defect, not telemetry. */
+static bool
+kk_ts_trace(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("LIMINA_KK_TS_TRACE");
+      on = v && v[0] != '0';
+   }
+   return on > 0;
+}
+
 static void
 kk_encoder_start_internal(struct kk_encoder_internal *encoder,
                           mtl_device *device, mtl_command_queue *queue)
@@ -272,8 +285,17 @@ kk_post_execution_release(void *data)
    util_dynarray_fini(&encoder->imm_writes);
    util_dynarray_fini(&encoder->copy_query_pool_result_infos);
    util_dynarray_foreach(&encoder->timestamp_sample_buffers,
-                         mtl_counter_sample_buffer *, sb)
+                         mtl_counter_sample_buffer *, sb) {
+      /* limina LIMINA_KK_TS_TRACE: this runs after the command buffers have
+       * completed, so a CPU read here says whether the sample was ever TAKEN.
+       * Compared against the value the GPU resolve wrote into the report, it
+       * separates "never sampled" from "sampled, resolve lost it" — the two
+       * faults a zero in the report cannot tell apart. */
+      if (kk_ts_trace())
+         fprintf(stderr, "[KKTS] release sb=%p cpu_peek=%llu\n", (void *)*sb,
+                 (unsigned long long)mtl_counter_sample_buffer_cpu_peek(*sb, 0u));
       mtl_release(*sb);
+   }
    util_dynarray_fini(&encoder->timestamp_sample_buffers);
    util_dynarray_fini(&encoder->deferred_timestamps);
    free(encoder);
@@ -418,6 +440,22 @@ kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
    /* Sampling encoder: latches the GPU clock at its start boundary. */
    main->encoder =
       mtl_new_blit_command_encoder_timestamp(main->cmd_buffer, sb, 0u);
+   /* The sampling encoder MUST carry real work.
+    *
+    * Metal elides a blit encoder that encodes nothing, and an elided encoder
+    * never takes its counter sample — the report then reads 0 with the query
+    * marked available, which is indistinguishable from a GPU that ran
+    * instantly. Everything this encoder does otherwise (fence wait, fence
+    * signal) is synchronisation, not data movement, and does not count.
+    *
+    * Measured on M4 Pro: with no work here a CPU resolveCounterRange: of the
+    * sample buffer reads 0 in 20 runs out of 20 — the sample is never taken.
+    * With this fill it reads a real timestamp 20 out of 20. M1 Max does not
+    * elide it, which is why this went unnoticed there.
+    *
+    * Filling the 8 bytes at dst_offset is free in effect: the resolve encoder
+    * below overwrites exactly that slot with the resolved value. */
+   mtl_blit_fill_buffer(main->encoder, dst, dst_offset, sizeof(uint64_t), 0u);
    if (main->wait_fence) {
       mtl_blit_wait_for_fence(main->encoder,
                               util_dynarray_top(&main->fences, mtl_fence *));
@@ -437,7 +475,11 @@ kk_encoder_write_timestamp(struct kk_cmd_buffer *cmd, mtl_buffer *dst,
     * failing (measured on M4 Pro; M1 Max is unaffected). There, split the
     * command buffer so the resolve lands in the next one. Command buffers run
     * in commit order, so the in-stream ordering above is preserved. */
-   if (mtl_device_needs_split_counter_resolve(enc->dev))
+   const bool split = mtl_device_needs_split_counter_resolve(enc->dev);
+   if (kk_ts_trace())
+      fprintf(stderr, "[KKTS] write_timestamp sb=%p dst=%p off=%llu split=%d\n",
+              (void *)sb, (void *)dst, (unsigned long long)dst_offset, (int)split);
+   if (split)
       kk_encoder_split_main(enc);
 
    main->encoder = mtl_new_blit_command_encoder(main->cmd_buffer);

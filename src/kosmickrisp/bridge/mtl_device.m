@@ -436,3 +436,32 @@ mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,
       return [dev newBufferWithBytesNoCopy:ptr length:size_B options:KK_MTL_RESOURCE_OPTIONS deallocator:nil];
    }
 }
+
+/* limina LIMINA_KK_TS_TRACE: read a counter sample back on the CPU.
+ *
+ * This is the discriminator the timestamp investigation needs. The GPU
+ * `resolveCounters:` path writes 0 on an affected device without failing, and a
+ * 0 in the query report is equally consistent with two very different faults:
+ * the sample was never TAKEN (sampling encoder elided, wrong attachment, work
+ * optimised away), or it was taken and the RESOLVE lost it. A CPU
+ * resolveCounterRange: reads the sample buffer directly, so a nonzero here
+ * against a zero in the report proves the sample exists and indicts the
+ * resolve; zero in both moves the search upstream to the sampling encoder.
+ *
+ * Returns 0 if the sample is unavailable or the range cannot be resolved. */
+uint64_t
+mtl_counter_sample_buffer_cpu_peek(mtl_counter_sample_buffer *sb_handle,
+                                   uint32_t index)
+{
+   @autoreleasepool {
+      id<MTLCounterSampleBuffer> sb = (id<MTLCounterSampleBuffer>)sb_handle;
+      if (!sb)
+         return 0u;
+      NSData *data = [sb resolveCounterRange:NSMakeRange(index, 1u)];
+      if (!data || [data length] < sizeof(MTLCounterResultTimestamp))
+         return 0u;
+      const MTLCounterResultTimestamp *r =
+         (const MTLCounterResultTimestamp *)[data bytes];
+      return (uint64_t)r[0].timestamp;
+   }
+}

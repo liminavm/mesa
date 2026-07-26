@@ -63,6 +63,11 @@ mtl_new_timestamp_sample_buffer(mtl_device *dev, uint32_t sample_count);
  * be exercised on hardware that does not need it. */
 bool mtl_device_needs_split_counter_resolve(mtl_device *dev);
 
+/* limina LIMINA_KK_TS_TRACE: CPU-side read of a counter sample, to tell "the
+ * sample was never taken" apart from "the resolve lost it". See mtl_device.m. */
+uint64_t
+mtl_counter_sample_buffer_cpu_peek(mtl_counter_sample_buffer *sb, uint32_t index);
+
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,
                                                 uint64_t *size_B,
