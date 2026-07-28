@@ -17,7 +17,7 @@ EXT(AMD_gpu_shader_half_float               , AMD_gpu_shader_half_float         
 EXT(AMD_gpu_shader_int64                    , ARB_gpu_shader_int64                   ,  x , GLC,  x ,  x , 2015)
 EXT(AMD_multi_draw_indirect                 , ARB_draw_indirect                      , GLL, GLC,  x ,  x , 2011)
 EXT(AMD_performance_monitor                 , AMD_performance_monitor                , GLL, GLC,  x , ES2, 2007)
-EXT(AMD_pinned_memory                       , AMD_pinned_memory                      , GLL, GLC,  x ,  x , 2013)
+EXT(AMD_pinned_memory                       , AMD_pinned_memory                      , GLL, GLC,  x , ES2, 2013)
 EXT(AMD_query_buffer_object                 , ARB_query_buffer_object                , GLL, GLC,  x ,  x , 2012)
 EXT(AMD_seamless_cubemap_per_texture        , AMD_seamless_cubemap_per_texture       , GLL, GLC,  x ,  x , 2009)
 EXT(AMD_shader_stencil_export               , ARB_shader_stencil_export              , GLL, GLC,  x ,  x , 2009)
