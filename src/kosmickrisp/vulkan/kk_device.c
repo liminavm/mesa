@@ -239,6 +239,19 @@ kk_parse_device_environment_options(struct kk_device *dev)
       int index = atoi(list);
       dev->disabled_workarounds |= BITFIELD64_BIT(index);
    }
+
+   /* limina: run queue submissions on the common runtime's submit thread.
+    * vkQueueSubmit's real cost in KK is the deferred-command replay into Metal
+    * encoding (~1.3 ms per 10k-draw frame); in IMMEDIATE mode it runs on the
+    * caller, serializing against whatever the caller does next — for venus
+    * that is the vkr ring thread, so guest decode of frame N+1 cannot overlap
+    * the replay of frame N and the pipelined venus tax stays ~1.5x host.
+    * THREADED moves the replay to the vk_queue submit thread: the caller
+    * returns at enqueue, and cross-submit dependencies are handled by the
+    * WAIT_PENDING dance in vk_queue.c (kk_sync advertises WAIT_PENDING).
+    * LIMINA_KK_SUBMIT_THREAD=0 restores IMMEDIATE. */
+   if (debug_get_bool_option("LIMINA_KK_SUBMIT_THREAD", true))
+      dev->vk.submit_mode = VK_QUEUE_SUBMIT_MODE_THREADED;
 }
 
 static VkResult

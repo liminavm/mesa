@@ -16,6 +16,8 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#include "util/u_debug.h"
+
 #include "util/disk_cache.h"
 #include "util/mesa-blake3.h"
 #include "git_sha1.h"
@@ -1116,6 +1118,14 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    pdev->sync_binary_type = vk_sync_binary_get_type(&kk_sync_type);
    unsigned st_idx = 0;
    pdev->sync_types[st_idx++] = &kk_sync_type;
+   /* limina (threaded submit): serve binary semaphores/fences with the native
+    * move-capable type — the vk_sync_binary wrapper has no `move`, which
+    * forced-THREADED submission requires for permanent binary semaphore
+    * payloads. Only when the submit thread is on (must match the device-level
+    * knob in kk_parse_device_environment_options): in immediate mode the
+    * wrapper's monotonic-point scheme is the correct binary mechanism. */
+   if (debug_get_bool_option("LIMINA_KK_SUBMIT_THREAD", true))
+      pdev->sync_types[st_idx++] = &kk_sync_type_binary;
    pdev->sync_types[st_idx++] = &pdev->sync_binary_type.sync;
    pdev->sync_types[st_idx++] = NULL;
    assert(st_idx <= ARRAY_SIZE(pdev->sync_types));

@@ -59,7 +59,7 @@ struct kk_physical_device {
 
    // Emulated binary sync type
    struct vk_sync_binary_type sync_binary_type;
-   const struct vk_sync_type *sync_types[3];
+   const struct vk_sync_type *sync_types[4];
 
    struct kk_queue_family queue_families[3];
    uint8_t queue_family_count;

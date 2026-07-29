@@ -42,8 +42,13 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
         wait != end; ++wait) {
       struct kk_sync_timeline *sync =
          container_of(wait->sync, struct kk_sync_timeline, base);
+      /* Binary syncs (kk_sync_type_binary) carry value 0 from the runtime;
+       * their signaled state is event value 1. */
+      uint64_t value = wait->wait_value;
+      if (!(wait->sync->flags & VK_SYNC_IS_TIMELINE) && value == 0)
+         value = 1;
       mtl_encode_wait_for_event(encoder->main.cmd_buffer, sync->mtl_handle,
-                                wait->wait_value);
+                                value);
    }
 
    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
@@ -69,8 +74,12 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       struct vk_sync_signal *signal = &submit->signals[i];
       struct kk_sync_timeline *sync =
          container_of(signal->sync, struct kk_sync_timeline, base);
+      /* Binary syncs signal at event value 1 (runtime passes 0). */
+      uint64_t value = signal->signal_value;
+      if (!(signal->sync->flags & VK_SYNC_IS_TIMELINE) && value == 0)
+         value = 1;
       mtl_encode_signal_event(encoder->main.cmd_buffer, sync->mtl_handle,
-                              signal->signal_value);
+                              value);
    }
 
    /* Ensure any changes to residency are propagated before we submit any work.
