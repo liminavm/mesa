@@ -1836,6 +1836,7 @@ fail:
                                ST_INVALIDATE_SAMPLE_MASK |
                                ST_INVALIDATE_SAMPLE_SHADING |
                                ST_INVALIDATE_FS_CONSTBUF0 |
+                               ST_INVALIDATE_FS_SAMPLER_VIEWS |
                                ST_INVALIDATE_VS_STATE |
                                ST_INVALIDATE_FS_STATE |
                                ST_INVALIDATE_GS_STATE |
@@ -2125,6 +2126,7 @@ fail:
                                ST_INVALIDATE_SAMPLE_SHADING |
                                ST_INVALIDATE_FS_CONSTBUF0 |
                                ST_INVALIDATE_FS_IMAGES |
+                               ST_INVALIDATE_FS_SAMPLER_VIEWS |
                                ST_INVALIDATE_VS_STATE |
                                ST_INVALIDATE_FS_STATE |
                                ST_INVALIDATE_GS_STATE |
@@ -2252,9 +2254,13 @@ st_TexSubImage(struct gl_context *ctx, GLuint dims,
    }
 
    if (unpack->BufferObj) {
-      if (try_pbo_upload(ctx, dims, texImage, format, type, dst_format,
-                         xoffset, yoffset, zoffset,
-                         width, height, depth, pixels, unpack))
+      bool pbo_ok = try_pbo_upload(ctx, dims, texImage, format, type, dst_format,
+                                   xoffset, yoffset, zoffset,
+                                   width, height, depth, pixels, unpack);
+      if (getenv("LIMINA_PBO_TRACE"))
+         fprintf(stderr, "[PBOTRACE] st try_pbo_upload %dx%d -> %s\n", width, height,
+                 pbo_ok ? "GPU path" : "REJECTED (fallback)");
+      if (pbo_ok)
          return;
    }
 
