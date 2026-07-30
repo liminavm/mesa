@@ -21,4 +21,7 @@ struct kk_sync_timeline {
 extern const struct vk_sync_type kk_sync_type;
 extern const struct vk_sync_type kk_sync_type_binary;
 
+/* limina: LIMINA_KK_SYNCTRACE gate (cached), shared with kk_queue.c. */
+bool kk_synctrace(void);
+
 #endif

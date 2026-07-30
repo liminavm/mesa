@@ -10,6 +10,29 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#include "util/u_debug.h"
+#include <pthread.h>
+#include <stdio.h>
+
+/* limina: LIMINA_KK_SYNCTRACE=1 — one-line trace of every sync-object
+ * transition (signal/reset/move/wait), for the threaded-submit early-fence
+ * hunt. Cached once; never a per-call getenv (the profile trap). */
+bool
+kk_synctrace(void)
+{
+   static int cached = -1;
+   if (cached < 0)
+      cached = debug_get_bool_option("LIMINA_KK_SYNCTRACE", false);
+   return cached;
+}
+
+#define KKST(fmt, ...)                                                        \
+   do {                                                                       \
+      if (kk_synctrace())                                                     \
+         fprintf(stderr, "[KKSYNC t%p] " fmt "\n", (void *)pthread_self(),    \
+                 ##__VA_ARGS__);                                              \
+   } while (0)
+
 static VkResult
 kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
                  uint64_t initial_value)
@@ -42,6 +65,9 @@ kk_timeline_signal(struct vk_device *device, struct vk_sync *sync,
     * signaled state of a binary kk sync is event value 1 (waits map 0→1). */
    if (!(sync->flags & VK_SYNC_IS_TIMELINE) && value == 0)
       value = 1;
+   KKST("SIGNAL  sync=%p ev=%p val=%llu tl=%d", (void *)sync,
+        (void *)timeline->mtl_handle, (unsigned long long)value,
+        !!(sync->flags & VK_SYNC_IS_TIMELINE));
    mtl_shared_event_set_signaled_value(timeline->mtl_handle, value);
    return VK_SUCCESS;
 }
@@ -86,8 +112,16 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
       timeout_ms =
          (rel_timeout_ns / 1000000) + (rel_timeout_ns % 1000000 ? 1 : 0);
    }
+   uint64_t pre = mtl_shared_event_get_signaled_value(timeline->mtl_handle);
+   KKST("WAIT+   sync=%p ev=%p want=%llu cur=%llu flags=%x tl=%d",
+        (void *)sync, (void *)timeline->mtl_handle,
+        (unsigned long long)wait_value, (unsigned long long)pre, wait_flags,
+        !!(sync->flags & VK_SYNC_IS_TIMELINE));
    int completed = mtl_shared_event_wait_until_signaled_value(
       timeline->mtl_handle, wait_value, timeout_ms);
+   KKST("WAIT-   sync=%p ev=%p want=%llu done=%d", (void *)sync,
+        (void *)timeline->mtl_handle, (unsigned long long)wait_value,
+        completed);
 
    return completed != 0 ? VK_SUCCESS : VK_TIMEOUT;
 }
@@ -95,9 +129,31 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
 static VkResult
 kk_timeline_reset(struct vk_device *device, struct vk_sync *sync)
 {
+   struct kk_device *dev = container_of(device, struct kk_device, vk);
    struct kk_sync_timeline *timeline =
       container_of(sync, struct kk_sync_timeline, base);
-   mtl_shared_event_set_signaled_value(timeline->mtl_handle, 0);
+   /* Swap in a FRESH event instead of writing 0: a recycled binary payload
+    * (vkResetFences on a pooled fence — fences, unlike semaphores, are never
+    * moved) can still have the previous use's GPU-side `signal := 1` in
+    * flight on the submit thread's command stream. Writing 0 races it: the
+    * late signal lands after the reset and pre-signals the NEXT use, and
+    * every later wait is then satisfied by the PREVIOUS cycle's signal — a
+    * self-sustaining off-by-one (the early-fence bug: guest fences/sync_files
+    * retiring one submit early → dogfood tearing, explicit_sync_bridge RED).
+    * A fresh event orphans the stale signal harmlessly; binary fences are
+    * CPU-waited only, so no already-encoded GPU wait can dangle on the old
+    * handle. Mirrors kk_timeline_move. */
+   mtl_shared_event *new_event = mtl_new_shared_event(dev->mtl_handle);
+   if (new_event == NULL)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   mtl_shared_event_set_signaled_value(new_event, 0);
+   KKST("RESET   sync=%p ev=%p (cur=%llu) -> fresh ev=%p", (void *)sync,
+        (void *)timeline->mtl_handle,
+        (unsigned long long)mtl_shared_event_get_signaled_value(
+           timeline->mtl_handle),
+        (void *)new_event);
+   mtl_release(timeline->mtl_handle);
+   timeline->mtl_handle = new_event;
    return VK_SUCCESS;
 }
 
@@ -120,6 +176,12 @@ kk_timeline_move(struct vk_device *device, struct vk_sync *dst,
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    mtl_shared_event_set_signaled_value(new_event, 0);
 
+   KKST("MOVE    dst=%p(ev=%p) <- src=%p(ev=%p srcval=%llu); src gets %p",
+        (void *)dst, (void *)tdst->mtl_handle, (void *)src,
+        (void *)tsrc->mtl_handle,
+        (unsigned long long)mtl_shared_event_get_signaled_value(
+           tsrc->mtl_handle),
+        (void *)new_event);
    mtl_release(tdst->mtl_handle);
    tdst->mtl_handle = tsrc->mtl_handle;
    tsrc->mtl_handle = new_event;

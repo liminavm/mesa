@@ -47,6 +47,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       uint64_t value = wait->wait_value;
       if (!(wait->sync->flags & VK_SYNC_IS_TIMELINE) && value == 0)
          value = 1;
+      if (kk_synctrace())
+         fprintf(stderr, "[KKSYNC q] ENC-WAIT ev=%p val=%llu (submit cbufs=%u)\n",
+                 (void *)sync->mtl_handle, (unsigned long long)value,
+                 submit->command_buffer_count);
       mtl_encode_wait_for_event(encoder->main.cmd_buffer, sync->mtl_handle,
                                 value);
    }
@@ -78,6 +82,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       uint64_t value = signal->signal_value;
       if (!(signal->sync->flags & VK_SYNC_IS_TIMELINE) && value == 0)
          value = 1;
+      if (kk_synctrace())
+         fprintf(stderr, "[KKSYNC q] ENC-SIG  ev=%p val=%llu (submit cbufs=%u)\n",
+                 (void *)sync->mtl_handle, (unsigned long long)value,
+                 submit->command_buffer_count);
       mtl_encode_signal_event(encoder->main.cmd_buffer, sync->mtl_handle,
                               value);
    }
