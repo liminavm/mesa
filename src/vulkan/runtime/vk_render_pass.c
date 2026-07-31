@@ -2668,6 +2668,23 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    if (!attach_begin)
       assert(pass->attachment_count == framebuffer->attachment_count);
 
+/* Invalid-usage mismatches between the framebuffer's image views and the
+ * render pass reach this code from untrusted sources (a virtio-gpu venus
+ * guest replays app command streams through the common runtime), so a
+ * VU violation here must not abort the process.  Log loudly (capped per
+ * site) and continue: rendering is undefined but contained.
+ */
+#define VU_VIOLATION_LOGW(fmt, ...)                                           \
+   do {                                                                       \
+      static int _vu_logged = 0;                                              \
+      if (_vu_logged < 8) {                                                   \
+         _vu_logged++;                                                        \
+         mesa_logw("render-pass begin VU violation (%s:%d): " fmt "%s",       \
+                   __FILE__, __LINE__, ##__VA_ARGS__,                         \
+                   _vu_logged == 8 ? " (further reports suppressed)" : "");   \
+      }                                                                       \
+   } while (0)
+
    const VkImageView *image_views;
    if (attach_begin && attach_begin->attachmentCount != 0) {
       assert(attach_begin->attachmentCount == pass->attachment_count);
@@ -2704,8 +2721,11 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    VkImageViewCreateInfo::format equal to the corresponding value of
        *    VkAttachmentDescription::format in renderPass"
        */
-      if (!pass_att->has_external_format)
-         assert(image_view->format == pass_att->format);
+      if (!pass_att->has_external_format &&
+          unlikely(image_view->format != pass_att->format))
+         VU_VIOLATION_LOGW("attachment %u: image view format (%u) != render "
+                           "pass attachment format (%u)",
+                           a, image_view->format, pass_att->format);
 
       /* From the Vulkan 1.3.204 spec:
        *
@@ -2729,7 +2749,10 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    VkImageCreateInfo::samples equal to the corresponding value of
        *    VkAttachmentDescription::samples in renderPass"
        */
-      assert(image_view->image->samples == pass_att->samples);
+      if (unlikely(image_view->image->samples != pass_att->samples))
+         VU_VIOLATION_LOGW("attachment %u: image samples (%u) != render "
+                           "pass attachment samples (%u)",
+                           a, image_view->image->samples, pass_att->samples);
 
       /* From the Vulkan 1.3.204 spec:
        *
@@ -2742,8 +2765,11 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    Otherwise, the texel is unconditionally selected from the first
        *    layer of the attachment.
        */
-      if (!(image_view->usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR))
-         assert(util_last_bit(pass_att->view_mask) <= image_view->layer_count);
+      if (!(image_view->usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
+          unlikely(util_last_bit(pass_att->view_mask) > image_view->layer_count))
+         VU_VIOLATION_LOGW("attachment %u: view_mask 0x%x exceeds image view "
+                           "layer count (%u)",
+                           a, pass_att->view_mask, image_view->layer_count);
 
       *att_state = (struct vk_attachment_state) {
          .image_view = image_view,
@@ -2760,6 +2786,7 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
       if (a < pRenderPassBeginInfo->clearValueCount)
          att_state->clear_value = pRenderPassBeginInfo->pClearValues[a];
    }
+#undef VU_VIOLATION_LOGW
 
    const VkRenderPassSampleLocationsBeginInfoEXT *rp_sl_info =
       vk_find_struct_const(pRenderPassBeginInfo->pNext,
