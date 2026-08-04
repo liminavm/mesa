@@ -45,7 +45,9 @@ libgallium_dri = shared_library(
     inc_gallium_winsys, include_directories('../../frontends/dri'),
   ],
   gnu_symbol_visibility : 'hidden',
-  link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
+  # limina (darwin): IOSurface for dri2_from_iosurface_limina (frontends/dri).
+  link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args]
+              + (host_machine.system() == 'darwin' ? ['-Wl,-framework,IOSurface'] : []),
   link_depends : gallium_dri_link_depends,
   link_with : [
     libmesa, libgalliumvl,

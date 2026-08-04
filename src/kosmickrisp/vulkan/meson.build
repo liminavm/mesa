@@ -152,7 +152,10 @@ libkk = static_library(
 libvulkan_kosmickrisp = shared_library(
   'vulkan_kosmickrisp',
   link_whole: [libkk],
-  link_args: [ld_args_build_id, '-Wl,-undefined,dynamic_lookup'],
+  # limina: IOSurface for the IOSurfaceRef import path (mtl_device.m); explicit
+  # because -undefined,dynamic_lookup would otherwise defer a missing framework
+  # to runtime.
+  link_args: [ld_args_build_id, '-Wl,-undefined,dynamic_lookup', '-Wl,-framework,IOSurface'],
   gnu_symbol_visibility : 'hidden',
   install : true,
 )

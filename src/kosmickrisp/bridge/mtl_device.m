@@ -13,6 +13,7 @@
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCaptureManager.h>
 #include <Metal/MTLCounters.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 /* Device creation */
 mtl_device *
@@ -252,6 +253,45 @@ mtl_new_texture_descriptor(const struct kk_image_layout *layout)
       /* We don't set the swizzle because Metal complains when the usage has store or render target with swizzle... */
       
       return descriptor;
+   }
+}
+
+/* limina: is this external handle an IOSurfaceRef (vs an id<MTLTexture>)?
+ * Lives in the bridge so plain-C callers need no CoreFoundation/IOSurface
+ * linkage of their own. */
+bool
+mtl_handle_is_iosurface(void *handle)
+{
+   return handle && CFGetTypeID((CFTypeRef)handle) == IOSurfaceGetTypeID();
+}
+
+/* limina: create a texture whose storage IS an IOSurface
+ * (newTextureWithDescriptor:iosurface:plane:). Built from the adopting
+ * image's own kk_image_layout so kk_image_plane_bind's verbatim-adoption
+ * checks pass by construction. IOSurface-backed textures must be plain 2D. */
+mtl_texture *
+mtl_new_texture_with_descriptor_iosurface(mtl_device *device,
+                                          const struct kk_image_layout *layout,
+                                          void *iosurface)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLTextureDescriptor *descriptor =
+         [mtl_new_texture_descriptor(layout) autorelease];
+      descriptor.resourceOptions = MTLResourceStorageModeShared;
+      if (descriptor.textureType != MTLTextureType2D ||
+          descriptor.mipmapLevelCount != 1 || descriptor.arrayLength != 1 ||
+          descriptor.sampleCount != 1) {
+         fprintf(stderr,
+                 "[LIMINA-KK-IOSURF] refusing IOSurface texture: layout not "
+                 "plain 2D (type=%u levels=%u layers=%u samples=%u)\n",
+                 layout->type, layout->levels, layout->layers,
+                 layout->sample_count_sa);
+         return NULL;
+      }
+      return [dev newTextureWithDescriptor:descriptor
+                                 iosurface:(IOSurfaceRef)iosurface
+                                     plane:0];
    }
 }
 

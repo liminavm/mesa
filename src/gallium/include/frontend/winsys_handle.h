@@ -19,6 +19,10 @@ extern "C" {
 #define WINSYS_HANDLE_TYPE_D3D12_RES 4
 #define WINSYS_HANDLE_TYPE_WIN32_NAME 5
 #define WINSYS_HANDLE_TYPE_UNBACKED 5
+/* limina (macOS): an IOSurfaceRef rides winsys_handle::com_obj. Import-only;
+ * consumed by zink (KK's VK_EXT_external_memory_metal MTLTEXTURE handle
+ * accepts an IOSurfaceRef). */
+#define WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA 6
 
 /**
  * For use with pipe_screen::{resource_from_handle|resource_get_handle}.
