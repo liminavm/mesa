@@ -9,6 +9,7 @@
 
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_image.h"
 #include "kk_physical_device.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -151,7 +152,36 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
           * adopts the texture verbatim (kk_image_plane_bind). Anything that
           * tries to treat this memory as a buffer — vkMapMemory, a VkBuffer
           * bind — must fail rather than deref a NULL map. */
-         mem->bo->texture = mtl_retain(metal_info->handle);
+         /* limina: the MTLTEXTURE handle also accepts an IOSurfaceRef (CFTypeID
+          * dispatch). We build the texture HERE, from the dedicated image's own
+          * kk_image_layout, via newTextureWithDescriptor:iosurface:plane: — so
+          * the bind-time verbatim-adoption checks pass by construction. This is
+          * the import half of the vrend "IOSurface world": zink (under vrend)
+          * imports a venus-exported window buffer's IOSurface as a GL texture. */
+         if (mtl_handle_is_iosurface(metal_info->handle)) {
+            const VkMemoryDedicatedAllocateInfo *ded = vk_find_struct_const(
+               pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+            struct kk_image *ded_image =
+               (ded && ded->image) ? kk_image_from_handle(ded->image) : NULL;
+            if (!ded_image || ded_image->plane_count != 1) {
+               result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                                  "IOSurface import requires a dedicated "
+                                  "single-plane image");
+               FREE(mem->bo);
+               goto fail_alloc;
+            }
+            mem->bo->texture = mtl_new_texture_with_descriptor_iosurface(
+               dev->mtl_handle, &ded_image->planes[0].layout,
+               metal_info->handle);
+            if (!mem->bo->texture) {
+               result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                                  "IOSurface texture creation failed");
+               FREE(mem->bo);
+               goto fail_alloc;
+            }
+         } else {
+            mem->bo->texture = mtl_retain(metal_info->handle);
+         }
          mem->bo->size_B = mem->vk.size;
          kk_device_add_texture_to_residency_set(dev, mem->bo->texture);
       } else if (import_metal) {
