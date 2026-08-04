@@ -20,6 +20,11 @@ struct vk_object_base;
 struct kk_bo {
    mtl_heap *mtl_handle;
    mtl_buffer *map;
+   /* An imported MTLTexture (VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT).
+    * Unlike a heap or buffer import this is not memory we can suballocate from:
+    * the texture IS the storage, so mtl_handle/map/gpu/cpu all stay NULL and the
+    * single image bound to this memory adopts the texture verbatim. */
+   mtl_texture *texture;
    uint64_t size_B;
    uint64_t gpu; // GPU address
    void *cpu;    // CPU address
