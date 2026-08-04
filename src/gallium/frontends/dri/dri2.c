@@ -30,6 +30,9 @@
 
 #include "util/libdrm.h"
 #include "git_sha1.h"
+#ifdef __APPLE__
+#include <IOSurface/IOSurfaceRef.h>
+#endif
 #include "GL/mesa_glinterop.h"
 #include "mesa_interface.h"
 #include "util/disk_cache.h"
@@ -911,6 +914,74 @@ dri_create_image_from_winsys(struct dri_screen *screen,
 
    return img;
 }
+
+#ifdef __APPLE__
+/* limina: create a DRIimage whose pipe resource adopts an IOSurface (zink →
+ * KK MTLTEXTURE metal-handle import). Reached via the EGL_IOSURFACE_LIMINA
+ * EGLImage target — the door virglrenderer's vrend uses to composite a venus
+ * client's window buffer. BGRA/RGBA 8-bit only, matching what the venus
+ * scanout exporter allocates. */
+PUBLIC struct dri_image *
+dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
+                           void *loaderPrivate)
+{
+   struct pipe_screen *pscreen = screen->base.screen;
+   struct dri_image *img;
+   struct pipe_resource templ;
+   struct winsys_handle whandle;
+   enum pipe_format pf;
+
+   const uint32_t osfmt = IOSurfaceGetPixelFormat((IOSurfaceRef)iosurface);
+   switch (osfmt) {
+   case 0x42475241: /* 'BGRA' */
+      pf = PIPE_FORMAT_B8G8R8A8_UNORM;
+      break;
+   case 0x52474241: /* 'RGBA' */
+      pf = PIPE_FORMAT_R8G8B8A8_UNORM;
+      break;
+   default:
+      mesa_loge("dri2_from_iosurface_limina: unhandled IOSurface pixel format "
+                "0x%08x", osfmt);
+      return NULL;
+   }
+
+   memset(&whandle, 0, sizeof(whandle));
+   whandle.type = WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA;
+   whandle.com_obj = iosurface;
+   whandle.modifier = DRM_FORMAT_MOD_INVALID;
+   whandle.format = pf;
+
+   memset(&templ, 0, sizeof(templ));
+   templ.target = screen->target;
+   templ.format = pf;
+   templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+   templ.last_level = 0;
+   templ.depth0 = 1;
+   templ.array_size = 1;
+   templ.width0 = IOSurfaceGetWidth((IOSurfaceRef)iosurface);
+   templ.height0 = IOSurfaceGetHeight((IOSurfaceRef)iosurface);
+
+   img = CALLOC_STRUCT(dri_image);
+   if (!img)
+      return NULL;
+
+   img->texture = pscreen->resource_from_handle(
+      pscreen, &templ, &whandle, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   if (!img->texture) {
+      FREE(img);
+      return NULL;
+   }
+
+   img->level = 0;
+   img->layer = 0;
+   img->use = 0;
+   img->in_fence_fd = -1;
+   img->loader_private = loaderPrivate;
+   img->screen = screen;
+
+   return img;
+}
+#endif /* __APPLE__ */
 
 static unsigned
 dri2_get_modifier_num_planes(struct dri_screen *screen,
