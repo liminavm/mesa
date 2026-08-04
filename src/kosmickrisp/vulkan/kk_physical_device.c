@@ -196,6 +196,11 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_post_depth_coverage = true,
       .EXT_primitive_restart_index = true,
       .EXT_primitive_topology_list_restart = true,
+      /* Constant-only (VK_QUEUE_FAMILY_FOREIGN_EXT, no entry points). One queue
+       * family and shared storage: acquire/release to a foreign family is a
+       * no-op here, so this is an honest claim, and compositors' dma-buf paths
+       * (via venus in a VM) require it. */
+      .EXT_queue_family_foreign = true,
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_shader_atomic_float = true,
