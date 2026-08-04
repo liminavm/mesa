@@ -483,6 +483,27 @@ kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
    simple_mtx_unlock(&dev->residency_set.mutex);
 }
 
+/* An imported MTLTexture is its own allocation — it belongs to no heap of ours,
+ * so it must be made resident in its own right or the first submit that samples
+ * or renders to it faults. */
+void
+kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                       mtl_texture *texture)
+{
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_add_allocation(dev->residency_set.handle, texture);
+   simple_mtx_unlock(&dev->residency_set.mutex);
+}
+
+void
+kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture)
+{
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_remove_allocation(dev->residency_set.handle, texture);
+   simple_mtx_unlock(&dev->residency_set.mutex);
+}
+
 void
 kk_device_make_resources_resident(struct kk_device *dev)
 {

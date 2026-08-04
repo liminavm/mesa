@@ -79,6 +79,15 @@ fail_heap:
 void
 kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
 {
+   /* An imported MTLTexture has neither heap nor buffer — the texture is the
+    * whole allocation. Release it and stop; the paths below would deref NULL. */
+   if (bo->texture) {
+      kk_device_remove_texture_from_residency_set(dev, bo->texture);
+      mtl_release(bo->texture);
+      FREE(bo);
+      return;
+   }
+
    /* We may only have a mapped buffer, for example if the memory was imported
     * from a host pointer */
    if (bo->mtl_handle)

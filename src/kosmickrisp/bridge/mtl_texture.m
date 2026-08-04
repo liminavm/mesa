@@ -23,6 +23,22 @@ mtl_texture_get_gpu_resource_id(mtl_texture *texture)
    }
 }
 
+void
+mtl_texture_get_props(mtl_texture *texture, struct mtl_texture_props *props)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      props->width = [tex width];
+      props->height = [tex height];
+      props->pixel_format = (uint32_t)[tex pixelFormat];
+      props->texture_type = (uint32_t)[tex textureType];
+      props->sample_count = (uint32_t)[tex sampleCount];
+      props->mip_levels = (uint32_t)[tex mipmapLevelCount];
+      props->array_length = (uint32_t)[tex arrayLength];
+      props->usage = (uint32_t)[tex usage];
+   }
+}
+
 /* TODO_KOSMICKRISP This should be part of the mapping */
 static uint32_t
 mtl_texture_view_type(uint32_t type, uint8_t sample_count)
@@ -89,6 +105,26 @@ mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_
       NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
       NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
       return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
+   }
+}
+
+mtl_texture *
+mtl_new_texture_view_with_format(mtl_texture *texture, uint32_t pixel_format)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      id<MTLTexture> v =
+         [tex newTextureViewWithPixelFormat:(MTLPixelFormat)pixel_format
+                               textureType:tex.textureType
+                                    levels:NSMakeRange(0, tex.mipmapLevelCount)
+                                    slices:NSMakeRange(0, tex.arrayLength)];
+      if (!v)
+         fprintf(stderr,
+                 "[LIMINA-KK-VIEW] NIL reformat parent=%p(%lux%lu fmt=%lu usage=0x%lx) -> fmt=%lu\n",
+                 (void *)tex, (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.pixelFormat, (unsigned long)tex.usage,
+                 (unsigned long)pixel_format);
+      return (mtl_texture *)limina_mtl_note_new(v);
    }
 }
 
