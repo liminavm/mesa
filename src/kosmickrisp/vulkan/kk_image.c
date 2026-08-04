@@ -20,7 +20,10 @@
 #include "vk_enum_defines.h"
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
+#include "vk_util.h"
 #include "wsi_common_private.h"
+
+#include "drm-uapi/drm_fourcc.h"
 
 static VkFormatFeatureFlags2
 kk_get_image_plane_format_features(struct kk_physical_device *pdev,
@@ -232,6 +235,20 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    memset(&pImageFormatProperties->imageFormatProperties, 0,
           sizeof(pImageFormatProperties->imageFormatProperties));
 
+   /* VK_EXT_image_drm_format_modifier: LINEAR is the only modifier we offer,
+    * and only for the formats kk_get_drm_format_modifier_features admits. */
+   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
+         vk_find_struct_const(
+            pImageFormatInfo->pNext,
+            PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+
+      if (mod_info == NULL ||
+          mod_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+          !kk_get_drm_format_modifier_features(pdev, pImageFormatInfo->format))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+
    /* Metal does not support depth/stencil textures that are not 2D (we make 1D
     * textures 2D) */
    if (vk_format_is_depth_or_stencil(pImageFormatInfo->format) &&
@@ -405,7 +422,11 @@ kk_GetPhysicalDeviceImageFormatProperties2(
          break;
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT: {
-         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR) {
+         /* DRM-format-modifier tiling qualifies: our only modifier is
+          * DRM_FORMAT_MOD_LINEAR, laid out exactly like TILING_LINEAR. */
+         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR &&
+             pImageFormatInfo->tiling !=
+                VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
             return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
                              "host memory import image must be linear");
          }
@@ -555,6 +576,54 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
    image->disjoint = image->plane_count > 1 &&
                      (pCreateInfo->flags & VK_IMAGE_CREATE_DISJOINT_BIT);
 
+   /* VK_EXT_image_drm_format_modifier: DRM_FORMAT_MOD_LINEAR is the only
+    * modifier we advertise, so it is the only one a valid LIST can offer us
+    * and the only one a valid EXPLICIT can name. Single-plane only (the
+    * format-properties list advertises drmFormatModifierPlaneCount = 1). */
+   uint32_t explicit_row_stride_B = 0;
+   if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      assert(image->plane_count == 1);
+
+      const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit_info =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+      if (mod_explicit_info) {
+         if (mod_explicit_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+             mod_explicit_info->drmFormatModifierPlaneCount != 1)
+            return vk_errorf(dev,
+                             VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "unsupported DRM format modifier 0x%" PRIx64
+                             " (plane count %u)",
+                             mod_explicit_info->drmFormatModifier,
+                             mod_explicit_info->drmFormatModifierPlaneCount);
+         const VkSubresourceLayout *plane0 =
+            &mod_explicit_info->pPlaneLayouts[0];
+         if (plane0->offset != 0 || plane0->rowPitch > UINT32_MAX)
+            return vk_errorf(dev,
+                             VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "unsupported explicit plane layout (offset %" PRIu64
+                             ", rowPitch %" PRIu64 ")",
+                             plane0->offset, plane0->rowPitch);
+         explicit_row_stride_B = plane0->rowPitch;
+      } else {
+         const VkImageDrmFormatModifierListCreateInfoEXT *mod_list_info =
+            vk_find_struct_const(pCreateInfo->pNext,
+                                 IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+         bool has_linear = false;
+         for (uint32_t i = 0;
+              mod_list_info && i < mod_list_info->drmFormatModifierCount; i++)
+            has_linear |=
+               mod_list_info->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR;
+         if (!has_linear)
+            return vk_errorf(dev,
+                             VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "modifier list offers none we support (LINEAR)");
+      }
+
+      assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_INVALID);
+      image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
+   }
+
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(pCreateInfo->format);
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
@@ -565,9 +634,22 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
       const uint8_t height_scale =
          ycbcr_info ? ycbcr_info->planes[plane].denominator_scales[1] : 1;
       kk_image_layout_init(dev, &image->vk, vk_format_to_pipe_format(format),
-                           width_scale, height_scale,
+                           width_scale, height_scale, explicit_row_stride_B,
                            &image->planes[plane].layout);
    }
+
+   /* An EXPLICIT rowPitch we could not adopt (narrower than Metal's minimum
+    * for this format/width, or violating its linear-texture row alignment) is
+    * an unsupported layout, not one to silently replace — the caller's other
+    * plane (the exporter) is already using that pitch. */
+   if (explicit_row_stride_B != 0 &&
+       image->planes[0].layout.linear_stride_B != explicit_row_stride_B)
+      return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                       "unsupported explicit rowPitch %u (minimum %u, "
+                       "alignment %" PRIu64 ")",
+                       explicit_row_stride_B,
+                       image->planes[0].layout.linear_stride_B,
+                       image->planes[0].layout.align_B);
 
    return VK_SUCCESS;
 }

@@ -16,6 +16,9 @@
 
 #include "vk_enum_defines.h"
 #include "vk_format.h"
+#include "vk_util.h"
+
+#include "drm-uapi/drm_fourcc.h"
 
 #define MTL_FMT_ALL_NO_ATOMIC(width)                                           \
    .bit_widths = width, .filter = 1u, .write = 1u, .color = 1u, .blend = 1u,   \
@@ -382,6 +385,82 @@ vk_format_to_mtl_pixel_format(VkFormat vkformat)
    return supported_format->mtl_pixel_format;
 }
 
+/* VK_EXT_image_drm_format_modifier: the one modifier KK offers is
+ * DRM_FORMAT_MOD_LINEAR, for single-plane, non-compressed, non-depth/stencil
+ * color formats. The feature mask is the DRM_FORMAT_MODIFIER tiling one (which
+ * matches OPTIMAL — notably including COLOR_ATTACHMENT, which linear color
+ * images genuinely support; the plain-LINEAR tiling mask withholds it only
+ * because of the input-attachments-as-arrays lowering, see
+ * kk_GetPhysicalDeviceImageFormatProperties2). Depth/stencil stays out of the
+ * modifier table entirely: Metal cannot lay out depth linearly, and no
+ * modifier consumer wants it. */
+VkFormatFeatureFlags2
+kk_get_drm_format_modifier_features(struct kk_physical_device *pdevice,
+                                    VkFormat vk_format)
+{
+   if (vk_format_get_plane_count(vk_format) != 1)
+      return 0;
+   if (vk_format_is_compressed(vk_format))
+      return 0;
+   if (vk_format_has_depth(vk_format) || vk_format_has_stencil(vk_format))
+      return 0;
+
+   return kk_get_image_format_features(pdevice, vk_format,
+                                       VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                                       DRM_FORMAT_MOD_LINEAR);
+}
+
+static void
+kk_get_drm_format_modifier_properties_list(
+   struct kk_physical_device *pdevice, VkFormat vk_format,
+   VkDrmFormatModifierPropertiesListEXT *list)
+{
+   const VkFormatFeatureFlags2 features2 =
+      kk_get_drm_format_modifier_features(pdevice, vk_format);
+
+   VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
+                          list->pDrmFormatModifierProperties,
+                          &list->drmFormatModifierCount);
+
+   if (features2) {
+      vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
+                               out_props)
+      {
+         *out_props = (VkDrmFormatModifierPropertiesEXT){
+            .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+            .drmFormatModifierPlaneCount = 1,
+            .drmFormatModifierTilingFeatures =
+               vk_format_features2_to_features(features2),
+         };
+      };
+   }
+}
+
+static void
+kk_get_drm_format_modifier_properties_list_2(
+   struct kk_physical_device *pdevice, VkFormat vk_format,
+   VkDrmFormatModifierPropertiesList2EXT *list)
+{
+   const VkFormatFeatureFlags2 features2 =
+      kk_get_drm_format_modifier_features(pdevice, vk_format);
+
+   VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
+                          list->pDrmFormatModifierProperties,
+                          &list->drmFormatModifierCount);
+
+   if (features2) {
+      vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
+                               out_props)
+      {
+         *out_props = (VkDrmFormatModifierProperties2EXT){
+            .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+            .drmFormatModifierPlaneCount = 1,
+            .drmFormatModifierTilingFeatures = features2,
+         };
+      };
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                                       VkFormat format,
@@ -411,6 +490,16 @@ kk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
          p->bufferFeatures = buffer2;
          break;
       }
+
+      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT:
+         kk_get_drm_format_modifier_properties_list(pdevice, format,
+                                                    (void *)ext);
+         break;
+
+      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT:
+         kk_get_drm_format_modifier_properties_list_2(pdevice, format,
+                                                      (void *)ext);
+         break;
 
       default:
          vk_debug_ignored_stype(ext->sType);

@@ -214,9 +214,14 @@ bool kk_image_layout_can_optimize(VkImageUsageFlags usage, VkImageTiling tiling,
                                   VkImageCreateFlags flags,
                                   enum pipe_format format);
 
+/* explicit_row_stride_B: nonzero only for VK_EXT_image_drm_format_modifier
+ * EXPLICIT creates — the caller-supplied linear rowPitch to adopt (validated
+ * by the caller; ignored if narrower than the computed minimum or misaligned).
+ * Pass 0 to compute the stride. */
 void kk_image_layout_init(const struct kk_device *dev,
                           const struct vk_image *image, enum pipe_format format,
                           const uint8_t width_scale, const uint8_t height_scale,
+                          const uint32_t explicit_row_stride_B,
                           struct kk_image_layout *layout);
 
 #endif /* KK_IMAGE_LAYOUT_H */
