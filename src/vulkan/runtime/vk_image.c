@@ -23,6 +23,9 @@
 
 #include "vk_image.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+
 #if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
 #include <drm-uapi/drm_fourcc.h>
 #endif
@@ -196,7 +199,21 @@ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
    assert(pProperties->sType ==
           VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT);
 
-   assert(image->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+   /* Valid usage requires a DRM_FORMAT_MODIFIER-tiled image here, but in the
+    * limina stack this entrypoint is reachable with guest-controlled state via
+    * venus, and a guest slip must degrade, not abort the host VMM (a release
+    * build would already return drm_format_mod — 0 == LINEAR — silently; do
+    * the same loudly). Seen live 2026-08-04: firefox's dmabuf path queried a
+    * non-modifier image and the assert killed the worker.
+    */
+   if (image->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      fprintf(stderr,
+              "[KK-MODIFIER] GetImageDrmFormatModifierPropertiesEXT on a "
+              "non-modifier image (tiling=%d format=%d extent=%ux%u usage=0x%x) "
+              "— reporting modifier 0x%" PRIx64 "\n",
+              image->tiling, image->format, image->extent.width,
+              image->extent.height, image->usage, image->drm_format_mod);
+   }
    pProperties->drmFormatModifier = image->drm_format_mod;
 
    return VK_SUCCESS;
