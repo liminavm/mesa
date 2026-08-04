@@ -30,6 +30,19 @@ const VkExternalMemoryProperties kk_mtlheap_mem_props = {
    .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
 };
 
+/* An MTLTexture handle is a *dedicated* allocation: the texture is the storage,
+ * so it can back exactly one image and cannot be suballocated. It is therefore
+ * not interchangeable with the heap handle type — keep the compatible set to
+ * itself alone. */
+const VkExternalMemoryProperties kk_mtltexture_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+};
+
 const VkExternalMemoryProperties kk_host_mem_props = {
    .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
    .exportFromImportedHandleTypes = 0,
@@ -48,10 +61,12 @@ kk_GetMemoryMetalHandlePropertiesEXT(
    VK_FROM_HANDLE(kk_device, dev, device);
    struct kk_physical_device *pdev = kk_device_physical(dev);
 
-   /* We only support heaps since that's the backing for all our memory and
-    * simplifies implementation */
+   /* Heaps back all of our own allocations; textures are additionally accepted
+    * as dedicated imports (a texture cannot be suballocated, so it backs exactly
+    * one image). */
    switch (handleType) {
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT:
       break;
    default:
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -113,15 +128,33 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    if (import_metal || import_host) {
       /* limina: metal_info is NULL on a host-pointer-only import — don't deref it. */
-      assert(!import_metal || metal_info->handleType ==
-             VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
+      const bool import_texture =
+         import_metal && metal_info->handleType ==
+                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+      if (import_metal && !import_texture &&
+          metal_info->handleType !=
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT) {
+         result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "unsupported Metal handle type 0x%x",
+                            metal_info->handleType);
+         goto fail_alloc;
+      }
       mem->bo = CALLOC_STRUCT(kk_bo);
       if (!mem->bo) {
          result = vk_errorf(&dev->vk.base, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
          goto fail_alloc;
       }
 
-      if (import_metal) {
+      if (import_texture) {
+         /* A texture is the storage, not a pool to carve from: there is no heap
+          * and no buffer, so gpu/cpu stay 0 and the image bound to this memory
+          * adopts the texture verbatim (kk_image_plane_bind). Anything that
+          * tries to treat this memory as a buffer — vkMapMemory, a VkBuffer
+          * bind — must fail rather than deref a NULL map. */
+         mem->bo->texture = mtl_retain(metal_info->handle);
+         mem->bo->size_B = mem->vk.size;
+         kk_device_add_texture_to_residency_set(dev, mem->bo->texture);
+      } else if (import_metal) {
          /* We only support heaps since that's the backing for all our memory
           * and simplifies implementation */
          mem->bo->mtl_handle = mtl_retain(metal_info->handle);
@@ -151,8 +184,11 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
       }
 
-      mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
-      mem->bo->cpu = mtl_get_contents(mem->bo->map);
+      /* A texture import has no buffer to take an address or contents from. */
+      if (mem->bo->map) {
+         mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+         mem->bo->cpu = mtl_get_contents(mem->bo->map);
+      }
    } else {
       result =
          kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
@@ -284,11 +320,22 @@ kk_GetMemoryMetalHandleEXT(
    VkDevice device, const VkMemoryGetMetalHandleInfoEXT *pGetMetalHandleInfo,
    void **pHandle)
 {
-   /* We only support heaps since that's the backing for all our memory and
-    * simplifies implementation */
-   assert(pGetMetalHandleInfo->handleType ==
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
    VK_FROM_HANDLE(kk_device_memory, mem, pGetMetalHandleInfo->memory);
+
+   /* A texture-backed allocation can only ever hand back its texture, and a
+    * heap-backed one its heap — asking for the other is an invalid handle, not
+    * an assert: the request comes from the application. */
+   if (pGetMetalHandleInfo->handleType ==
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
+      if (!mem->bo->texture)
+         return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      *pHandle = mem->bo->texture;
+      return VK_SUCCESS;
+   }
+
+   if (pGetMetalHandleInfo->handleType !=
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)
+      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    /* In some cases, such as host pointer imports, we don't have a MTLHeap */
    if (!mem->bo->mtl_handle)

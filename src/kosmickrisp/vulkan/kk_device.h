@@ -171,6 +171,10 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
                                            mtl_buffer *buffer);
 void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
                                                 mtl_buffer *buffer);
+void kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture);
+void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                                 mtl_texture *texture);
 void kk_device_make_resources_resident(struct kk_device *dev);
 
 /* Take the sequence number for a command buffer that is about to carry

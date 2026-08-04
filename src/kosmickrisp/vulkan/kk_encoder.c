@@ -92,6 +92,15 @@ kk_encoder_start_render(struct kk_cmd_buffer *cmd,
 
       encoder->main.encoder = mtl_new_render_command_encoder_with_descriptor(
          encoder->main.cmd_buffer, descriptor);
+      /* limina probe: a nil encoder here is Metal refusing the render pass — most
+       * often because an attachment texture is not a valid render target. It is
+       * silent: the crash lands later, in kk_encoder_internal_end_encoding's
+       * assert, with no clue as to which pass. Name it at the source. */
+      if (!encoder->main.encoder)
+         fprintf(stderr, "[LIMINA-KK-ENC] render command encoder is NIL "
+                         "(descriptor=%p view_mask=0x%x) — attachment likely not a "
+                         "valid Metal render target\n",
+                 (void *)descriptor, view_mask);
       if (encoder->main.wait_fence) {
          mtl_render_wait_for_fence(
             encoder->main.encoder,
