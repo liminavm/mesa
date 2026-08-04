@@ -931,6 +931,11 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
    struct winsys_handle whandle;
    enum pipe_format pf;
 
+   if (!pscreen->resource_from_handle) {
+      mesa_loge("dri2_from_iosurface_limina: driver has no resource_from_handle");
+      return NULL;
+   }
+
    const uint32_t osfmt = IOSurfaceGetPixelFormat((IOSurfaceRef)iosurface);
    switch (osfmt) {
    case 0x42475241: /* 'BGRA' */
@@ -968,6 +973,9 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
    img->texture = pscreen->resource_from_handle(
       pscreen, &templ, &whandle, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
    if (!img->texture) {
+      mesa_loge("dri2_from_iosurface_limina: resource_from_handle refused "
+                "%ux%u %s", (unsigned)templ.width0, (unsigned)templ.height0,
+                util_format_name(pf));
       FREE(img);
       return NULL;
    }
