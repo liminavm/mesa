@@ -1083,16 +1083,10 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
       obj->exportable_dmabuf = !!(alloc_info->export_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
    }
 
-#ifdef ZINK_USE_DMABUF
-
-#if !defined(_WIN32)
-   VkImportMemoryFdInfoKHR imfi = {
-      VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-      NULL,
-   };
 #ifdef __APPLE__
    /* limina: IOSurface import — KK's MTLTEXTURE metal handle accepts an
-    * IOSurfaceRef and builds the texture from the dedicated image's layout. */
+    * IOSurfaceRef and builds the texture from the dedicated image's layout.
+    * Deliberately OUTSIDE ZINK_USE_DMABUF (not defined on macOS). */
    VkImportMemoryMetalHandleInfoEXT immhi = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
    };
@@ -1102,8 +1096,17 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
       immhi.handle = alloc_info->whandle->com_obj;
       immhi.pNext = mai.pNext;
       mai.pNext = &immhi;
-   } else
+   }
 #endif
+
+#ifdef ZINK_USE_DMABUF
+
+#if !defined(_WIN32)
+   VkImportMemoryFdInfoKHR imfi = {
+      VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+      NULL,
+   };
+
    if (alloc_info->whandle) {
       imfi.pNext = NULL;
       imfi.handleType = alloc_info->external;
@@ -1653,8 +1656,14 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
       if (!ici.pNext)
          return roc_fail_and_free_object;
    }
-   if (!success)
+   if (!success) {
+      if (alloc_info->whandle &&
+          alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
+         mesa_loge("zink: IOSurface import: negotiate_image_config failed "
+                   "(fmt %u tiling %u usage 0x%x)", ici.format, ici.tiling,
+                   ici.usage);
       return roc_fail_and_free_object;
+   }
 
    if (ici.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && srgb &&
       util_format_get_nr_components(srgb) == 4 &&
@@ -1809,6 +1818,9 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
       create_result = create_image(screen, obj, templ, linear, modifiers, modifiers_count,
                                    &alloc_info);
    }
+   if (whandle && whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA &&
+       create_result != roc_success)
+      mesa_loge("zink: IOSurface import: create_image result=%d", create_result);
 
    switch (create_result) {
    case roc_success:
@@ -2350,23 +2362,25 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
                  struct winsys_handle *whandle,
                  unsigned usage)
 {
-#ifdef ZINK_USE_DMABUF
-   struct zink_screen *screen = zink_screen(pscreen);
-
 #ifdef __APPLE__
    /* limina: import an IOSurface (winsys_handle::com_obj) as a plain OPTIMAL
     * image whose dedicated memory adopts the surface via KK's MTLTEXTURE
     * metal handle. No modifier machinery, no dmabuf bind — mirror of the vkr
     * scanout import, reached from vrend through the EGL_IOSURFACE_LIMINA
-    * EGLImage target. */
+    * EGLImage target. NOTE: deliberately OUTSIDE ZINK_USE_DMABUF, which is
+    * not defined on macOS. */
    if (whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA) {
       struct pipe_resource templ3 = *templ;
       if (templ->format == PIPE_FORMAT_NONE)
          templ3.format = whandle->format;
       struct pipe_resource *ios_pres =
          resource_create(pscreen, &templ3, whandle, usage, NULL, 0, NULL, NULL);
-      if (!ios_pres)
+      if (!ios_pres) {
+         mesa_loge("zink: IOSurface import resource_create refused (%s %ux%u)",
+                   util_format_name(templ3.format), templ3.width0,
+                   templ3.height0);
          return NULL;
+      }
       struct zink_resource *ios_res = zink_resource(ios_pres);
       ios_res->valid = true;
       ios_res->obj->immutable_handle = true;
@@ -2374,6 +2388,8 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
       return ios_pres;
    }
 #endif
+#ifdef ZINK_USE_DMABUF
+   struct zink_screen *screen = zink_screen(pscreen);
 
    if (whandle->modifier != DRM_FORMAT_MOD_INVALID &&
        !screen->info.have_EXT_image_drm_format_modifier)
@@ -3646,6 +3662,13 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
       pscreen->resource_get_handle = zink_resource_get_handle;
       pscreen->resource_from_handle = zink_resource_from_handle;
    }
+#ifdef __APPLE__
+   /* limina: KK has neither external-memory-fd nor win32, but the IOSurface
+    * winsys-handle import (WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA) needs the
+    * entry point installed — without it dri2_from_iosurface_limina calls NULL. */
+   if (!pscreen->resource_from_handle)
+      pscreen->resource_from_handle = zink_resource_from_handle;
+#endif
    if (screen->info.have_EXT_external_memory_host) {
       pscreen->resource_from_user_memory = zink_resource_from_user_memory;
    }
