@@ -27,6 +27,12 @@ kk_get_image_format_features(struct kk_physical_device *pdevice,
                              VkFormat format, VkImageTiling tiling,
                              uint64_t drm_format_mod);
 
+/* Nonzero iff the format is eligible for VK_EXT_image_drm_format_modifier
+ * (LINEAR-only); the value is the LINEAR modifier's tiling feature mask. */
+VkFormatFeatureFlags2
+kk_get_drm_format_modifier_features(struct kk_physical_device *pdevice,
+                                    VkFormat format);
+
 uint32_t kk_image_max_dimension(VkImageType image_type);
 
 struct kk_image_plane {

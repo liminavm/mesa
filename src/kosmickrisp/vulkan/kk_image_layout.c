@@ -19,12 +19,23 @@ vk_image_to_mtl_texture_type(const struct vk_image *image)
 {
    uint32_t array_layers = image->array_layers;
    uint32_t samples = image->samples;
+   /* Metal forbids array types for linear textures, so a non-OPTIMAL image
+    * (plain LINEAR or a DRM-format-modifier image, which for us is always
+    * DRM_FORMAT_MOD_LINEAR) must stay non-array. Input-attachment READS go
+    * through the arrays-only lowering and therefore do not work on linear
+    * images — that matches the feature envelope we advertise (plain LINEAR
+    * withholds attachment features entirely; the LINEAR modifier advertises
+    * COLOR_ATTACHMENT, whose render path is proven, while a subpass read on
+    * one would fail loudly at view creation rather than make the base
+    * texture un-creatable here). */
+   const bool can_array = image->tiling == VK_IMAGE_TILING_OPTIMAL;
    switch (image->image_type) {
    case VK_IMAGE_TYPE_1D:
    case VK_IMAGE_TYPE_2D:
       /* We require input attachments to be arrays */
-      if (array_layers > 1 ||
-          (image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+      if (can_array &&
+          (array_layers > 1 ||
+           (image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
          return samples > 1u ? MTL_TEXTURE_TYPE_2D_ARRAY_MULTISAMPLE
                              : MTL_TEXTURE_TYPE_2D_ARRAY;
       return samples > 1u ? MTL_TEXTURE_TYPE_2D_MULTISAMPLE
@@ -203,7 +214,9 @@ kk_image_layout_calc_tiled(const struct kk_device *dev,
 void
 kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
                      enum pipe_format format, const uint8_t width_scale,
-                     const uint8_t height_scale, struct kk_image_layout *layout)
+                     const uint8_t height_scale,
+                     const uint32_t explicit_row_stride_B,
+                     struct kk_image_layout *layout)
 {
    const struct kk_va_format *supported_format = kk_get_va_format(format);
    layout->type = vk_image_to_mtl_texture_type(image);
@@ -212,21 +225,13 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
    layout->depth_px = image->extent.depth;
    layout->layers = image->array_layers;
    layout->levels = image->mip_levels;
+   /* A DRM-format-modifier image is always DRM_FORMAT_MOD_LINEAR for us, so it
+    * takes the linear path like plain VK_IMAGE_TILING_LINEAR. (An earlier
+    * carve-out laid modifier *attachments* out tiled to dodge a nil render
+    * encoder; the checkpoint of 2026-08-04 showed linear color attachments
+    * render fine — the historical aborts came from the arrays-only
+    * input-attachment type, handled in vk_image_to_mtl_texture_type now.) */
    layout->linear = image->tiling != VK_IMAGE_TILING_OPTIMAL;
-   /* limina: a DRM-format-modifier image used as a render target must NOT become
-    * a buffer-backed linear Metal texture — Metal cannot build a render command
-    * encoder for one, so mtl_new_render_command_encoder_with_descriptor returns
-    * nil and kk_render_encoder (kk_encoder.c) asserts on the nil encoder. In a VM
-    * the guest's DRM modifier is host-meaningless (the real backing is a host
-    * heap, not a guest-readable linear buffer), so lay such attachment images out
-    * tiled / heap-backed, which IS a valid Metal render target. Plain
-    * VK_IMAGE_TILING_LINEAR images are left linear: that path is vkr's
-    * IOSurface-backed scanout image (renderable via newBufferWithBytesNoCopy),
-    * which must keep its linear layout. */
-   if (image->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
-       (image->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
-      layout->linear = false;
    layout->optimized_layout = kk_image_layout_can_optimize(
       image->usage, image->tiling, image->create_flags, format);
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
@@ -251,6 +256,18 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
 
    if (layout->linear) {
       kk_image_layout_calc_linear(dev, layout);
+      /* VK_EXT_image_drm_format_modifier EXPLICIT create: adopt the caller's
+       * rowPitch when it is compatible (at least as wide as ours, and meeting
+       * Metal's linear-texture alignment). The caller validates/rejects an
+       * incompatible pitch; here an unusable value is simply ignored so the
+       * layout is never internally inconsistent. */
+      if (explicit_row_stride_B >= layout->linear_stride_B &&
+          (explicit_row_stride_B % layout->align_B) == 0) {
+         layout->linear_stride_B = explicit_row_stride_B;
+         layout->layer_stride_B = layout->linear_stride_B * layout->height_px;
+         layout->size_B = layout->layer_stride_B;
+         layout->level_offsets_B[1] = layout->layer_stride_B;
+      }
    } else {
       kk_image_layout_calc_tiled(dev, layout);
    }
