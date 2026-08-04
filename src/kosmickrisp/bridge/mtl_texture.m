@@ -23,6 +23,22 @@ mtl_texture_get_gpu_resource_id(mtl_texture *texture)
    }
 }
 
+void
+mtl_texture_get_props(mtl_texture *texture, struct mtl_texture_props *props)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      props->width = [tex width];
+      props->height = [tex height];
+      props->pixel_format = (uint32_t)[tex pixelFormat];
+      props->texture_type = (uint32_t)[tex textureType];
+      props->sample_count = (uint32_t)[tex sampleCount];
+      props->mip_levels = (uint32_t)[tex mipmapLevelCount];
+      props->array_length = (uint32_t)[tex arrayLength];
+      props->usage = (uint32_t)[tex usage];
+   }
+}
+
 /* TODO_KOSMICKRISP This should be part of the mapping */
 static uint32_t
 mtl_texture_view_type(uint32_t type, uint8_t sample_count)
