@@ -652,9 +652,17 @@ submit_queue(void *data, void *gdata, int thread_index)
    int num_si = ZINK_SUBMIT_MAX;
    while (!bs->fence.batch_id)
       bs->fence.batch_id = (uint32_t)p_atomic_inc_return(&screen->curr_batch);
+   /* the unflushed clear must happen under the usage mutex: waiters in
+    * zink_batch_usage_unflushed_wait() check the flag under that mutex before
+    * sleeping on u->flush, and a clear that lands between an unlocked check and
+    * the cnd_wait is a lost wakeup (observed as an infinite sleep on u->flush
+    * with every flush queue idle)
+    */
+   mtx_lock(&bs->usage.mtx);
    bs->usage.usage = bs->fence.batch_id;
    assert(bs->usage.usage);
    bs->usage.unflushed = false;
+   mtx_unlock(&bs->usage.mtx);
 
    uint64_t batch_id = bs->fence.batch_id;
    /* first submit is just for acquire waits since they have a separate array */
@@ -842,7 +850,12 @@ submit_queue(void *data, void *gdata, int thread_index)
 
    bs->usage.submit_count++;
 end:
+   /* broadcast under the mutex so the wake can't slip between a waiter's locked
+    * predicate check and its cnd_wait
+    */
+   mtx_lock(&bs->usage.mtx);
    cnd_broadcast(&bs->usage.flush);
+   mtx_unlock(&bs->usage.mtx);
 
    post_submit(bs, screen);
 
@@ -1207,12 +1220,30 @@ zink_batch_usage_unflushed_wait(struct zink_context *ctx, struct zink_batch_usag
          ctx->base.flush(&ctx->base, NULL, PIPE_FLUSH_HINT_FINISH);
          return true;
       } else { //multi-context
+         /* re-check the predicate under the mutex and wait in a loop: the submit
+          * thread clears `unflushed` and broadcasts `flush` under this same mutex,
+          * so a checked-then-wait without the re-check races the broadcast and
+          * sleeps forever on a signal that already fired
+          */
          mtx_lock(&u->mtx);
          if (trywait) {
-            struct timespec ts = {0, 10000};
-            cnd_timedwait(&u->flush, &u->mtx, &ts);
-         } else
-            cnd_wait(&u->flush, &u->mtx);
+            if (u->unflushed) {
+               /* cnd_timedwait takes an ABSOLUTE TIME_UTC timespec; the previous
+                * {0, 10000} was epoch+10us, i.e. always already expired
+                */
+               struct timespec ts;
+               timespec_get(&ts, TIME_UTC);
+               ts.tv_nsec += 10000;
+               if (ts.tv_nsec >= 1000000000) {
+                  ts.tv_sec++;
+                  ts.tv_nsec -= 1000000000;
+               }
+               cnd_timedwait(&u->flush, &u->mtx, &ts);
+            }
+         } else {
+            while (u->unflushed)
+               cnd_wait(&u->flush, &u->mtx);
+         }
          mtx_unlock(&u->mtx);
       }
    }
