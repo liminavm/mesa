@@ -647,16 +647,22 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
 
    /* An EXPLICIT rowPitch we could not adopt (narrower than Metal's minimum
     * for this format/width, or violating its linear-texture row alignment) is
-    * an unsupported layout, not one to silently replace — the caller's other
-    * plane (the exporter) is already using that pitch. */
+    * an invalid plane layout — app-side undefined behavior, which we define as
+    * "the image uses the computed pitch instead", loudly. Rationale: in the VM
+    * stack the exporter's image at the same width computes the same pitch, so
+    * this stays coherent end to end; and the transition-era guest driver
+    * (mesa 0010(b)) fabricates tight-packed pitches that are wrong exactly
+    * when width*bpp misses the alignment. The queries always report the pitch
+    * actually in use, never the rejected value — the claim stays truthful.
+    * This log line disappearing is the tripwire that the guest went truthful. */
    if (explicit_row_stride_B != 0 &&
-       image->planes[0].layout.linear_stride_B != explicit_row_stride_B)
-      return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
-                       "unsupported explicit rowPitch %u (minimum %u, "
-                       "alignment %" PRIu64 ")",
-                       explicit_row_stride_B,
-                       image->planes[0].layout.linear_stride_B,
-                       image->planes[0].layout.align_B);
+       image->planes[0].layout.linear_stride_B != explicit_row_stride_B) {
+      fprintf(stderr,
+              "[KK-MODIFIER] EXPLICIT rowPitch %u unusable (minimum %u, "
+              "alignment %" PRIu64 "); using the computed pitch\n",
+              explicit_row_stride_B, image->planes[0].layout.linear_stride_B,
+              image->planes[0].layout.align_B);
+   }
 
    return VK_SUCCESS;
 }
