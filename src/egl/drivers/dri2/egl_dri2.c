@@ -2651,6 +2651,37 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
 
 #endif
 
+#ifdef __APPLE__
+/* limina: EGLImage from an IOSurfaceRef (passed as the EGLClientBuffer, no
+ * attribs — the surface self-describes). Consumed by virglrenderer's vrend to
+ * composite venus clients' window buffers; the pipe resource adopts the
+ * IOSurface via zink → KK's MTLTEXTURE metal-handle import.
+ * The enum value must match virglrenderer's copy (vrend_winsys_egl.c). */
+#define EGL_IOSURFACE_LIMINA 0x3B9A
+
+static _EGLImage *
+dri2_create_image_iosurface_limina(_EGLDisplay *disp, EGLClientBuffer buffer)
+{
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   struct dri_image *dri_image;
+
+   if (!buffer) {
+      _eglError(EGL_BAD_PARAMETER, "dri2_create_image_iosurface_limina");
+      return NULL;
+   }
+
+   dri_image =
+      dri2_from_iosurface_limina(dri2_dpy->dri_screen_render_gpu,
+                                 (void *)buffer, NULL);
+   if (!dri_image) {
+      _eglError(EGL_BAD_PARAMETER, "dri2_create_image_iosurface_limina");
+      return NULL;
+   }
+
+   return dri2_create_image_from_dri(disp, dri_image);
+}
+#endif /* __APPLE__ */
+
 _EGLImage *
 dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
                       EGLClientBuffer buffer, const EGLint *attr_list)
@@ -2675,6 +2706,10 @@ dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
 #ifdef HAVE_BIND_WL_DISPLAY
    case EGL_WAYLAND_BUFFER_WL:
       return dri2_create_image_wayland_wl_buffer(disp, ctx, buffer, attr_list);
+#endif
+#ifdef __APPLE__
+   case EGL_IOSURFACE_LIMINA:
+      return dri2_create_image_iosurface_limina(disp, buffer);
 #endif
    default:
       _eglError(EGL_BAD_PARAMETER, "dri2_create_image_khr");

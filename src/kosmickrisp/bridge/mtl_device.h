@@ -46,6 +46,11 @@ uint64_t mtl_device_timestamp_frequency(mtl_device *dev);
 mtl_counter_heap *mtl_new_timestamp_counter_heap(mtl_device *dev,
                                                  uint32_t count);
 
+/* limina: texture whose storage IS an IOSurface (import path; see mtl_device.m) */
+bool mtl_handle_is_iosurface(void *handle);
+mtl_texture *mtl_new_texture_with_descriptor_iosurface(
+   mtl_device *device, const struct kk_image_layout *layout, void *iosurface);
+
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,
                                                 uint64_t *size_B,
