@@ -185,6 +185,13 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_hdr_metadata = true,
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_view_min_lod = KK_EXPERIMENTAL(IMAGE_VIEW_MIN_LOD),
+      /* limina: LINEAR-only. In the VM stack this is what lets upstream venus's
+       * passthrough gate advertise the extension to the guest, deleting the
+       * guest-side fabrication (mesa 0010(b)). The LINEAR claim is genuine: the
+       * shareable images are IOSurface-backed (linear at the surface's rowBytes)
+       * or buffer-backed linear Metal textures, and both render (measured —
+       * spikes/modifier-necessity/RESULTS.md, kk 0002 origin-class checkpoint). */
+      .EXT_image_drm_format_modifier = true,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = true,
