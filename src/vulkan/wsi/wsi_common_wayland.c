@@ -577,15 +577,16 @@ wsi_wl_display_add_drm_format_modifier(struct wsi_wl_display *display,
     * compared to DRM formats, just like the 8-bits-per-channel ones.
     * On little endian systems the memory representation of each channel
     * matches the DRM formats'. */
+   /* limina: do NOT expose R16G16B16A16_UNORM as a wayland swapchain/surface format.
+      It is a legal Vulkan swapchain format but NOT a color-renderable surface format in
+      wgpu/WebGPU even with TEXTURE_FORMAT_16BIT_NORM, so a conventional "first non-sRGB"
+      wgpu client (e.g. ghost-ui) that lands on it fails pipeline creation ("Rgba16Unorm
+      cannot be used as a render attachment"). It is never a real scanout format here (host
+      virtio-gpu scanout is 8-bit); it reached clients only via the compositor's
+      compositable dmabuf set. Skip the UNORM 16-bit cases; the SFLOAT (HDR) variants below
+      stay (those ARE wgpu-renderable). Matches lavapipe. */
    case DRM_FORMAT_ABGR16161616:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_R16G16B16A16_UNORM,
-                                            WSI_WL_FMT_ALPHA, modifier);
-      break;
    case DRM_FORMAT_XBGR16161616:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_R16G16B16A16_UNORM,
-                                            WSI_WL_FMT_OPAQUE, modifier);
       break;
    case DRM_FORMAT_ABGR16161616F:
       wsi_wl_display_add_vk_format_modifier(display, formats,
