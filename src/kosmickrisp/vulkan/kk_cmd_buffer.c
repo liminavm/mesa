@@ -700,24 +700,6 @@ kk_pool_upload(struct kk_cmd_buffer *cmd, const void *data, uint32_t size,
    return T;
 }
 
-/* limina: upload only the root-table prefix the bound shaders can address
- * instead of the full ~2.2 KiB table. Zink-shaped pipelines (no dynamic
- * descriptors) never read past sets[], so the dynamic_buffers tail (~half
- * the table) is dead weight on a memcpy that runs PER DRAW (every push-
- * descriptor flush re-dirties the root). Bound comes from the pipeline's
- * set layouts at compile time (kk_shader_info::root_used_size; 0 = unknown
- * -> full size). LIMINA_KK_SLIMROOT=0 restores full-size uploads. */
-static inline bool
-kk_limina_slimroot(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      const char *e = getenv("LIMINA_KK_SLIMROOT");
-      v = !e || e[0] != '0';
-   }
-   return v;
-}
-
 uint64_t
 kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
                           VkPipelineBindPoint bind_point)
