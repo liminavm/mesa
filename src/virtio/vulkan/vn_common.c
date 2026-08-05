@@ -245,7 +245,7 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
    };
 }
 
-void
+bool
 vn_relax(struct vn_relax_state *state)
 {
    const uint32_t base_sleep_us = state->profile.base_sleep_us;
@@ -257,7 +257,7 @@ vn_relax(struct vn_relax_state *state)
    (*iter)++;
    if (*iter < (1 << busy_wait_order)) {
       thrd_yield();
-      return;
+      return true;
    }
 
    state->warn = false;
@@ -270,8 +270,13 @@ vn_relax(struct vn_relax_state *state)
       struct vn_ring *ring = instance->ring.ring;
       const uint32_t status = vn_ring_load_status(ring);
       if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
-         vn_log(instance, "aborting on ring fatal error at iter %d", *iter);
-         abort();
+         /* The renderer-side ring is dead: whatever we are waiting on will
+          * never make progress. Give up the wait instead of taking the
+          * process down — the caller surfaces VK_ERROR_DEVICE_LOST.
+          */
+         vn_log(instance, "ring fatal at iter %d: giving up the %s wait",
+                *iter, state->reason_str);
+         return false;
       }
 
       struct vn_watchdog *watchdog = &instance->ring.watchdog;
@@ -293,6 +298,7 @@ vn_relax(struct vn_relax_state *state)
 
    const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
    os_time_sleep(base_sleep_us << shift);
+   return true;
 }
 
 struct vn_ring *

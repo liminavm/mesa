@@ -303,7 +303,11 @@ vn_query_feedback_wait_ready(struct vn_device *dev,
       vn_relax_init(dev->instance, VN_RELAX_REASON_QUERY);
    for (uint32_t i = 0, j = 0; i < query_count; i++, j += step) {
       while (!avail[j]) {
-         vn_relax(&relax_state);
+         if (!vn_relax(&relax_state)) {
+            /* ring dead: fall back to the synchronous probe below */
+            vn_relax_fini(&relax_state);
+            return false;
+         }
 
          /* Wait until warn order is reached. */
          if (vn_relax_warn(&relax_state)) {
@@ -336,10 +340,8 @@ vn_get_query_pool_feedback(VkDevice device,
          /* Emit synchronous call to catch renderer device lost */
          result = vn_get_query_pool_results(device, queryPool, firstQuery,
                                             queryCount, pData, stride, flags);
-         if (result == VK_ERROR_DEVICE_LOST) {
-            vn_log(dev->instance, "aborting on qfb device lost");
-            abort();
-         }
+         if (result == VK_ERROR_DEVICE_LOST)
+            vn_log(dev->instance, "device lost on qfb probe");
          if (result != VK_SUCCESS)
             return result;
 
