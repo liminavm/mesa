@@ -209,10 +209,11 @@ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
    if (image->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       fprintf(stderr,
               "[KK-MODIFIER] GetImageDrmFormatModifierPropertiesEXT on a "
-              "non-modifier image (tiling=%d format=%d extent=%ux%u usage=0x%x) "
-              "— reporting modifier 0x%" PRIx64 "\n",
+              "non-modifier image (tiling=%d format=%d extent=%ux%u usage=0x%" PRIx64
+              ") — reporting modifier 0x%" PRIx64 "\n",
               image->tiling, image->format, image->extent.width,
-              image->extent.height, image->usage, image->drm_format_mod);
+              image->extent.height, (uint64_t)image->usage,
+              image->drm_format_mod);
    }
    pProperties->drmFormatModifier = image->drm_format_mod;
 

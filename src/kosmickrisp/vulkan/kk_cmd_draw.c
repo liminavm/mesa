@@ -1325,28 +1325,6 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
                vb.addr, 0, gfx->attrib_elsize_B[i], vb.range,
                dyn->vi_binding_strides[attr.binding], attr.offset,
                &desc->root.draw.attrib_base[slot]);
-            if (kk_limina_rtlog()) {
-               mtl_buffer *h = gfx->vb.handles[attr.binding];
-               const float *cf = NULL;
-               if (h) {
-                  uint64_t gpu_base = mtl_buffer_get_gpu_address(h);
-                  char *cpu = (char *)mtl_get_contents(h);
-                  if (cpu && vb.addr >= gpu_base)
-                     cf = (const float *)(cpu + (vb.addr - gpu_base));
-               }
-               fprintf(stderr,
-                       "[LIMINA-KK-ATTR] slot=%u binding=%u vb.addr=0x%llx range=%llu "
-                       "stride=%u attroff=%u -> base=0x%llx clamp=%u data=(%.1f %.1f "
-                       "%.1f %.1f %.1f %.1f %.1f %.1f)\n",
-                       slot, attr.binding, (unsigned long long)vb.addr,
-                       (unsigned long long)vb.range,
-                       dyn->vi_binding_strides[attr.binding], attr.offset,
-                       (unsigned long long)desc->root.draw.attrib_base[slot],
-                       desc->root.draw.attrib_clamps[slot],
-                       cf ? cf[0] : -99, cf ? cf[1] : -99, cf ? cf[2] : -99,
-                       cf ? cf[3] : -99, cf ? cf[4] : -99, cf ? cf[5] : -99,
-                       cf ? cf[6] : -99, cf ? cf[7] : -99);
-            }
             desc->root.draw.buffer_strides[attr.binding] =
                dyn->vi_binding_strides[attr.binding];
          }
