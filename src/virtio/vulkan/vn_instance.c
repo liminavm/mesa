@@ -333,11 +333,13 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    result = vn_instance_init_ring(instance);
    if (result != VK_SUCCESS)
-      goto out_shmem_pool_fini;
+      goto out_degrade_to_stub;
 
    result = vn_instance_init_renderer_versions(instance);
-   if (result != VK_SUCCESS)
-      goto out_ring_fini;
+   if (result != VK_SUCCESS) {
+      vn_instance_fini_ring(instance);
+      goto out_degrade_to_stub;
+   }
 
    VkInstanceCreateInfo local_create_info = *pCreateInfo;
    local_create_info.ppEnabledExtensionNames = NULL;
@@ -392,10 +394,27 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    return VK_SUCCESS;
 
+out_degrade_to_stub:
+   /* The renderer connected but the instance ring / version handshake can't
+    * be set up (e.g. the ring shmem can't be allocated or mapped -- seen on
+    * 4 KiB-page guests under a 16 KiB-page host). Degrade to the stub
+    * instance exactly like the wire-version-mismatch path in
+    * vn_instance_init_renderer(): a hard error here (especially
+    * VK_ERROR_OUT_OF_HOST_MEMORY) makes the loader fail the WHOLE
+    * vkCreateInstance, killing every other ICD (lavapipe) with us.
+    */
+   vn_renderer_shmem_pool_fini(instance->renderer,
+                               &instance->reply_shmem_pool);
+   vn_renderer_shmem_pool_fini(instance->renderer, &instance->cs_shmem_pool);
+   vn_renderer_destroy(instance->renderer, alloc);
+   /* needed by stub instance creation */
+   instance->renderer = NULL;
+   *pInstance = instance_handle;
+   return VK_SUCCESS;
+
 out_ring_fini:
    vn_instance_fini_ring(instance);
 
-out_shmem_pool_fini:
    vn_renderer_shmem_pool_fini(instance->renderer,
                                &instance->reply_shmem_pool);
    vn_renderer_shmem_pool_fini(instance->renderer, &instance->cs_shmem_pool);
