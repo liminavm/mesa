@@ -72,6 +72,8 @@ struct vn_ring_submit {
 
    /* BOs to keep alive (TODO make sure shmems are pinned) */
    uint32_t shmem_count;
+   /* how many slots shmems[] was allocated with; never shrinks */
+   uint32_t shmem_capacity;
    struct vn_renderer_shmem *shmems[];
 };
 
@@ -437,16 +439,20 @@ vn_ring_get_submit(struct vn_ring *ring, uint32_t shmem_count)
 {
    list_for_each_entry_safe(struct vn_ring_submit, submit,
                             &ring->free_submits, head) {
-      if (submit->shmem_count >= shmem_count) {
+      if (submit->shmem_capacity >= shmem_count) {
          list_del(&submit->head);
          return submit;
       }
    }
 
    const uint32_t min_shmem_count = 2;
-   const size_t submit_size = offsetof(
-      struct vn_ring_submit, shmems[MAX2(shmem_count, min_shmem_count)]);
-   return malloc(submit_size);
+   const uint32_t shmem_capacity = MAX2(shmem_count, min_shmem_count);
+   const size_t submit_size =
+      offsetof(struct vn_ring_submit, shmems[shmem_capacity]);
+   struct vn_ring_submit *submit = malloc(submit_size);
+   if (submit)
+      submit->shmem_capacity = shmem_capacity;
+   return submit;
 }
 
 static VkResult
