@@ -317,11 +317,13 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    result = vn_instance_init_ring(instance);
    if (result != VK_SUCCESS)
-      goto out_shmem_pool_fini;
+      goto out_degrade_to_stub;
 
    result = vn_instance_init_renderer_versions(instance);
-   if (result != VK_SUCCESS)
-      goto out_ring_fini;
+   if (result != VK_SUCCESS) {
+      vn_instance_fini_ring(instance);
+      goto out_degrade_to_stub;
+   }
 
    VkInstanceCreateInfo local_create_info = *pCreateInfo;
    local_create_info.ppEnabledExtensionNames = NULL;
@@ -369,10 +371,23 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    return VK_SUCCESS;
 
+out_degrade_to_stub:
+   /* Like a renderer version mismatch, fall back to the stub instance. The
+    * loader fails the whole vkCreateInstance on VK_ERROR_OUT_OF_HOST_MEMORY,
+    * which would take every other driver down with venus.
+    */
+   vn_renderer_shmem_pool_fini(instance->renderer,
+                               &instance->reply_shmem_pool);
+   vn_renderer_shmem_pool_fini(instance->renderer, &instance->cs_shmem_pool);
+   vn_renderer_destroy(instance->renderer, alloc);
+   /* needed by stub instance creation */
+   instance->renderer = NULL;
+   *pInstance = instance_handle;
+   return VK_SUCCESS;
+
 out_ring_fini:
    vn_instance_fini_ring(instance);
 
-out_shmem_pool_fini:
    vn_renderer_shmem_pool_fini(instance->renderer,
                                &instance->reply_shmem_pool);
    vn_renderer_shmem_pool_fini(instance->renderer, &instance->cs_shmem_pool);
