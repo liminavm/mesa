@@ -425,7 +425,11 @@ vn_watchdog_fini(struct vn_watchdog *watchdog)
 struct vn_relax_state
 vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason);
 
-void
+/* Returns false when the renderer-side ring is dead (VK_RING_STATUS_FATAL) —
+ * the wait will never make progress and the caller must stop and surface
+ * VK_ERROR_DEVICE_LOST instead of spinning or aborting.
+ */
+bool
 vn_relax(struct vn_relax_state *state);
 
 void
