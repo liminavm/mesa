@@ -465,10 +465,8 @@ kk_query_write_cpu_result(struct kk_cmd_buffer *cmd,
                            (uint32_t)(values[i] >> 32)});
    }
 
-   if (kk_has_available(pool)) {
-      uint64_t addr = kk_query_available_addr(pool, query);
-      kk_cmd_write(cmd, (struct libkk_imm_write){addr, 1});
-   }
+   uint64_t addr = kk_query_available_addr(pool, query);
+   kk_cmd_write(cmd, (struct libkk_imm_write){addr, 1});
 }
 
 VKAPI_ATTR void VKAPI_CALL
