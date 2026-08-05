@@ -39,12 +39,10 @@ kk_limina_rtlog(void)
    return v;
 }
 
-/* limina: hot per-draw buffer rebinds. The root table (index 0) and per-draw
- * data (index 2) live in the upload pool, so consecutive draws bind the SAME
- * MTLBuffer at a new offset — Metal's setBufferOffset skips setBuffer's
- * residency/binding-table work, and a fully unchanged bind is skipped
- * outright. Per-encoder cache in kk_graphics_state, zeroed on encoder
- * creation. LIMINA_KK_FASTBIND=0 restores plain setBuffer calls. */
+/* limina: gates the per-draw upload dedup below (identical per-draw content
+ * reuses its previous pool location — pool data is immutable for the life of
+ * the cmd buffer). The MTL3-era bind cache this knob also covered died with
+ * the MTL4 argument-table rework. LIMINA_KK_FASTBIND=0 disables. */
 static inline bool
 kk_limina_fastbind(void)
 {
@@ -54,46 +52,6 @@ kk_limina_fastbind(void)
       v = !e || e[0] != '0';
    }
    return v;
-}
-
-static inline void
-kk_bind_vbuf_cached(mtl_render_encoder *enc, struct kk_bound_buf *slot,
-                    mtl_buffer *buf, uint32_t offset, uint32_t index)
-{
-   if (!kk_limina_fastbind()) {
-      mtl_set_vertex_buffer(enc, buf, offset, index);
-      return;
-   }
-   if (slot->buf == buf) {
-      if (slot->offset != offset) {
-         mtl_set_vertex_buffer_offset(enc, offset, index);
-         slot->offset = offset;
-      }
-   } else {
-      mtl_set_vertex_buffer(enc, buf, offset, index);
-      slot->buf = buf;
-      slot->offset = offset;
-   }
-}
-
-static inline void
-kk_bind_fbuf_cached(mtl_render_encoder *enc, struct kk_bound_buf *slot,
-                    mtl_buffer *buf, uint32_t offset, uint32_t index)
-{
-   if (!kk_limina_fastbind()) {
-      mtl_set_fragment_buffer(enc, buf, offset, index);
-      return;
-   }
-   if (slot->buf == buf) {
-      if (slot->offset != offset) {
-         mtl_set_fragment_buffer_offset(enc, offset, index);
-         slot->offset = offset;
-      }
-   } else {
-      mtl_set_fragment_buffer(enc, buf, offset, index);
-      slot->buf = buf;
-      slot->offset = offset;
-   }
 }
 
 static void
@@ -2394,15 +2352,14 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       uint32_t xfb_fit = 0, xfb_gen = 0;
       if (xfb_track) {
          kk_xfb_pre_draw(cmd, data, i, &xfb_captured, &xfb_fit, &xfb_gen);
+         /* The pre-draw writes XFB state into the root table; re-upload and
+          * re-bind it the same way the regular draw path does (MTL4 argument
+          * table, not per-stage buffer binds). */
          if (cmd->state.gfx.descriptors.root_dirty) {
             kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-            struct kk_ptr root_buffer =
-               cmd->state.gfx.descriptors.root.root_buffer;
-            mtl_render_encoder *enc = kk_render_encoder(cmd);
-            kk_bind_vbuf_cached(enc, &cmd->state.gfx.bind_cache_v0,
-                                root_buffer.buffer, root_buffer.offset, 0);
-            kk_bind_fbuf_cached(enc, &cmd->state.gfx.bind_cache_f0,
-                                root_buffer.buffer, root_buffer.offset, 0);
+            if (cmd->state.gfx.descriptors.root.addr)
+               kk_cmd_bind_root_to_argument_table(
+                  cmd, cmd->state.gfx.descriptors.root.addr);
          }
       }
 

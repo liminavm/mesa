@@ -187,11 +187,6 @@ struct kk_graphics_state {
     * at a new offset — Metal's setBufferOffset skips the residency/binding-
     * table work of setBuffer, and a fully unchanged bind is skipped outright.
     * Zeroed when a new render encoder is created (fresh binding tables). */
-   struct kk_bound_buf {
-      mtl_buffer *buf;
-      uint32_t offset;
-   } bind_cache_v0, bind_cache_f0, bind_cache_v2, bind_cache_f2;
-
    /* limina: last-uploaded per-draw data + its pool location; non-tess draws
     * usually repeat the same content (draw_id varies only across multidraw),
     * so the per-draw pool upload can be skipped (pool data is immutable).
