@@ -189,6 +189,15 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
    physical_dev->wsi_device.supports_scanout = false;
    physical_dev->wsi_device.supports_modifiers =
       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
+   /* macOS-host virtio-gpu compositors advertise modifiers as INVALID. Force
+    * the rewrite to LINEAR so mesa picks the native single-memory path; this
+    * is what lets the host-side IOSurface reach the wl_buffer Mutter samples. */
+   physical_dev->wsi_device.treat_invalid_modifier_as_linear = true;
+   /* Diagnostic: drop high-bit-depth DRM formats (RGBA16F, RGB10A2) so
+    * clients fall back to BGRA8/RGBA8. The high-bit path currently produces
+    * stride-mismatch position offsets and wrong colors via IOSurface→ANGLE.
+    * Remove this once the high-bit color/stride path is fixed. */
+   physical_dev->wsi_device.block_16f_swapchain_formats = true;
    physical_dev->base.vk.wsi_device = &physical_dev->wsi_device;
 
    return VK_SUCCESS;

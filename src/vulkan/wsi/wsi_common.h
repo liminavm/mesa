@@ -92,6 +92,26 @@ struct wsi_device {
    bool supports_protected[VK_ICD_WSI_PLATFORM_MAX];
 
    bool supports_modifiers;
+
+   /* On macOS-host virtio-gpu, the host has no DRM modifier negotiation;
+    * compositors (e.g. Mutter) advertise their dmabuf format tranches with
+    * modifier=DRM_FORMAT_MOD_INVALID. With INVALID, mesa falls back to the
+    * prime-blit path (separate image+buffer memories), which prevents the
+    * host-side IOSurface from reaching the wl_buffer Mutter samples.
+    *
+    * Setting this flag rewrites every INVALID modifier the compositor offers
+    * to DRM_FORMAT_MOD_LINEAR, which makes mesa pick the native single-memory
+    * path and lets the IOSurface flow end-to-end. */
+   bool treat_invalid_modifier_as_linear;
+
+   /* High-bit DRM formats (RGBA16F, RGB10A2 variants) currently produce
+    * severely distorted colors and (for 16F) a stride-mismatch position
+    * offset on the IOSurface→ANGLE path. Setting this flag suppresses those
+    * formats so vkcube/vkmark fall through to BGRA8/RGBA8, which renders
+    * pixel-perfect. (Diagnostic: covers both 16F and 10:10:10:2 despite
+    * the name. Drop when the high-bit color/stride issue is fixed.) */
+   bool block_16f_swapchain_formats;
+
    uint32_t maxImageDimension2D;
    uint32_t optimalBufferCopyRowPitchAlignment;
    VkPresentModeKHR override_present_mode;
