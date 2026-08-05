@@ -10,6 +10,7 @@
 
 #include "vn_common.h"
 
+#include <dlfcn.h>
 #include <stdarg.h>
 
 #include "util/log.h"
@@ -385,6 +386,20 @@ vn_tls_key_create_once(void)
    vn_tls_key_valid = tss_create(&vn_tls_key, vn_tls_free) == thrd_success;
    if (!vn_tls_key_valid && VN_DEBUG(INIT))
       vn_log(NULL, "WARNING: failed to create vn_tls_key");
+
+   /* The key's destructor (vn_tls_free) lives in this DSO, but unlike
+    * __cxa_thread_atexit_impl, pthread/C11 TLS destructors do not pin the DSO
+    * they point into. The Vulkan loader dlclose()s the driver once the last
+    * instance is destroyed, after which any thread that ever used venus calls
+    * the now-unmapped destructor on exit and crashes in
+    * __nptl_deallocate_tsd. Pin ourselves (a no-op re-open with RTLD_NODELETE)
+    * so the destructor stays callable for the life of the process.
+    */
+   if (vn_tls_key_valid) {
+      Dl_info info;
+      if (dladdr((void *)vn_tls_free, &info) && info.dli_fname)
+         dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+   }
 }
 
 struct vn_tls *
