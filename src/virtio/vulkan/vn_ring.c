@@ -186,7 +186,7 @@ vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno)
    return vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno);
 }
 
-void
+VkResult
 vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
 {
    /* A renderer wait incurs several hops and the renderer might poll
@@ -199,19 +199,31 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
    do {
       if (vn_ring_get_seqno_status(ring, seqno)) {
          vn_relax_fini(&relax_state);
-         return;
+         return VK_SUCCESS;
       }
-      vn_relax(&relax_state);
+      /* Check THIS ring's status, not just the instance ring's (vn_relax):
+       * a dead ring never advances its head and the wait would never end.
+       */
+      if (unlikely(vn_ring_load_status(ring) &
+                   VK_RING_STATUS_FATAL_BIT_MESA)) {
+         vn_log(ring->instance, "ring fatal: abandoning the seqno wait");
+         vn_relax_fini(&relax_state);
+         return VK_ERROR_DEVICE_LOST;
+      }
+      if (!vn_relax(&relax_state)) {
+         vn_relax_fini(&relax_state);
+         return VK_ERROR_DEVICE_LOST;
+      }
    } while (true);
 }
 
-void
+VkResult
 vn_ring_wait_all(struct vn_ring *ring)
 {
    /* load from tail rather than ring->cur for atomicity */
    const uint32_t pending_seqno =
       atomic_load_explicit(ring->shared.tail, memory_order_relaxed);
-   vn_ring_wait_seqno(ring, pending_seqno);
+   return vn_ring_wait_seqno(ring, pending_seqno);
 }
 
 static bool
@@ -228,14 +240,14 @@ vn_ring_has_space(const struct vn_ring *ring,
    return false;
 }
 
-static uint32_t
-vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
+/* Returns false when the ring died while waiting (VK_ERROR_DEVICE_LOST). */
+static bool
+vn_ring_wait_space(struct vn_ring *ring, uint32_t size, uint32_t *out_head)
 {
    assert(size <= ring->buffer_size);
 
-   uint32_t head;
-   if (likely(vn_ring_has_space(ring, size, &head)))
-      return head;
+   if (likely(vn_ring_has_space(ring, size, out_head)))
+      return true;
 
    {
       VN_TRACE_FUNC();
@@ -244,10 +256,15 @@ vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
       struct vn_relax_state relax_state =
          vn_relax_init(ring->instance, VN_RELAX_REASON_RING_SPACE);
       do {
-         vn_relax(&relax_state);
-         if (vn_ring_has_space(ring, size, &head)) {
+         if (unlikely(vn_ring_load_status(ring) &
+                      VK_RING_STATUS_FATAL_BIT_MESA) ||
+             !vn_relax(&relax_state)) {
             vn_relax_fini(&relax_state);
-            return head;
+            return false;
+         }
+         if (vn_ring_has_space(ring, size, out_head)) {
+            vn_relax_fini(&relax_state);
+            return true;
          }
       } while (true);
    }
@@ -443,11 +460,12 @@ vn_ring_get_submit(struct vn_ring *ring, uint32_t shmem_count)
    return submit;
 }
 
-static bool
+static VkResult
 vn_ring_submit_internal(struct vn_ring *ring,
                         struct vn_ring_submit *submit,
                         const struct vn_cs_encoder *cs,
-                        uint32_t *seqno)
+                        uint32_t *seqno,
+                        bool *out_notify)
 {
    /* write cs to the ring */
    assert(!vn_cs_encoder_is_empty(cs));
@@ -455,17 +473,24 @@ vn_ring_submit_internal(struct vn_ring *ring,
    /* avoid -Wmaybe-unitialized */
    uint32_t cur_seqno = 0;
 
+   *out_notify = false;
+
    for (uint32_t i = 0; i < cs->buffer_count; i++) {
       const struct vn_cs_encoder_buffer *buf = &cs->buffers[i];
-      cur_seqno = vn_ring_wait_space(ring, buf->committed_size);
+      if (!vn_ring_wait_space(ring, buf->committed_size, &cur_seqno))
+         return VK_ERROR_DEVICE_LOST;
       vn_ring_write_buffer(ring, buf->base, buf->committed_size);
    }
 
    vn_ring_store_tail(ring);
    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
-      vn_log(NULL, "vn_ring_submit abort on fatal");
-      abort();
+      /* The renderer-side ring is dead; nothing will consume what we just
+       * wrote. Fail the submission instead of taking the process down — the
+       * loss surfaces as VK_ERROR_DEVICE_LOST from the calling entrypoint.
+       */
+      vn_log(NULL, "ring fatal: failing the submission with device lost");
+      return VK_ERROR_DEVICE_LOST;
    }
 
    vn_ring_retire_submits(ring, cur_seqno);
@@ -484,10 +509,10 @@ vn_ring_submit_internal(struct vn_ring *ring,
       if (os_time_timeout(ring->last_notify, ring->next_notify, now)) {
          ring->last_notify = now;
          ring->next_notify = now + VN_RING_IDLE_TIMEOUT_NS;
-         return true;
+         *out_notify = true;
       }
    }
-   return false;
+   return VK_SUCCESS;
 }
 
 static const struct vn_cs_encoder *
@@ -630,6 +655,10 @@ vn_ring_submit_locked(struct vn_ring *ring,
                       struct vn_renderer_shmem *extra_shmem,
                       uint32_t *ring_seqno)
 {
+   /* fast-fail: the ring is known dead and nothing will consume the cs */
+   if (unlikely(vn_ring_load_status(ring) & VK_RING_STATUS_FATAL_BIT_MESA))
+      return VK_ERROR_DEVICE_LOST;
+
    const bool direct = vn_ring_submission_can_direct(ring, cs);
    if (!direct && cs->storage_type == VN_CS_ENCODER_STORAGE_POINTER) {
       cs = vn_ring_cs_upload_locked(ring, cs);
@@ -645,8 +674,20 @@ vn_ring_submit_locked(struct vn_ring *ring,
       return result;
 
    uint32_t seqno;
-   const bool notify =
-      vn_ring_submit_internal(ring, submit.submit, submit.cs, &seqno);
+   bool notify;
+   result =
+      vn_ring_submit_internal(ring, submit.submit, submit.cs, &seqno, &notify);
+   if (result != VK_SUCCESS) {
+      /* the submit was never queued: drop its shmem refs and recycle it,
+       * mirroring vn_ring_retire_submits
+       */
+      for (uint32_t i = 0; i < submit.submit->shmem_count; i++)
+         vn_renderer_shmem_unref(ring->instance->renderer,
+                                 submit.submit->shmems[i]);
+      list_addtail(&submit.submit->head, &ring->free_submits);
+      vn_ring_submission_cleanup(&submit);
+      return result;
+   }
    if (notify) {
       uint32_t notify_ring_data[8];
       struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
@@ -727,12 +768,16 @@ vn_ring_submit_command(struct vn_ring *ring,
    mtx_unlock(&ring->mutex);
 
    if (submit->reply_size) {
-      if (likely(submit->ring_seqno_valid)) {
+      if (likely(submit->ring_seqno_valid) &&
+          vn_ring_wait_seqno(ring, submit->ring_seqno) == VK_SUCCESS) {
          void *reply_ptr = submit->reply_shmem->mmap_ptr + reply_offset;
          submit->reply =
             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
-         vn_ring_wait_seqno(ring, submit->ring_seqno);
       } else {
+         /* submission failed or the ring died before consuming it: no reply
+          * will ever arrive — the caller sees a NULL reply decoder and fails
+          * the command instead of decoding garbage
+          */
          vn_renderer_shmem_unref(ring->instance->renderer,
                                  submit->reply_shmem);
          submit->reply_shmem = NULL;
