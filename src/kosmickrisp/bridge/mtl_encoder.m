@@ -10,7 +10,16 @@
 #include <Metal/MTL4ComputeCommandEncoder.h>
 #include <Metal/MTL4Counters.h>
 #include <Metal/MTL4RenderCommandEncoder.h>
+/* limina: the full MTL4RenderPassDescriptor interface (MTL4CommandBuffer.h only
+ * forward-declares it), needed to inspect the attachments below. */
+#include <Metal/MTL4RenderPass.h>
 #include <Metal/MTLRenderPass.h>
+
+/* limina: atomics for the attachment-less clamp warning counter, execinfo for
+ * its one-shot backtrace. */
+#include <stdatomic.h>
+#include <execinfo.h>
+#include <unistd.h>
 
 /* Common encoder utils */
 void
@@ -238,6 +247,45 @@ mtl_new_render_command_encoder_with_descriptor(
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
       MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
+      /* limina: an attachment-less pass whose defaultRasterSampleCount is still 0 makes AGX
+       * abort the whole process from inside the Metal compiler, uncatchably -- so the state
+       * has to be caught here, on the way in. An attachment is "there" only if it carries a
+       * texture: a failed import leaves the descriptor slot populated but the texture nil,
+       * which is exactly how this shape was reaching Metal. */
+      uint32_t natt = 0;
+      for (uint32_t i = 0; i < 8; i++)
+         natt += desc.colorAttachments[i].texture ? 1 : 0;
+      natt += desc.depthAttachment.texture ? 1 : 0;
+      natt += desc.stencilAttachment.texture ? 1 : 0;
+
+      if (natt == 0 && desc.defaultRasterSampleCount == 0) {
+         /* Clamping to 1 is what turns an uncatchable process abort into, at worst, a lost
+          * render: mtlrp.m measured attachment-less passes as green at sample count 1 and 2
+          * and fatal only at 0. Anything reaching here is still an upstream bug -- the pass
+          * has nothing to draw into -- so keep warning (rate-limited; the shape can repeat
+          * every frame) even though it no longer kills us. */
+         static _Atomic uint64_t seen;
+         uint64_t n_seen = atomic_fetch_add_explicit(&seen, 1, memory_order_relaxed);
+         if (n_seen < 8 || (n_seen & 1023) == 0) {
+            fprintf(stderr,
+                    "[LIMINA-KK-RP] attachment-less render pass with "
+                    "defaultRasterSampleCount=0 (rt=%lux%lu, #%llu) -- clamping to 1; "
+                    "without this AGX aborts the process from inside the Metal compiler\n",
+                    (unsigned long)desc.renderTargetWidth,
+                    (unsigned long)desc.renderTargetHeight,
+                    (unsigned long long)n_seen + 1);
+            /* Backtrace on the first one only: it names the caller that built the bad
+             * descriptor, which is the only thing anyone needs from here. */
+            if (n_seen == 0) {
+               void *bt[32];
+               int nframes = backtrace(bt, 32);
+               fflush(stderr);
+               backtrace_symbols_fd(bt, nframes, STDERR_FILENO);
+            }
+         }
+         desc.defaultRasterSampleCount = 1;
+      }
+
       return [[cmd renderCommandEncoderWithDescriptor:desc] retain];
    }
 }

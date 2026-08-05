@@ -290,7 +290,14 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
    if (gfx->need_to_start_render_pass) {
-      gfx->render.samples = gfx->pipeline_sample_count;
+      /* limina: Metal requires defaultRasterSampleCount >= 1; an attachment-less
+       * render pass has no attachment to derive it from and a draw can reach
+       * here before a pipeline set it, leaving 0 -> the render command encoder
+       * comes back nil and the pass start crashes (observed pre-MTL4 as a
+       * worker-killing assert; on the live-record path the nil propagates to
+       * mtl_set_vertex_amplification_count). Clamp. */
+      gfx->render.samples =
+         gfx->pipeline_sample_count ? gfx->pipeline_sample_count : 1u;
       mtl_render_pass_descriptor_set_default_raster_sample_count(
          cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
       gfx->need_to_start_render_pass = false;
