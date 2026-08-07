@@ -12,6 +12,9 @@
 
 #include "util/u_memory.h"
 
+#include <stdatomic.h>
+#include <stdlib.h>
+
 #if DETECT_OS_APPLE
 #include <mach/mach_init.h>
 #include <mach/mach_vm.h>
@@ -82,7 +85,44 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
    /* An imported MTLTexture has neither heap nor buffer — the texture is the
     * whole allocation. Release it and stop; the paths below would deref NULL. */
    if (bo->texture) {
+      /* limina: LIMINA_KK_TEX_TRACE=N — the retain count around the residency removal, on the
+       * last lines where the texture is still legally ours to touch. KK holds exactly one ref
+       * (the import) plus the residency set's; anything left after both come off is a holder
+       * we did not put there. Budgeted: a storm destroys hundreds of these a second. The
+       * running census after it is the verdict — a create/dealloc gap means the texture (and
+       * with it the IOSurface it is backed by) never died. */
+      static atomic_int traced;
+      static atomic_int budget = -1;
+      int b = atomic_load(&budget);
+      if (b < 0) {
+         const char *e = getenv("LIMINA_KK_TEX_TRACE");
+         b = (e && *e) ? (int)strtol(e, NULL, 10) : 0;
+         atomic_store(&budget, b);
+      }
+      bool trace = b > 0 && atomic_fetch_add(&traced, 1) < b;
+      long before = trace ? mtl_limina_retain_count(bo->texture) : 0;
+
       kk_device_remove_texture_from_residency_set(dev, bo->texture);
+
+      if (trace) {
+         char census[128];
+         mtl_limina_texture_census(census, sizeof(census));
+         fprintf(stderr,
+                 "[LIMINA-KK-TEXFREE] tex=%p retain before=%ld after-residency-remove=%ld "
+                 "(ours: 1) | %s\n",
+                 bo->texture, before, mtl_limina_retain_count(bo->texture), census);
+      }
+
+      /* And a heartbeat regardless of the trace budget: the storm destroys hundreds of
+       * textures a second, so the gap must stay visible long after the first N lines. */
+      static atomic_uint destroyed;
+      unsigned n = atomic_fetch_add(&destroyed, 1) + 1;
+      if ((n % 256u) == 0u) {
+         char census[128];
+         mtl_limina_texture_census(census, sizeof(census));
+         fprintf(stderr, "[LIMINA-KK-TEXFREE] %s\n", census);
+      }
+
       mtl_release(bo->texture);
       FREE(bo);
       return;
