@@ -11,6 +11,29 @@ mtl_command_allocator_reset(mtl_command_allocator *allocator)
 {
 }
 
+uint64_t
+mtl_command_allocator_allocated_size(mtl_command_allocator *allocator)
+{
+   return 0u;
+}
+
+int
+limina_kk_alloc_stats_on(void)
+{
+   return 0;
+}
+
+uint64_t
+limina_kk_alloc_track_commit(void **cbs, uint32_t count)
+{
+   return 0u;
+}
+
+void
+limina_kk_alloc_track_complete(uint64_t token)
+{
+}
+
 void
 mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
                          mtl_command_allocator *allocator)
