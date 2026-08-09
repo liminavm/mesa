@@ -127,6 +127,14 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                util_dynarray_clear(&cmd_buffer->charged_allocs);
                mtl_commit_options_add_feedback_handler(queue->commit_options,
                                                        discharge_callback, d);
+            } else {
+               /* limina: no payload, so these charges will be discharged at command-buffer reset
+                * instead of at GPU completion — early, and rerecord_cmd_buffer reaches that path
+                * while the first submission is still executing. Harmless while the pool only
+                * ever RESETS a drained allocator; a use-after-free once it may DESTROY one. Pin
+                * them out of the destroy policy rather than reason about the window. */
+               util_dynarray_foreach(&cmd_buffer->charged_allocs, kk_pooled_alloc_ptr, pap)
+                  kk_alloc_pool_pin(dev, *pap);
             }
          }
 

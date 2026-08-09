@@ -115,6 +115,14 @@ struct kk_pooled_alloc {
    uint32_t pending;
    bool in_use;   /* borrowed by an open encoder — Metal allows only one at a time */
    bool draining; /* over budget: no new work until pending hits 0 and it is reset */
+   /* Sticky: this allocator's charges once went through the kk_queue.c malloc-failure fallback,
+    * which discharges at Vulkan command-buffer reset instead of at GPU completion. Under RESET
+    * that is merely early (recoverable); under DESTROY it would free heaps the GPU is still
+    * reading. Cheaper to exclude the allocator forever than to reason about the window. Remove
+    * once the fallback itself is fixed to keep the charge until completion. */
+   bool no_destroy;
+   /* os_time_get_nano() when pending last hit 0 while draining — the decay clock. 0 = not idle. */
+   uint64_t idle_since;
    enum kk_alloc_class klass;
 };
 
@@ -122,9 +130,18 @@ struct kk_alloc_pool {
    simple_mtx_t mtx;
    struct util_dynarray allocs[KK_ALLOC_CLASS_COUNT]; /* struct kk_pooled_alloc * */
    uint64_t budget_bytes;
+   /* Reclaim policy. Measured (spikes/vrend-region-leak/mtl4-repro/destroy-probe.m): releasing an
+    * allocator returns 100% of its heaps immediately, even while its completed command buffers
+    * are still alive, whereas reset() returns 0%. So destroying a surplus allocator is the ONLY
+    * lever that gives memory back on the vrend tier, where the KK VkDevice belongs to zink's
+    * screen and lives until the worker process exits. */
+   uint64_t decay_ns;                    /* idle this long before a drained allocator is surplus */
+   uint32_t floor;                       /* never destroy below this many per class */
+   bool destroy_enabled;                 /* LIMINA_KK_ALLOC_DESTROY=0 kill switch */
    /* Stats, so pool growth is never silent. */
    uint32_t live[KK_ALLOC_CLASS_COUNT];
    uint32_t peak_live[KK_ALLOC_CLASS_COUNT];
+   uint32_t destroyed[KK_ALLOC_CLASS_COUNT];
    uint32_t watermark_warned;
 };
 
@@ -136,6 +153,7 @@ struct kk_pooled_alloc *kk_alloc_pool_acquire(struct kk_device *dev,
 void kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa);
 void kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa);
 void kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa);
+void kk_alloc_pool_pin(struct kk_device *dev, struct kk_pooled_alloc *pa);
 void kk_alloc_pool_init(struct kk_device *dev);
 void kk_alloc_pool_finish(struct kk_device *dev);
 

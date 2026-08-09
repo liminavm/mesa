@@ -198,12 +198,24 @@ kk_encoder_begin(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
       return false;
    es->allocator = es->pa->handle;
 
-   mtl_begin_command_buffer(es->cmd_buf, es->allocator);
-   kk_alloc_pool_charge(dev, es->pa);
+   /* Grow the tracking slot BEFORE charging. The other order loses the charge entirely when the
+    * grow fails: nothing would ever discharge it, the allocator would wedge in draining forever,
+    * and under the destroy policy that silently erodes the pool below its floor. Failing here
+    * instead costs only this encoder. The slot is NULLed first so a concurrent walk of the array
+    * can never see an uninitialised entry (kk_alloc_pool_discharge tolerates NULL). */
    kk_pooled_alloc_ptr *slot =
       util_dynarray_grow(&cmd->charged_allocs, kk_pooled_alloc_ptr, 1);
-   if (slot)
-      *slot = es->pa;
+   if (slot == NULL) {
+      kk_alloc_pool_release(dev, es->pa);
+      es->pa = NULL;
+      es->allocator = NULL;
+      return false;
+   }
+   *slot = NULL;
+
+   mtl_begin_command_buffer(es->cmd_buf, es->allocator);
+   kk_alloc_pool_charge(dev, es->pa);
+   *slot = es->pa;
    return true;
 }
 
