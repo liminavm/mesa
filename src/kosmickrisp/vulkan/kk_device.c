@@ -98,7 +98,7 @@ kk_alloc_pool_take_surplus(struct kk_alloc_pool *pool, enum kk_alloc_class klass
       struct kk_pooled_alloc *pa = *pap;
       if (pa == keep || pa->in_use || !pa->draining || pa->pending != 0)
          continue;
-      if (pa->no_destroy || pa->idle_since == 0)
+      if (pa->idle_since == 0)
          continue;
       if (now - pa->idle_since < pool->decay_ns)
          continue;
@@ -297,24 +297,6 @@ kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa)
     * and its decay clock starts. Not eligible while borrowed — release() stamps that case. */
    if (pa->pending == 0 && pa->draining && !pa->in_use)
       pa->idle_since = os_time_get_nano();
-   simple_mtx_unlock(&dev->alloc_pool.mtx);
-}
-
-/* Exclude an allocator from destruction, permanently.
- *
- * Called when a submit's discharge payload could not be allocated, so its charges will instead be
- * discharged at Vulkan command-buffer reset (kk_cmd_release_resources) rather than at GPU
- * completion. Under RESET that is merely early and recoverable; under DESTROY the same window
- * would free heaps the GPU is still reading — and rerecord_cmd_buffer reaches it without any
- * spec violation by the app, so on both tiers a guest could drive it. Pinning is far cheaper than
- * reasoning about the window. Retire this once the fallback holds its charge until completion. */
-void
-kk_alloc_pool_pin(struct kk_device *dev, struct kk_pooled_alloc *pa)
-{
-   if (!pa)
-      return;
-   simple_mtx_lock(&dev->alloc_pool.mtx);
-   pa->no_destroy = true;
    simple_mtx_unlock(&dev->alloc_pool.mtx);
 }
 

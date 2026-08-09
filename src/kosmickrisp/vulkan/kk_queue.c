@@ -46,6 +46,31 @@ discharge_callback(struct mtl_feedback_data *data)
    free(d);
 }
 
+/* limina: fault injection for the discharge-payload allocation.
+ *
+ * That allocation is a few dozen bytes and effectively never fails, which is exactly why its
+ * recovery path carried a use-after-free unnoticed for as long as it did. An untestable error
+ * path is an unreviewed one, so make it reachable on demand:
+ * LIMINA_KK_FAIL_DISCHARGE_ALLOC=<n> fails the first <n> payload allocations.
+ *
+ * The counter is deliberately plain: it is a debug knob, and a race can only change how many
+ * injections land, never whether the path under test is correct. */
+static bool
+kk_discharge_alloc_should_fail(void)
+{
+   static int remaining = -1;
+   if (remaining < 0) {
+      const char *e = getenv("LIMINA_KK_FAIL_DISCHARGE_ALLOC");
+      remaining = (e && *e) ? atoi(e) : 0;
+   }
+   if (remaining > 0) {
+      remaining--;
+      fprintf(stderr, "[LIMINA-KK] injecting discharge-payload allocation failure\n");
+      return true;
+   }
+   return false;
+}
+
 static void
 rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
 {
@@ -106,36 +131,42 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
       /* Metal complains with empty submissions. */
       if (count > 0u) {
-         mtl_commit_options_add_feedback_handler(queue->commit_options,
-                                                 commit_callback, dev);
-
-         /* limina: hand this batch's allocator charges to the completion callback and clear
-          * them from the command buffer, so kk_cmd_release_resources does not discharge them a
-          * second time. Anything left in charged_allocs after this belongs to a command buffer
-          * that was recorded but never submitted. */
+         /* limina: build the discharge payload BEFORE anything is committed or cleared.
+          *
+          * The charge for a command buffer must be released at GPU COMPLETION. The old code
+          * committed first and, if this allocation failed, left the charges in charged_allocs to
+          * be discharged by kk_cmd_release_resources at Vulkan command-buffer reset instead —
+          * which rerecord_cmd_buffer (just above) reaches on a SIMULTANEOUS_USE resubmit while
+          * the first submission is still executing. No app-side spec violation is needed to get
+          * there, so on both tiers a guest could drive pending to 0 with the GPU still reading
+          * the heaps: harmless while the pool only ever RESET a drained allocator, a
+          * use-after-free once it may DESTROY one.
+          *
+          * Allocating up-front removes the window rather than narrowing it. If it fails we
+          * return before committing, so the GPU never receives this work and discharging later
+          * at reset is then exactly right. Nothing between the dynarray clear and the commit can
+          * fail, so a charge can never be dropped on the floor either. */
          uint32_t ncharged = util_dynarray_num_elements(
             &cmd_buffer->charged_allocs, kk_pooled_alloc_ptr);
+         struct kk_submit_discharge *d = NULL;
          if (ncharged) {
-            struct kk_submit_discharge *d = malloc(
-               sizeof(*d) + ncharged * sizeof(kk_pooled_alloc_ptr));
-            if (d) {
-               d->dev = dev;
-               d->count = ncharged;
-               memcpy(d->allocs,
-                      util_dynarray_begin(&cmd_buffer->charged_allocs),
-                      ncharged * sizeof(kk_pooled_alloc_ptr));
-               util_dynarray_clear(&cmd_buffer->charged_allocs);
-               mtl_commit_options_add_feedback_handler(queue->commit_options,
-                                                       discharge_callback, d);
-            } else {
-               /* limina: no payload, so these charges will be discharged at command-buffer reset
-                * instead of at GPU completion — early, and rerecord_cmd_buffer reaches that path
-                * while the first submission is still executing. Harmless while the pool only
-                * ever RESETS a drained allocator; a use-after-free once it may DESTROY one. Pin
-                * them out of the destroy policy rather than reason about the window. */
-               util_dynarray_foreach(&cmd_buffer->charged_allocs, kk_pooled_alloc_ptr, pap)
-                  kk_alloc_pool_pin(dev, *pap);
-            }
+            d = kk_discharge_alloc_should_fail()
+                   ? NULL
+                   : malloc(sizeof(*d) + ncharged * sizeof(kk_pooled_alloc_ptr));
+            if (d == NULL)
+               return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+            d->dev = dev;
+            d->count = ncharged;
+            memcpy(d->allocs, util_dynarray_begin(&cmd_buffer->charged_allocs),
+                   ncharged * sizeof(kk_pooled_alloc_ptr));
+         }
+
+         mtl_commit_options_add_feedback_handler(queue->commit_options,
+                                                 commit_callback, dev);
+         if (d) {
+            util_dynarray_clear(&cmd_buffer->charged_allocs);
+            mtl_commit_options_add_feedback_handler(queue->commit_options,
+                                                    discharge_callback, d);
          }
 
          mtl_command_queue_commit(queue->mtl_handle, cmds, count,
