@@ -108,6 +108,14 @@ mtl_command_queue_commit(mtl_command_queue *queue,
       id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
       id<MTL4CommandBuffer> *cmds = (id<MTL4CommandBuffer> *)command_buffers;
       MTL4CommitOptions *opt = (MTL4CommitOptions *)options;
+      /* limina probe: charge these command buffers to their allocators, and discharge them when
+       * the GPU says this commit completed. See mtl_command_buffer.m. */
+      void *batch = limina_kk_alloc_track_commit((void **)command_buffers, count);
+      if (batch) {
+         [opt addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+           limina_kk_alloc_track_complete(batch);
+         }];
+      }
       [q commit:cmds count:count options:opt];
    }
 }

@@ -17,6 +17,23 @@ mtl_command_allocator_allocated_size(mtl_command_allocator *allocator)
    return 0u;
 }
 
+int
+limina_kk_alloc_stats_on(void)
+{
+   return 0;
+}
+
+void *
+limina_kk_alloc_track_commit(void **cbs, uint32_t count)
+{
+   return NULL;
+}
+
+void
+limina_kk_alloc_track_complete(void *batch)
+{
+}
+
 void
 mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
                          mtl_command_allocator *allocator)

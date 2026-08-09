@@ -52,9 +52,16 @@ static pthread_mutex_t limina_alloc_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
    void *key;
    uint64_t size;
+   int32_t pending;    /* committed-but-not-yet-complete command buffers on this allocator */
+   uint64_t violations; /* resets taken while pending > 0 */
 } limina_alloc_seen[LIMINA_ALLOC_SLOTS];
 static uint32_t limina_alloc_distinct;
 static uint64_t limina_alloc_resets;
+static uint64_t limina_alloc_violations;  /* total resets taken while pending > 0 */
+static uint64_t limina_alloc_commits;
+static uint32_t limina_alloc_cb_overflow; /* cmd-buf map ran full; mappings were dropped */
+static uint64_t limina_alloc_cb_charged;  /* committed cmd bufs successfully charged to an allocator */
+static uint64_t limina_alloc_cb_missed;   /* committed cmd bufs with no recorded allocator */
 
 static inline uint32_t
 limina_alloc_stats_every(void)
@@ -69,6 +76,174 @@ limina_alloc_stats_every(void)
    return (uint32_t)v;
 }
 
+int
+limina_kk_alloc_stats_on(void)
+{
+   return limina_alloc_stats_every() != 0;
+}
+
+/* Slot for `key` in the allocator table. Caller holds the lock. -1 if absent and !create, or if
+ * the table is full (open addressing; the live population is in the hundreds, so this stays far
+ * from full — if it ever does fill, give up rather than spin). */
+static int
+limina_alloc_slot(void *key, bool create)
+{
+   uintptr_t h = ((uintptr_t)key >> 4) * 2654435761u;
+   uint32_t i = (uint32_t)(h % LIMINA_ALLOC_SLOTS);
+   for (uint32_t probe = 0; probe < LIMINA_ALLOC_SLOTS; ++probe) {
+      uint32_t s = (i + probe) % LIMINA_ALLOC_SLOTS;
+      if (limina_alloc_seen[s].key == key)
+         return (int)s;
+      if (limina_alloc_seen[s].key == NULL) {
+         if (!create)
+            return -1;
+         limina_alloc_seen[s].key = key;
+         limina_alloc_distinct++;
+         return (int)s;
+      }
+   }
+   return -1;
+}
+
+/* --- pending-at-reset: the discriminator between the two surviving mechanisms ---------------
+ *
+ * Apple: "You are responsible to ensure that all command buffers with memory originating from
+ * this allocator instance are complete before calling resetting it." Two mechanisms explain the
+ * per-workload-launch ratchet equally well and nothing measured so far separates them:
+ *
+ *   (1) resets landing while that allocator's command buffers are still in flight, so Metal
+ *       cannot recycle the heaps and allocates fresh ones;
+ *   (2) plain documented high-water retention, where each launch drives a *different subset* of
+ *       the 450 allocators to a new high-water. No contract violation at all.
+ *
+ * So count the violations directly. mtl_begin_command_buffer records cmd_buf -> allocator;
+ * commit increments that allocator's pending and arms a feedback handler to decrement it on
+ * completion; reset checks pending and counts a violation if it is non-zero.
+ *
+ * Violations at launch magnitude => (1). Zero violations while the sum still steps per launch
+ * => (2), proven, and "obey the contract" fixes nothing.
+ *
+ * Note on the feedback handler: KK appends one to a queue-lifetime MTL4CommitOptions on every
+ * submit, so handlers accumulate and a given block is invoked again for later commits. The
+ * `fired` guard makes each batch decrement exactly once — at its own commit's completion, which
+ * is the first invocation it sees. That is correct regardless of the accumulation semantics. */
+#define LIMINA_CB_SLOTS 32768
+static struct {
+   void *cb;
+   void *alloc;
+} limina_cb_map[LIMINA_CB_SLOTS];
+
+struct limina_pending_batch {
+   int fired;
+   uint32_t count;
+   void *allocs[];
+};
+
+/* Record which allocator this command buffer was begun on. */
+static void
+limina_alloc_track_begin(void *cb, void *alloc)
+{
+   pthread_mutex_lock(&limina_alloc_stats_lock);
+   uintptr_t h = ((uintptr_t)cb >> 4) * 2654435761u;
+   uint32_t i = (uint32_t)(h % LIMINA_CB_SLOTS);
+   bool placed = false;
+   for (uint32_t probe = 0; probe < LIMINA_CB_SLOTS; ++probe) {
+      uint32_t s = (i + probe) % LIMINA_CB_SLOTS;
+      if (limina_cb_map[s].cb == NULL || limina_cb_map[s].cb == cb) {
+         limina_cb_map[s].cb = cb;
+         limina_cb_map[s].alloc = alloc;
+         placed = true;
+         break;
+      }
+   }
+   if (!placed)
+      limina_alloc_cb_overflow++;
+   pthread_mutex_unlock(&limina_alloc_stats_lock);
+}
+
+/* Look up and clear the mapping for `cb`. Caller holds the lock. */
+static void *
+limina_alloc_take_cb(void *cb)
+{
+   uintptr_t h = ((uintptr_t)cb >> 4) * 2654435761u;
+   uint32_t i = (uint32_t)(h % LIMINA_CB_SLOTS);
+   for (uint32_t probe = 0; probe < LIMINA_CB_SLOTS; ++probe) {
+      uint32_t s = (i + probe) % LIMINA_CB_SLOTS;
+      if (limina_cb_map[s].cb == NULL)
+         return NULL;
+      if (limina_cb_map[s].cb == cb) {
+         void *a = limina_cb_map[s].alloc;
+         /* Tombstone-free deletion is wrong under open addressing, so keep the key and null the
+          * allocator: the slot stays probeable and is reused by the next begin that hashes here.
+          * Command buffers are minted fresh per render pass, so slots do accumulate — the
+          * overflow counter is reported so a full map is never silent. */
+         limina_cb_map[s].alloc = NULL;
+         return a;
+      }
+   }
+   return NULL;
+}
+
+void *
+limina_kk_alloc_track_commit(void **cbs, uint32_t count)
+{
+   if (!limina_kk_alloc_stats_on() || count == 0)
+      return NULL;
+
+   struct limina_pending_batch *b =
+      calloc(1, sizeof(*b) + count * sizeof(void *));
+   if (!b)
+      return NULL;
+
+   pthread_mutex_lock(&limina_alloc_stats_lock);
+   limina_alloc_commits++;
+   for (uint32_t i = 0; i < count; ++i) {
+      void *alloc = limina_alloc_take_cb(cbs[i]);
+      /* Self-test: a negative violation result is only meaningful if the tracker actually
+       * charges the command buffers it sees. Count the misses so "no violations" can never be
+       * "the map was empty" in disguise. */
+      if (!alloc) {
+         limina_alloc_cb_missed++;
+         continue;
+      }
+      limina_alloc_cb_charged++;
+      int s = limina_alloc_slot(alloc, true);
+      if (s < 0)
+         continue;
+      limina_alloc_seen[s].pending++;
+      b->allocs[b->count++] = alloc;
+   }
+   pthread_mutex_unlock(&limina_alloc_stats_lock);
+
+   if (b->count == 0) {
+      free(b);
+      return NULL;
+   }
+   return b;
+}
+
+void
+limina_kk_alloc_track_complete(void *batch)
+{
+   struct limina_pending_batch *b = batch;
+   if (!b)
+      return;
+
+   pthread_mutex_lock(&limina_alloc_stats_lock);
+   if (b->fired) {
+      pthread_mutex_unlock(&limina_alloc_stats_lock);
+      return;
+   }
+   b->fired = 1;
+   for (uint32_t i = 0; i < b->count; ++i) {
+      int s = limina_alloc_slot(b->allocs[i], false);
+      if (s >= 0 && limina_alloc_seen[s].pending > 0)
+         limina_alloc_seen[s].pending--;
+   }
+   pthread_mutex_unlock(&limina_alloc_stats_lock);
+   free(b);
+}
+
 /* Record this allocator's current pool size, then periodically dump the population. */
 static void
 limina_alloc_stats_note(id<MTL4CommandAllocator> alloc, uint32_t every)
@@ -77,39 +252,54 @@ limina_alloc_stats_note(id<MTL4CommandAllocator> alloc, uint32_t every)
 
    pthread_mutex_lock(&limina_alloc_stats_lock);
 
-   /* Open addressing on the pointer; the live population is in the hundreds, so this stays
-    * far from full. If it ever does fill, stop inserting rather than spin. */
-   uintptr_t h = ((uintptr_t)alloc >> 4) * 2654435761u;
-   uint32_t i = (uint32_t)(h % LIMINA_ALLOC_SLOTS);
-   for (uint32_t probe = 0; probe < LIMINA_ALLOC_SLOTS; ++probe) {
-      uint32_t s = (i + probe) % LIMINA_ALLOC_SLOTS;
-      if (limina_alloc_seen[s].key == (void *)alloc) {
-         limina_alloc_seen[s].size = sz;
-         break;
-      }
-      if (limina_alloc_seen[s].key == NULL) {
-         limina_alloc_seen[s].key = (void *)alloc;
-         limina_alloc_seen[s].size = sz;
-         limina_alloc_distinct++;
-         break;
+   int slot = limina_alloc_slot((void *)alloc, true);
+   if (slot >= 0) {
+      limina_alloc_seen[slot].size = sz;
+      /* THE measurement: is this reset landing on in-flight work? */
+      if (limina_alloc_seen[slot].pending > 0) {
+         limina_alloc_seen[slot].violations++;
+         limina_alloc_violations++;
       }
    }
 
    if ((++limina_alloc_resets % every) == 0) {
       uint64_t sum = 0, max = 0;
+      uint32_t pend_now = 0, ever_violated = 0;
+      /* Size histogram: <1M, 1-8M, 8-32M, 32-128M, >=128M. Under mechanism (2) individual
+       * allocators step up monotonically at workload launches and never move otherwise, so the
+       * buckets should drift right in steps rather than spread smoothly. */
+      uint32_t hist[5] = {0};
       for (uint32_t s = 0; s < LIMINA_ALLOC_SLOTS; ++s) {
          if (limina_alloc_seen[s].key == NULL)
             continue;
-         sum += limina_alloc_seen[s].size;
-         if (limina_alloc_seen[s].size > max)
-            max = limina_alloc_seen[s].size;
+         uint64_t sz2 = limina_alloc_seen[s].size;
+         sum += sz2;
+         if (sz2 > max)
+            max = sz2;
+         if (limina_alloc_seen[s].pending > 0)
+            pend_now++;
+         if (limina_alloc_seen[s].violations)
+            ever_violated++;
+         hist[sz2 < (1u << 20)     ? 0
+              : sz2 < (8u << 20)   ? 1
+              : sz2 < (32u << 20)  ? 2
+              : sz2 < (128u << 20) ? 3
+                                   : 4]++;
       }
       uint32_t n = limina_alloc_distinct;
       fprintf(stderr,
               "[LIMINA-ALLOC-STATS] resets=%llu distinct=%u sum=%.1fMiB max=%.3fMiB "
-              "mean=%.3fMiB\n",
+              "mean=%.3fMiB | commits=%llu VIOLATIONS=%llu allocs_ever_violated=%u "
+              "pending_now=%u cb_overflow=%u charged=%llu missed=%llu | hist<1M=%u 1-8M=%u 8-32M=%u 32-128M=%u "
+              ">=128M=%u\n",
               (unsigned long long)limina_alloc_resets, n, sum / 1048576.0,
-              max / 1048576.0, n ? (sum / (double)n) / 1048576.0 : 0.0);
+              max / 1048576.0, n ? (sum / (double)n) / 1048576.0 : 0.0,
+              (unsigned long long)limina_alloc_commits,
+              (unsigned long long)limina_alloc_violations, ever_violated,
+              pend_now, limina_alloc_cb_overflow,
+              (unsigned long long)limina_alloc_cb_charged,
+              (unsigned long long)limina_alloc_cb_missed, hist[0], hist[1], hist[2],
+              hist[3], hist[4]);
    }
 
    pthread_mutex_unlock(&limina_alloc_stats_lock);
@@ -144,6 +334,8 @@ mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)command_buffer;
       id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
+      if (limina_kk_alloc_stats_on())
+         limina_alloc_track_begin(command_buffer, allocator);
       [cmd_buf beginCommandBufferWithAllocator:alloc];
    }
 }

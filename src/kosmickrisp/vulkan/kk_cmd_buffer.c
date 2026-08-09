@@ -194,6 +194,30 @@ kk_alloc_recycle_enabled(void)
    return cached;
 }
 
+/* LIMINA_KK_ALLOC_MAX_MIB=<n> — the fix the measurement actually points at.
+ *
+ * The ratchet is NOT a contract violation: pending-at-reset counting put KK's resets at 99.86%
+ * legal, with the violations anti-correlated with growth (spikes/vrend-region-leak/, "SETTLED:
+ * mechanism (2)"). It is Apple's documented high-water retention — `reset` "marks the command
+ * allocator's heaps for reuse" and never returns them — multiplied by burst reassignment, so
+ * each workload launch drives a *different subset* of the allocators to a new high-water.
+ *
+ * Recycling on every reset (LIMINA_KK_ALLOC_RECYCLE) does fix it, but it pays allocator churn on
+ * every vkBeginCommandBuffer to solve a problem that only a handful of allocators have: measured,
+ * ~34 of ~405 exceed 32 MiB while carrying most of the bytes. Recycling only past a size
+ * threshold bounds the total at population x threshold and leaves the common path untouched. */
+static uint64_t
+kk_alloc_max_bytes(void)
+{
+   static int64_t cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("LIMINA_KK_ALLOC_MAX_MIB");
+      long v = (e && *e) ? atol(e) : 0;
+      cached = v > 0 ? (int64_t)v * 1024 * 1024 : 0;
+   }
+   return (uint64_t)cached;
+}
+
 static void
 kk_reset_encoder_state(struct kk_encoder_state *es, mtl_device *handle)
 {
@@ -202,6 +226,14 @@ kk_reset_encoder_state(struct kk_encoder_state *es, mtl_device *handle)
       es->allocator = mtl_new_command_allocator(handle);
       return;
    }
+
+   uint64_t cap = kk_alloc_max_bytes();
+   if (cap && mtl_command_allocator_allocated_size(es->allocator) >= cap) {
+      mtl_release(es->allocator);
+      es->allocator = mtl_new_command_allocator(handle);
+      return;
+   }
+
    mtl_command_allocator_reset(es->allocator);
 }
 
