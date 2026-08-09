@@ -13,6 +13,10 @@
 
 void mtl_command_allocator_reset(mtl_command_allocator *allocator);
 
+/* Size of the allocator's internal encoding heaps, per Apple's -[MTL4CommandAllocator
+ * allocatedSize]. See the LIMINA_KK_ALLOC_STATS block in mtl_command_buffer.m. */
+uint64_t mtl_command_allocator_allocated_size(mtl_command_allocator *allocator);
+
 void mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
                               mtl_command_allocator *allocator);
 void mtl_end_command_buffer(mtl_command_buffer *command_buffer);

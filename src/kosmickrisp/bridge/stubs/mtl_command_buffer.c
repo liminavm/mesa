@@ -11,6 +11,12 @@ mtl_command_allocator_reset(mtl_command_allocator *allocator)
 {
 }
 
+uint64_t
+mtl_command_allocator_allocated_size(mtl_command_allocator *allocator)
+{
+   return 0u;
+}
+
 void
 mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
                          mtl_command_allocator *allocator)
