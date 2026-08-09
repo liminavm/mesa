@@ -46,6 +46,11 @@ uint64_t mtl_device_timestamp_frequency(mtl_device *dev);
 mtl_counter_heap *mtl_new_timestamp_counter_heap(mtl_device *dev,
                                                  uint32_t count);
 
+/* limina: dealloc census for the IOSurface import textures (see mtl_device.m). The census
+ * answers "did the texture actually die"; the retain count is a point-in-time lead. */
+void mtl_limina_texture_census(char *buf, unsigned long len);
+long mtl_limina_retain_count(void *obj);
+
 /* limina: texture whose storage IS an IOSurface (import path; see mtl_device.m) */
 bool mtl_handle_is_iosurface(void *handle);
 mtl_texture *mtl_new_texture_with_descriptor_iosurface(

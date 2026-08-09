@@ -6,6 +6,9 @@
 
 #include "mtl_texture.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 /* TODO_LUNARG Remove */
 #include "kk_image_layout.h"
 
@@ -109,7 +112,7 @@ mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *lay
                  v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
                  (unsigned long)tex.width, (unsigned long)tex.height,
                  (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
-      return v;
+      return (mtl_texture *)limina_mtl_note_new(v);
    }
 }
 
@@ -127,7 +130,7 @@ mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_
                  v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
                  (unsigned long)tex.width, (unsigned long)tex.height,
                  (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
-      return v;
+      return (mtl_texture *)limina_mtl_note_new(v);
    }
 }
 
@@ -147,7 +150,7 @@ mtl_new_texture_view_with_format(mtl_texture *texture, uint32_t pixel_format)
                  (void *)tex, (unsigned long)tex.width, (unsigned long)tex.height,
                  (unsigned long)tex.pixelFormat, (unsigned long)tex.usage,
                  (unsigned long)pixel_format);
-      return (mtl_texture *)v;
+      return (mtl_texture *)limina_mtl_note_new(v);
    }
 }
 
