@@ -25,6 +25,8 @@
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_pipeline_cache.h"
 
+#include "util/os_time.h"
+
 #include <time.h>
 
 /* limina: the shared command-allocator pool. Rationale and the measurements behind it are in
@@ -32,6 +34,27 @@
 
 #define KK_ALLOC_BUDGET_MIB_DEFAULT 4
 #define KK_ALLOC_POOL_WATERMARK 64
+/* Idle-decay before a drained allocator counts as surplus. Long enough that a burst which merely
+ * paused between frames keeps its working set; short enough that an app exit is reclaimed while
+ * the compositor is still drawing (reclaim is acquire-driven, so a fully idle guest holds its
+ * high-water until activity resumes — which is exactly when the memory is wanted again). */
+#define KK_ALLOC_DECAY_MS_DEFAULT 2000
+/* Never destroy below this many per class. NOT peak_live: peak_live only ever grows, so a floor
+ * there would pin the pool at its all-time high-water and reclaim nothing after a heavy app
+ * exits, which is the entire point. A small constant protects steady-state concurrency and lets
+ * the decay clock do the real work. */
+#define KK_ALLOC_FLOOR_DEFAULT 8
+
+static uint64_t
+kk_env_u64(const char *name, uint64_t dflt)
+{
+   const char *e = getenv(name);
+   if (!e || !*e)
+      return dflt;
+   char *end = NULL;
+   unsigned long long v = strtoull(e, &end, 10);
+   return (end != e && *end == '\0') ? (uint64_t)v : dflt;
+}
 
 void
 kk_alloc_pool_init(struct kk_device *dev)
@@ -44,9 +67,64 @@ kk_alloc_pool_init(struct kk_device *dev)
 
    /* The budget is the whole knob: an allocator leaves service once it holds this much, so the
     * steady state is roughly (pool size) x (budget). Overridable for the A/B ladder. */
-   const char *e = getenv("LIMINA_KK_ALLOC_BUDGET_MIB");
-   uint64_t mib = (e && *e) ? (uint64_t)atoll(e) : KK_ALLOC_BUDGET_MIB_DEFAULT;
-   pool->budget_bytes = mib * 1024u * 1024u;
+   pool->budget_bytes =
+      kk_env_u64("LIMINA_KK_ALLOC_BUDGET_MIB", KK_ALLOC_BUDGET_MIB_DEFAULT) * 1024u * 1024u;
+
+   pool->decay_ns =
+      kk_env_u64("LIMINA_KK_ALLOC_DECAY_MS", KK_ALLOC_DECAY_MS_DEFAULT) * 1000000ull;
+   pool->floor = (uint32_t)kk_env_u64("LIMINA_KK_ALLOC_FLOOR", KK_ALLOC_FLOOR_DEFAULT);
+   pool->destroy_enabled = kk_env_u64("LIMINA_KK_ALLOC_DESTROY", 1) != 0;
+}
+
+/* Pick at most one surplus allocator, unlink it, and hand its Metal handle back to be released
+ * OUTSIDE the pool mutex — the release does kernel unmap work of potentially multi-millisecond
+ * cost, and every encoder thread contends on this lock from cs_start_render.
+ *
+ * `keep` is the allocator this acquire is about to hand out; never consider it. Called only when
+ * the acquire already has a usable allocator, so a destroy can never be followed by a mint in the
+ * same call — that pairing is exactly the thrash the pool exists to avoid, and it would bite
+ * hardest at the concurrency edge (peak 184 command buffers in flight).
+ *
+ * Caller must hold pool->mtx. */
+static mtl_command_allocator *
+kk_alloc_pool_take_surplus(struct kk_alloc_pool *pool, enum kk_alloc_class klass,
+                           const struct kk_pooled_alloc *keep, uint64_t now)
+{
+   if (!pool->destroy_enabled || pool->live[klass] <= pool->floor)
+      return NULL;
+
+   struct kk_pooled_alloc *victim = NULL;
+   util_dynarray_foreach(&pool->allocs[klass], kk_pooled_alloc_ptr, pap) {
+      struct kk_pooled_alloc *pa = *pap;
+      if (pa == keep || pa->in_use || !pa->draining || pa->pending != 0)
+         continue;
+      if (pa->idle_since == 0)
+         continue;
+      if (now - pa->idle_since < pool->decay_ns)
+         continue;
+      victim = pa;
+      break;
+   }
+
+   if (!victim)
+      return NULL;
+
+   mtl_command_allocator *handle = victim->handle;
+   util_dynarray_delete_unordered(&pool->allocs[klass], kk_pooled_alloc_ptr, victim);
+   pool->live[klass]--;
+   pool->destroyed[klass]++;
+   free(victim);
+
+   /* Reclaim must not be invisible: growth already warns, so shrink gets the same treatment.
+    * Off by default — during a post-workload drain this fires once per acquire. */
+   static int log_reclaim = -1;
+   if (log_reclaim < 0)
+      log_reclaim = getenv("LIMINA_KK_ALLOC_POOL_LOG") != NULL;
+   if (log_reclaim)
+      fprintf(stderr, "[LIMINA-ALLOC-POOL] retired one class-%u allocator; live=%u destroyed=%u\n",
+              klass, pool->live[klass], pool->destroyed[klass]);
+
+   return handle;
 }
 
 void
@@ -54,7 +132,16 @@ kk_alloc_pool_finish(struct kk_device *dev)
 {
    struct kk_alloc_pool *pool = &dev->alloc_pool;
 
-   /* The one permitted destruction point: the device is going away, so every context is gone. */
+   if (pool->destroyed[0] || pool->destroyed[1]) {
+      fprintf(stderr,
+              "[LIMINA-ALLOC-POOL] teardown: render live=%u peak=%u retired=%u | "
+              "compute live=%u peak=%u retired=%u\n",
+              pool->live[KK_ALLOC_CLASS_RENDER], pool->peak_live[KK_ALLOC_CLASS_RENDER],
+              pool->destroyed[KK_ALLOC_CLASS_RENDER], pool->live[KK_ALLOC_CLASS_COMPUTE],
+              pool->peak_live[KK_ALLOC_CLASS_COMPUTE], pool->destroyed[KK_ALLOC_CLASS_COMPUTE]);
+   }
+
+   /* Device teardown frees whatever the reclaim policy did not: every context is gone. */
    for (unsigned i = 0; i < KK_ALLOC_CLASS_COUNT; ++i) {
       util_dynarray_foreach(&pool->allocs[i], kk_pooled_alloc_ptr, pap) {
          struct kk_pooled_alloc *pa = *pap;
@@ -71,26 +158,47 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
 {
    struct kk_alloc_pool *pool = &dev->alloc_pool;
    struct kk_pooled_alloc *found = NULL;
+   mtl_command_allocator *doomed = NULL;
+   const uint64_t now = os_time_get_nano();
 
    simple_mtx_lock(&pool->mtx);
 
+   /* Pass 1: an allocator that is ready as-is — not borrowed, not over budget. */
    util_dynarray_foreach(&pool->allocs[klass], kk_pooled_alloc_ptr, pap) {
       struct kk_pooled_alloc *pa = *pap;
-      if (pa->in_use)
-         continue;
-      if (pa->draining) {
-         /* Retired for size. It becomes usable again only once every command buffer begun on it
-          * has completed — that is Apple's stated precondition for reset, and the reason the
-          * charge happens at begin rather than at commit. Reset lazily here, on an app thread,
-          * rather than on the completion callback. */
-         if (pa->pending != 0)
+      if (!pa->in_use && !pa->draining) {
+         found = pa;
+         break;
+      }
+   }
+
+   if (!found) {
+      /* Pass 2: a retired one that has drained. It becomes usable again only once every command
+       * buffer begun on it has completed — Apple's stated precondition for reset, and the reason
+       * the charge happens at begin rather than at commit. Reset lazily here, on an app thread,
+       * rather than on the completion callback. */
+      util_dynarray_foreach(&pool->allocs[klass], kk_pooled_alloc_ptr, pap) {
+         struct kk_pooled_alloc *pa = *pap;
+         if (pa->in_use || pa->pending != 0)
             continue;
+         assert(pa->draining);
          mtl_command_allocator_reset(pa->handle);
          pa->draining = false;
+         pa->idle_since = 0;
+         found = pa;
+         break;
       }
-      found = pa;
-      break;
    }
+
+   /* Retire surplus only once this call is already served from the pool. Gating this on "pass 1
+    * succeeded" instead was wrong, and measured so: allocatedSize never shrinks, so a render
+    * allocator is permanently over budget once it crosses it. In steady state every render
+    * allocator is draining, pass 1 never succeeds, and destroy fired 66 times for compute and
+    * ZERO times for render — the one class that holds the memory. What actually matters is only
+    * that we never destroy in a call that then has to mint, and `found != NULL` here is exactly
+    * that condition. */
+   if (found)
+      doomed = kk_alloc_pool_take_surplus(pool, klass, found, now);
 
    if (!found) {
       /* Never block waiting for a drain: stalling cs_start_render on GPU progress invites jank
@@ -132,7 +240,15 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
    }
 
    found->in_use = true;
+   found->idle_since = 0;
    simple_mtx_unlock(&pool->mtx);
+
+   /* Outside the lock on purpose: releasing an allocator unmaps its heaps in the kernel, and
+    * cs_start_render must not serialise behind that. Measured to return 100% of the heaps
+    * (spikes/vrend-region-leak/mtl4-repro/destroy-probe.m). */
+   if (doomed)
+      mtl_release(doomed);
+
    return found;
 }
 
@@ -152,6 +268,9 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa)
     * never shrinks, so by the time a reset-time check fires the growth is already permanent. */
    if (pool->budget_bytes && size >= pool->budget_bytes)
       pa->draining = true;
+   /* Start the decay clock if it is already drained; otherwise the last discharge does it. */
+   if (pa->draining && pa->pending == 0)
+      pa->idle_since = os_time_get_nano();
    simple_mtx_unlock(&pool->mtx);
 }
 
@@ -174,6 +293,10 @@ kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa)
    assert(pa->pending > 0);
    if (pa->pending > 0)
       pa->pending--;
+   /* The GPU is done with everything begun here, so a retired allocator is now surplus-eligible
+    * and its decay clock starts. Not eligible while borrowed — release() stamps that case. */
+   if (pa->pending == 0 && pa->draining && !pa->in_use)
+      pa->idle_since = os_time_get_nano();
    simple_mtx_unlock(&dev->alloc_pool.mtx);
 }
 
