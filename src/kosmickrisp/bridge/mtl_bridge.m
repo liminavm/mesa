@@ -14,7 +14,9 @@
 
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <Metal/MTLCommandBuffer.h>
 #include <Metal/MTLCommandQueue.h>
@@ -47,30 +49,23 @@ mtl_drawable_get_texture(void *drawable_ptr)
  * So count every Metal object we mint, keyed by its Objective-C class, and report live counts
  * sorted by size of the leak. This names the class outright instead of eliminating them singly.
  *
- * SHAPE. Creation is spread over 36 `mtl_new_*` functions, so each notes its result here.
- * Destruction has exactly ONE chokepoint, `mtl_release` — but that is called for every release,
- * not only the last one, so decrementing there unconditionally would undercount live objects by
- * however many `mtl_retain`s are outstanding. We therefore decrement only on the release that
- * actually deallocates, detected by a retain count of 1 immediately before it. (This codebase
- * already reasons about retain counts in exactly this way — see mtl_limina_retain_count.)
+ * SHAPE. Creation is noted in each of the 36 `mtl_new_*` functions. Death is counted by a
+ * DEALLOC SENTINEL — an associated object, which the runtime releases when its host is
+ * deallocated — not by instrumenting a release call site.
  *
- * Objects created behind Metal's back — anything we never pass through an mtl_new_* — are
- * invisible here, and a class whose live count is honestly flat is genuinely exonerated.
+ * That distinction is the whole point, and the first version of this got it wrong. Counting
+ * releases (even "the release where the retain count was 1") only ever sees deaths WE cause.
+ * Metal objects routinely die in someone else's hands: an allocation in a residency set is
+ * retained by the set and released at `commit`, long after our `mtl_release` returned. A
+ * release-site counter reports those objects as immortal forever, which reads exactly like a
+ * leak. The retain-count version of this counter claimed MTLHeap `made == live` with zero
+ * deallocs — and the very next thing it did was send me after the residency set for a leak
+ * that number could not actually establish. The sentinel counts the death itself, whoever
+ * held the final reference, so `made - freed` is now a real live count.
  *
- * ⚠ READ `made == live` CAREFULLY — it is not automatically a leak. It means only that the
- * class never reached its dealloc THROUGH mtl_release. Some objects are released by other
- * means and will therefore always look immortal here:
- *
- *   MTLTextureDescriptorInternal   `[mtl_new_texture_descriptor(...) autorelease]`
- *                                  (mtl_heap.m, mtl_buffer.m) and a bare `[desc release]`
- *                                  in mtl_device.m — never mtl_release, so its 2 000+ "live"
- *                                  is an artefact of this counter, not a finding.
- *
- * The signal is a class that DOES go through mtl_release and still never deallocates. That is
- * exactly how the leak was pinned: MTLHeap is released at kk_bo.c (`mtl_release(bo->mtl_handle)`
- * in kk_destroy_bo), yet AGXG13XFamilyHeap reported made == live == 1 191 with zero deallocs
- * while kk_destroy_bo had run 239 times. Something outside KK still holds every heap; the
- * residency set (`[set addAllocation:]` retains) is the first place to look.
+ * Objects we never pass through an `mtl_new_*` are invisible here; a class whose live count is
+ * flat is genuinely exonerated. The self-test proves the mechanism fires before any zero is
+ * believed — an instrument that never fires reads identically to "nothing leaked".
  */
 #define LIMINA_MTL_CENSUS_SLOTS 128
 static pthread_mutex_t limina_mtl_census_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -94,29 +89,95 @@ limina_mtl_census_slot_locked(Class cls)
    return -1; /* table full: later classes go uncounted rather than mis-attributed */
 }
 
+
+/* Counting the release CALL proves nothing about the object dying — the last ref is often
+ * dropped by someone else entirely (the residency set drops its ref at commit, not at our
+ * mtl_release), and such a death is invisible to a release-site counter. So count the death
+ * itself: an associated object is deallocated with its host, so a sentinel turns "did this
+ * object actually die" into a number, whoever held the final reference. Same mechanism as the
+ * import-texture sentinel in mtl_device.m. */
+@interface LiminaMtlClassSentinel : NSObject
+@property(nonatomic) int slot;
+@property(nonatomic) bool selftest;
+@end
+
+static _Atomic unsigned long long g_limina_mtl_selftest_dealloc;
+
+@implementation LiminaMtlClassSentinel
+- (void)dealloc
+{
+   if (self.selftest) {
+      atomic_fetch_add(&g_limina_mtl_selftest_dealloc, 1ull);
+   } else {
+      pthread_mutex_lock(&limina_mtl_census_lock);
+      limina_mtl_census[self.slot].freed++;
+      pthread_mutex_unlock(&limina_mtl_census_lock);
+   }
+   [super dealloc];
+}
+@end
+
+static const char g_limina_mtl_sentinel_key; /* address only */
+
+static void
+limina_mtl_sentinel_attach(id obj, int slot, bool selftest)
+{
+   LiminaMtlClassSentinel *s = [[LiminaMtlClassSentinel alloc] init];
+   s.slot = slot;
+   s.selftest = selftest;
+   objc_setAssociatedObject(obj, &g_limina_mtl_sentinel_key, s,
+                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   [s release]; /* the association holds the only ref; it dies with obj */
+}
+
+/* An instrument that never fires reads exactly like "nothing leaked", so prove the mechanism
+ * on an object whose death we control before trusting a zero. */
+static void
+limina_mtl_sentinel_selftest(void)
+{
+   unsigned long long before = atomic_load(&g_limina_mtl_selftest_dealloc);
+   @autoreleasepool {
+      NSObject *victim = [[NSObject alloc] init];
+      limina_mtl_sentinel_attach(victim, -1, true);
+      [victim release];
+   }
+   fprintf(stderr, "[LIMINA-KK-MTLCLASS] dealloc sentinel self-test: %s\n",
+           atomic_load(&g_limina_mtl_selftest_dealloc) > before ? "OK"
+                                                               : "BROKEN (counts are lies)");
+}
+
+/* Cached: the census costs an associated object per Metal object, so it stays off unless asked. */
+static int
+limina_mtl_census_enabled(void)
+{
+   static _Atomic int cached = -1;
+   int v = atomic_load(&cached);
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_BOCENSUS");
+      v = (e && *e && strtol(e, NULL, 10) > 0) ? 1 : 0;
+      atomic_store(&cached, v);
+      if (v) {
+         static pthread_once_t once = PTHREAD_ONCE_INIT;
+         pthread_once(&once, limina_mtl_sentinel_selftest);
+      }
+   }
+   return v;
+}
+
 void *
 limina_mtl_note_new(void *handle)
 {
-   if (handle == NULL)
-      return NULL;
+   if (handle == NULL || !limina_mtl_census_enabled())
+      return handle;
    Class cls = object_getClass((id)handle);
    pthread_mutex_lock(&limina_mtl_census_lock);
    int i = limina_mtl_census_slot_locked(cls);
    if (i >= 0)
       limina_mtl_census[i].made++;
    pthread_mutex_unlock(&limina_mtl_census_lock);
-   return handle;
-}
-
-static void
-limina_mtl_note_dealloc(void *handle)
-{
-   Class cls = object_getClass((id)handle);
-   pthread_mutex_lock(&limina_mtl_census_lock);
-   int i = limina_mtl_census_slot_locked(cls);
    if (i >= 0)
-      limina_mtl_census[i].freed++;
-   pthread_mutex_unlock(&limina_mtl_census_lock);
+      limina_mtl_sentinel_attach((id)handle, i, false);
+   return handle;
 }
 
 void
@@ -170,9 +231,6 @@ mtl_release(void *handle)
 {
    @autoreleasepool {
       NSObject *obj = (NSObject *)handle;
-      /* limina: only the release that actually deallocates reduces the live count. */
-      if (handle != NULL && [obj retainCount] == 1)
-         limina_mtl_note_dealloc(handle);
       [obj release];
    }
 }
