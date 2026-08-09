@@ -169,9 +169,39 @@ alloc_fail:
    return result;
 }
 
-static void
-kk_reset_encoder_state(struct kk_encoder_state *es)
+/* limina LIMINA_KK_ALLOC_RECYCLE=1 — probe for the IOAccelerator region ratchet
+ * (spikes/vrend-region-leak/). Each Metal encoder-begin allocates a pooled IOGPU resource
+ * (ContextCommon::newCommand -> IOGPUMetalResourcePoolCreatePooledResource -> IOGPUResourceCreate);
+ * measured, ~one leaks per encoder-begin, 1:1 with the AGXResource kernel count, and `reset`
+ * demonstrably does not give them back even though it runs on every vkBeginCommandBuffer.
+ *
+ * This replaces the reset with a destroy+recreate of the allocator. It is the causation test and
+ * the candidate fix at once: if the parked resources die with their allocator, the ratchet turns
+ * into a plateau at working-set. A NULL result is equally informative — it means the resources
+ * are parked on a device-level pool rather than on the allocator, and no allocator-lifetime fix
+ * can work.
+ *
+ * Kept behind an env gate rather than made unconditional: allocator churn runs at batch-recycle
+ * rate (hundreds/s) and its cost has not been measured yet. */
+static int
+kk_alloc_recycle_enabled(void)
 {
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("LIMINA_KK_ALLOC_RECYCLE");
+      cached = (e && *e && strcmp(e, "0")) ? 1 : 0;
+   }
+   return cached;
+}
+
+static void
+kk_reset_encoder_state(struct kk_encoder_state *es, mtl_device *handle)
+{
+   if (kk_alloc_recycle_enabled()) {
+      mtl_release(es->allocator);
+      es->allocator = mtl_new_command_allocator(handle);
+      return;
+   }
    mtl_command_allocator_reset(es->allocator);
 }
 
@@ -186,9 +216,9 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
    cs_end(cmd);
    kk_cmd_release_resources(dev, cmd);
 
-   kk_reset_encoder_state(cmd->pre_gfx);
-   kk_reset_encoder_state(&cmd->gfx);
-   kk_reset_encoder_state(cmd->post_gfx);
+   kk_reset_encoder_state(cmd->pre_gfx, dev->mtl_handle);
+   kk_reset_encoder_state(&cmd->gfx, dev->mtl_handle);
+   kk_reset_encoder_state(cmd->post_gfx, dev->mtl_handle);
 
    cmd->uploader.bo = NULL;
    cmd->uploader.offset = 0;
