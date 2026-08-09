@@ -266,6 +266,10 @@ struct kk_ts_resolve {
 struct kk_encoder_state {
    /* either a mtl_compute_encoder or a mtl_render_encoder */
    mtl_command_encoder *encoder;
+   /* limina: BORROWED from the device allocator pool for the lifetime of one Metal command
+    * buffer, not owned. NULL whenever no encoder is open. `allocator` is just pa->handle,
+    * cached to keep the encode path free of an indirection. */
+   struct kk_pooled_alloc *pa;
    mtl_command_allocator *allocator;
    mtl_command_buffer *cmd_buf;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
@@ -274,6 +278,12 @@ struct kk_encoder_state {
 
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;
+
+   /* limina: allocator charges taken at mtl_begin_command_buffer, one per entry in
+    * submit_cmd_bufs and in the same order. Discharged on GPU completion for submitted command
+    * buffers, or at release for ones that are never submitted -- otherwise a recorded-but-
+    * discarded command buffer would strand its allocator in DRAINING for ever. */
+   struct util_dynarray charged_allocs; /* struct kk_pooled_alloc * */
 
    struct kk_encoder_state gfx;
    /* pre and post gfx encoder states swap after every gfx encoder is committed */

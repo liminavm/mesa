@@ -28,6 +28,24 @@ commit_callback(struct mtl_feedback_data *data)
    }
 }
 
+/* limina: GPU completion for one submitted batch — discharge the allocator borrows it charged,
+ * which is what lets an over-budget allocator leave DRAINING and be reset. Metal snapshots the
+ * feedback-handler list per commit (measured, mtl4-repro T4), so this fires exactly once. */
+struct kk_submit_discharge {
+   struct kk_device *dev;
+   uint32_t count;
+   struct kk_pooled_alloc *allocs[];
+};
+
+static void
+discharge_callback(struct mtl_feedback_data *data)
+{
+   struct kk_submit_discharge *d = (struct kk_submit_discharge *)data->user_data;
+   for (uint32_t i = 0; i < d->count; ++i)
+      kk_alloc_pool_discharge(d->dev, d->allocs[i]);
+   free(d);
+}
+
 static void
 rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
 {
@@ -90,6 +108,28 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       if (count > 0u) {
          mtl_commit_options_add_feedback_handler(queue->commit_options,
                                                  commit_callback, dev);
+
+         /* limina: hand this batch's allocator charges to the completion callback and clear
+          * them from the command buffer, so kk_cmd_release_resources does not discharge them a
+          * second time. Anything left in charged_allocs after this belongs to a command buffer
+          * that was recorded but never submitted. */
+         uint32_t ncharged = util_dynarray_num_elements(
+            &cmd_buffer->charged_allocs, kk_pooled_alloc_ptr);
+         if (ncharged) {
+            struct kk_submit_discharge *d = malloc(
+               sizeof(*d) + ncharged * sizeof(kk_pooled_alloc_ptr));
+            if (d) {
+               d->dev = dev;
+               d->count = ncharged;
+               memcpy(d->allocs,
+                      util_dynarray_begin(&cmd_buffer->charged_allocs),
+                      ncharged * sizeof(kk_pooled_alloc_ptr));
+               util_dynarray_clear(&cmd_buffer->charged_allocs);
+               mtl_commit_options_add_feedback_handler(queue->commit_options,
+                                                       discharge_callback, d);
+            }
+         }
+
          mtl_command_queue_commit(queue->mtl_handle, cmds, count,
                                   queue->commit_options);
       }

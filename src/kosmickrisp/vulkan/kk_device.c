@@ -27,6 +27,156 @@
 
 #include <time.h>
 
+/* limina: the shared command-allocator pool. Rationale and the measurements behind it are in
+ * the block comment on struct kk_alloc_pool (kk_device.h) and spikes/vrend-region-leak/. */
+
+#define KK_ALLOC_BUDGET_MIB_DEFAULT 4
+#define KK_ALLOC_POOL_WATERMARK 64
+
+void
+kk_alloc_pool_init(struct kk_device *dev)
+{
+   struct kk_alloc_pool *pool = &dev->alloc_pool;
+
+   simple_mtx_init(&pool->mtx, mtx_plain);
+   for (unsigned i = 0; i < KK_ALLOC_CLASS_COUNT; ++i)
+      util_dynarray_init(&pool->allocs[i], NULL);
+
+   /* The budget is the whole knob: an allocator leaves service once it holds this much, so the
+    * steady state is roughly (pool size) x (budget). Overridable for the A/B ladder. */
+   const char *e = getenv("LIMINA_KK_ALLOC_BUDGET_MIB");
+   uint64_t mib = (e && *e) ? (uint64_t)atoll(e) : KK_ALLOC_BUDGET_MIB_DEFAULT;
+   pool->budget_bytes = mib * 1024u * 1024u;
+}
+
+void
+kk_alloc_pool_finish(struct kk_device *dev)
+{
+   struct kk_alloc_pool *pool = &dev->alloc_pool;
+
+   /* The one permitted destruction point: the device is going away, so every context is gone. */
+   for (unsigned i = 0; i < KK_ALLOC_CLASS_COUNT; ++i) {
+      util_dynarray_foreach(&pool->allocs[i], kk_pooled_alloc_ptr, pap) {
+         struct kk_pooled_alloc *pa = *pap;
+         mtl_release(pa->handle);
+         free(pa);
+      }
+      util_dynarray_fini(&pool->allocs[i]);
+   }
+   simple_mtx_destroy(&pool->mtx);
+}
+
+struct kk_pooled_alloc *
+kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
+{
+   struct kk_alloc_pool *pool = &dev->alloc_pool;
+   struct kk_pooled_alloc *found = NULL;
+
+   simple_mtx_lock(&pool->mtx);
+
+   util_dynarray_foreach(&pool->allocs[klass], kk_pooled_alloc_ptr, pap) {
+      struct kk_pooled_alloc *pa = *pap;
+      if (pa->in_use)
+         continue;
+      if (pa->draining) {
+         /* Retired for size. It becomes usable again only once every command buffer begun on it
+          * has completed — that is Apple's stated precondition for reset, and the reason the
+          * charge happens at begin rather than at commit. Reset lazily here, on an app thread,
+          * rather than on the completion callback. */
+         if (pa->pending != 0)
+            continue;
+         mtl_command_allocator_reset(pa->handle);
+         pa->draining = false;
+      }
+      found = pa;
+      break;
+   }
+
+   if (!found) {
+      /* Never block waiting for a drain: stalling cs_start_render on GPU progress invites jank
+       * and priority inversion, and the in-flight depth that drives this is already bounded by
+       * the client's own fencing. Mint instead, and make growth loud. */
+      found = calloc(1, sizeof(*found));
+      if (!found) {
+         simple_mtx_unlock(&pool->mtx);
+         return NULL;
+      }
+      found->handle = mtl_new_command_allocator(dev->mtl_handle);
+      if (!found->handle) {
+         free(found);
+         simple_mtx_unlock(&pool->mtx);
+         return NULL;
+      }
+      found->klass = klass;
+      kk_pooled_alloc_ptr *slot =
+         util_dynarray_grow(&pool->allocs[klass], kk_pooled_alloc_ptr, 1);
+      if (!slot) {
+         mtl_release(found->handle);
+         free(found);
+         simple_mtx_unlock(&pool->mtx);
+         return NULL;
+      }
+      *slot = found;
+      pool->live[klass]++;
+      if (pool->live[klass] > pool->peak_live[klass])
+         pool->peak_live[klass] = pool->live[klass];
+      if (pool->live[klass] > KK_ALLOC_POOL_WATERMARK &&
+          pool->live[klass] > pool->watermark_warned) {
+         pool->watermark_warned = pool->live[klass];
+         fprintf(stderr,
+                 "[LIMINA-ALLOC-POOL] class %u grew to %u allocators (budget %llu MiB) — "
+                 "in-flight depth is outrunning completion\n",
+                 klass, pool->live[klass],
+                 (unsigned long long)(pool->budget_bytes >> 20));
+      }
+   }
+
+   found->in_use = true;
+   simple_mtx_unlock(&pool->mtx);
+   return found;
+}
+
+void
+kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa)
+{
+   struct kk_alloc_pool *pool = &dev->alloc_pool;
+   if (!pa)
+      return;
+
+   /* Read the size OUTSIDE the lock: this is a Metal call on the encode hot path. */
+   uint64_t size = mtl_command_allocator_allocated_size(pa->handle);
+
+   simple_mtx_lock(&pool->mtx);
+   pa->in_use = false;
+   /* Retire on budget. Note this is checked at encoder end, not at reset time: allocatedSize
+    * never shrinks, so by the time a reset-time check fires the growth is already permanent. */
+   if (pool->budget_bytes && size >= pool->budget_bytes)
+      pa->draining = true;
+   simple_mtx_unlock(&pool->mtx);
+}
+
+void
+kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa)
+{
+   if (!pa)
+      return;
+   simple_mtx_lock(&dev->alloc_pool.mtx);
+   pa->pending++;
+   simple_mtx_unlock(&dev->alloc_pool.mtx);
+}
+
+void
+kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa)
+{
+   if (!pa)
+      return;
+   simple_mtx_lock(&dev->alloc_pool.mtx);
+   assert(pa->pending > 0);
+   if (pa->pending > 0)
+      pa->pending--;
+   simple_mtx_unlock(&dev->alloc_pool.mtx);
+}
+
 struct kk_mtl_compiler {
    mtl_compiler *handle;
    uint32_t refcount;
@@ -331,6 +481,9 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->mtl_compiler_handle == NULL)
       goto fail_init;
 
+   /* limina: the allocator pool must exist before any command buffer can encode. */
+   kk_alloc_pool_init(dev);
+
    /* We need to initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
@@ -417,6 +570,10 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
    }
+
+   /* limina: every context is gone by here, which is the only point at which command
+    * allocators are destroyed. Must follow kk_queue_finish so nothing is still in flight. */
+   kk_alloc_pool_finish(dev);
 
    /* Release the residency set last once all BOs are released. */
    mtl_release(dev->residency_set.handle);
