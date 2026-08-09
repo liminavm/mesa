@@ -50,6 +50,14 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    }
    util_dynarray_clear(&cmd->submit_cmd_bufs);
 
+   /* limina: any charge still outstanding belongs to a command buffer that was recorded but
+    * never submitted (or whose submission already discharged and cleared this array). Discharge
+    * it here so the allocator can leave DRAINING. */
+   util_dynarray_foreach(&cmd->charged_allocs, kk_pooled_alloc_ptr, pap) {
+      kk_alloc_pool_discharge(dev, *pap);
+   }
+   util_dynarray_clear(&cmd->charged_allocs);
+
    /* Release all BOs used as descriptor buffers for submissions */
    util_dynarray_foreach(&cmd->large_bos, struct kk_bo *, bo) {
       kk_destroy_bo(dev, *bo);
@@ -62,9 +70,8 @@ kk_destroy_encoder_state(struct kk_encoder_state *es)
 {
    assert(es->encoder == NULL);
    assert(es->cmd_buf == NULL);
-
-   mtl_release(es->allocator);
-   es->allocator = NULL;
+   /* limina: the allocator is a pool borrow, returned at kk_stop_encoder. Nothing to release. */
+   assert(es->pa == NULL);
 
    util_dynarray_fini(&es->ts_resolves);
 }
@@ -86,6 +93,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    kk_cmd_release_resources(dev, cmd);
    util_dynarray_fini(&cmd->submit_cmd_bufs);
+   util_dynarray_fini(&cmd->charged_allocs);
    util_dynarray_fini(&cmd->large_bos);
 
    vk_free(&pool->vk.alloc, cmd);
@@ -94,9 +102,11 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 static bool
 kk_init_encoder_state(struct kk_encoder_state *es, mtl_device *handle)
 {
-   es->allocator = mtl_new_command_allocator(handle);
+   /* limina: allocators now come from the device pool at encoder start. */
+   es->pa = NULL;
+   es->allocator = NULL;
    es->ts_resolves = UTIL_DYNARRAY_INIT;
-   return es->allocator != NULL;
+   return true;
 }
 
 static VkResult
@@ -145,6 +155,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->submit_cmd_bufs = UTIL_DYNARRAY_INIT;
+   cmd->charged_allocs = UTIL_DYNARRAY_INIT;
    cmd->large_bos = UTIL_DYNARRAY_INIT;
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
@@ -169,10 +180,43 @@ alloc_fail:
    return result;
 }
 
-static void
-kk_reset_encoder_state(struct kk_encoder_state *es)
+/* limina: acquire a pooled allocator and begin `cb` on it, charging the borrow.
+ *
+ * The charge is taken HERE, at begin, not at commit. An allocator is returned to the pool at
+ * kk_stop_encoder while its command buffers still sit uncommitted in submit_cmd_bufs; charging
+ * at commit would leave a window in which pending == 0 yet the encoding memory must still
+ * survive, and a reset landing there would discard commands the GPU has not been handed.
+ */
+static bool
+kk_encoder_begin(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
+                 enum kk_alloc_class klass)
 {
-   mtl_command_allocator_reset(es->allocator);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   es->pa = kk_alloc_pool_acquire(dev, klass);
+   if (es->pa == NULL)
+      return false;
+   es->allocator = es->pa->handle;
+
+   /* Grow the tracking slot BEFORE charging. The other order loses the charge entirely when the
+    * grow fails: nothing would ever discharge it, the allocator would wedge in draining forever,
+    * and under the destroy policy that silently erodes the pool below its floor. Failing here
+    * instead costs only this encoder. The slot is NULLed first so a concurrent walk of the array
+    * can never see an uninitialised entry (kk_alloc_pool_discharge tolerates NULL). */
+   kk_pooled_alloc_ptr *slot =
+      util_dynarray_grow(&cmd->charged_allocs, kk_pooled_alloc_ptr, 1);
+   if (slot == NULL) {
+      kk_alloc_pool_release(dev, es->pa);
+      es->pa = NULL;
+      es->allocator = NULL;
+      return false;
+   }
+   *slot = NULL;
+
+   mtl_begin_command_buffer(es->cmd_buf, es->allocator);
+   kk_alloc_pool_charge(dev, es->pa);
+   *slot = es->pa;
+   return true;
 }
 
 void
@@ -186,9 +230,10 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
    cs_end(cmd);
    kk_cmd_release_resources(dev, cmd);
 
-   kk_reset_encoder_state(cmd->pre_gfx);
-   kk_reset_encoder_state(&cmd->gfx);
-   kk_reset_encoder_state(cmd->post_gfx);
+   /* limina: no allocator resets here any more. Allocators are pool borrows returned at
+    * kk_stop_encoder, and the pool resets them when they have drained. Resetting per
+    * vkBeginCommandBuffer was the root of the ratchet: an epoch's every render pass piled onto
+    * one allocator, so the high-water was set by the heaviest epoch and then kept for ever. */
 
    cmd->uploader.bo = NULL;
    cmd->uploader.offset = 0;
@@ -263,7 +308,12 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    assert(state->render_pass_descriptor);
 
    cmd->gfx.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
-   mtl_begin_command_buffer(cmd->gfx.cmd_buf, cmd->gfx.allocator);
+   if (!kk_encoder_begin(cmd, &cmd->gfx, KK_ALLOC_CLASS_RENDER)) {
+      mtl_release(cmd->gfx.cmd_buf);
+      cmd->gfx.cmd_buf = NULL;
+      vk_device_set_lost(&dev->vk, "out of command allocators");
+      return;
+   }
    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
       cmd->gfx.cmd_buf, state->render_pass_descriptor);
 
@@ -308,11 +358,16 @@ cs_get_render(struct kk_cmd_buffer *cmd)
 }
 
 static void
-kk_start_compute_encoder(struct kk_encoder_state *es, mtl_device *handle,
+kk_start_compute_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
+                         mtl_device *handle,
                          mtl_argument_table *argument_table)
 {
    es->cmd_buf = mtl_new_command_buffer(handle);
-   mtl_begin_command_buffer(es->cmd_buf, es->allocator);
+   if (!kk_encoder_begin(cmd, es, KK_ALLOC_CLASS_COMPUTE)) {
+      mtl_release(es->cmd_buf);
+      es->cmd_buf = NULL;
+      return;
+   }
    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
 
    /* Argument table won't ever change */
@@ -327,13 +382,13 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
    /* If we are not inside a render, we can just take pre_gfx. */
    if (!cmd->gfx.encoder || pre_gfx) {
       if (!cmd->pre_gfx->encoder) {
-         kk_start_compute_encoder(cmd->pre_gfx, dev->mtl_handle,
+         kk_start_compute_encoder(cmd, cmd->pre_gfx, dev->mtl_handle,
                                   cmd->argument_table);
       }
       encoder = cmd->pre_gfx->encoder;
    } else {
       if (!cmd->post_gfx->encoder) {
-         kk_start_compute_encoder(cmd->post_gfx, dev->mtl_handle,
+         kk_start_compute_encoder(cmd, cmd->post_gfx, dev->mtl_handle,
                                   cmd->argument_table);
       }
       encoder = cmd->post_gfx->encoder;
@@ -360,6 +415,13 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
    util_dynarray_clear(&es->ts_resolves);
 
    mtl_end_command_buffer(es->cmd_buf);
+
+   /* limina: reuse is legal the moment the command buffer ends (Apple: "You can safely reuse
+    * command allocators after ending the command buffer"); only *reset* needs GPU completion,
+    * which the pool gates on the charge taken at begin. So the borrow goes back now. */
+   kk_alloc_pool_release(kk_cmd_buffer_device(cmd), es->pa);
+   es->pa = NULL;
+   es->allocator = NULL;
 
    util_dynarray_append(&cmd->submit_cmd_bufs, es->cmd_buf);
    es->cmd_buf = NULL;
