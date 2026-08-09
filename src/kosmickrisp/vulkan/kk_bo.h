@@ -48,4 +48,13 @@ VkResult kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr);
 VkResult kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr,
                      bool reserved);
 
+/* limina: allocation census (LIMINA_KK_BOCENSUS=<secs>). BOs are counted inside kk_bo.c;
+ * textures have to be counted where images acquire and release them. Increment on every site
+ * that makes a plane hold an MTLTexture — freshly created OR adopted via mtl_retain — and
+ * decrement on release, so the pair stays balanced regardless of which path produced it. */
+#include <stdatomic.h>
+extern atomic_ullong kk_tex_census_acquire, kk_tex_census_release;
+#define KK_TEX_CENSUS_ACQUIRE() atomic_fetch_add(&kk_tex_census_acquire, 1ull)
+#define KK_TEX_CENSUS_RELEASE() atomic_fetch_add(&kk_tex_census_release, 1ull)
+
 #endif /* KK_BO_H */
