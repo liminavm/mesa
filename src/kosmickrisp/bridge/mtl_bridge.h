@@ -41,4 +41,11 @@ mtl_texture *mtl_drawable_get_texture(void *drawable_ptr);
 void *mtl_retain(void *handle);
 void mtl_release(void *handle);
 
+/* limina: per-class live-object census (LIMINA_KK_BOCENSUS=<secs> prints it). Every
+ * mtl_new_* passes its result through this — it returns the handle unchanged, so it wraps
+ * a return expression in place. NULL-tolerant, so failure paths need no special casing.
+ * The matching decrement lives in mtl_release, on the dealloc transition only. */
+void *limina_mtl_note_new(void *handle);
+void limina_mtl_class_census_dump(void);
+
 #endif /* KK_BRIDGE_H */

@@ -6,6 +6,9 @@
 
 #include "mtl_device.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 /* TODO_KOSMICKRISP Remove */
 #include "kk_image_layout.h"
 #include "kk_private.h"
@@ -224,10 +227,10 @@ mtl_new_timestamp_counter_heap(mtl_device *dev, uint32_t count)
       if (heap == nil) {
          fprintf(stderr, "Failed to create timestamp counter heap: %s\n",
                  error ? error.localizedDescription.UTF8String : "unknown");
-         return NULL;
+         return (mtl_counter_heap *)limina_mtl_note_new(NULL);
       }
 
-      return (mtl_counter_heap *)heap;
+      return (mtl_counter_heap *)limina_mtl_note_new((mtl_counter_heap *)heap);
    }
 }
 
@@ -263,7 +266,7 @@ mtl_new_texture_descriptor(const struct kk_image_layout *layout)
       descriptor.usage = (MTLTextureUsage)layout->usage;
       /* We don't set the swizzle because Metal complains when the usage has store or render target with swizzle... */
       
-      return descriptor;
+      return (MTLTextureDescriptor *)limina_mtl_note_new(descriptor);
    }
 }
 
@@ -383,7 +386,7 @@ mtl_new_texture_with_descriptor_iosurface(mtl_device *device,
                  "plain 2D (type=%u levels=%u layers=%u samples=%u)\n",
                  layout->type, layout->levels, layout->layers,
                  layout->sample_count_sa);
-         return NULL;
+         return (mtl_texture *)limina_mtl_note_new(NULL);
       }
       id<MTLTexture> tex = [dev newTextureWithDescriptor:descriptor
                                               iosurface:(IOSurfaceRef)iosurface
@@ -393,7 +396,7 @@ mtl_new_texture_with_descriptor_iosurface(mtl_device *device,
          limina_kk_sentinel_attach(tex, false);
          atomic_fetch_add(&g_limina_kk_tex_create, 1);
       }
-      return tex;
+      return (mtl_texture *)limina_mtl_note_new(tex);
    }
 }
 
@@ -471,7 +474,7 @@ mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newBufferWithBytesNoCopy:ptr length:size_B options:KK_MTL_RESOURCE_OPTIONS deallocator:nil];
+      return (mtl_buffer *)limina_mtl_note_new([dev newBufferWithBytesNoCopy:ptr length:size_B options:KK_MTL_RESOURCE_OPTIONS deallocator:nil]);
    }
 }
 
@@ -480,7 +483,7 @@ mtl_new_command_allocator(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newCommandAllocator];
+      return (mtl_command_allocator *)limina_mtl_note_new([dev newCommandAllocator]);
    }
 }
 
@@ -489,6 +492,6 @@ mtl_new_command_buffer(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newCommandBuffer];
+      return (mtl_command_buffer *)limina_mtl_note_new([dev newCommandBuffer]);
    }
 }

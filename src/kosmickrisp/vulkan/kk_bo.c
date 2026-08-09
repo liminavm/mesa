@@ -92,6 +92,10 @@ kk_bo_census_tick(void)
            "MTLBuffer; each texture is its own allocation too\n",
            a, f, (long long)(a - f), (double)live / (1024.0 * 1024.0),
            (double)peak / (1024.0 * 1024.0), ta, tr, (long long)(ta - tr));
+
+   /* The per-class histogram is the one that names a leak outright, so it rides the same
+    * timer rather than needing its own knob. */
+   limina_mtl_class_census_dump();
 }
 
 static void

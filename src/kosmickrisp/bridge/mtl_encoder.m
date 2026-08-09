@@ -6,6 +6,9 @@
 
 #include "mtl_encoder.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTL4CommandBuffer.h>
 #include <Metal/MTL4ComputeCommandEncoder.h>
 #include <Metal/MTL4Counters.h>
@@ -141,7 +144,7 @@ mtl_new_compute_command_encoder(mtl_command_buffer *cmd_buffer)
 {
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)cmd_buffer;
-      return [[cmd_buf computeCommandEncoder] retain];
+      return (mtl_compute_encoder *)limina_mtl_note_new([[cmd_buf computeCommandEncoder] retain]);
    }
 }
 
@@ -293,7 +296,7 @@ mtl_new_render_command_encoder_with_descriptor(
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
       MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
-      return [[cmd renderCommandEncoderWithDescriptor:desc] retain];
+      return (mtl_render_encoder *)limina_mtl_note_new([[cmd renderCommandEncoderWithDescriptor:desc] retain]);
    }
 }
 

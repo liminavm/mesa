@@ -6,6 +6,9 @@
 
 #include "mtl_buffer.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 /* TODO_KOSMICKRISP Remove */
 #include "kk_image_layout.h"
 
@@ -68,7 +71,7 @@ mtl_new_texture_descriptor(const struct kk_image_layout *layout)
       descriptor.usage = (MTLTextureUsage)layout->usage;
       /* We don't set the swizzle because Metal complains when the usage has store or render target with swizzle... */
       
-      return descriptor;
+      return (MTLTextureDescriptor *)limina_mtl_note_new(descriptor);
    }
 }
 
@@ -96,7 +99,7 @@ mtl_new_texture_with_descriptor_linear(mtl_buffer *buffer,
                  layout->linear_stride_B, (unsigned long long)offset);
       id<MTLTexture> texture = [buf newTextureWithDescriptor:descriptor offset:offset bytesPerRow:layout->linear_stride_B];
 
-      return texture;
+      return (mtl_texture *)limina_mtl_note_new(texture);
    }
 }
 

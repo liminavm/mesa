@@ -6,6 +6,9 @@
 
 #include "mtl_command_queue.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
 
@@ -14,7 +17,7 @@ mtl_commit_options *
 mtl_new_commit_options(void)
 {
    @autoreleasepool {
-      return [[MTL4CommitOptions new] init];
+      return (mtl_commit_options *)limina_mtl_note_new([[MTL4CommitOptions new] init]);
    }
 }
 
@@ -50,7 +53,7 @@ mtl_new_command_queue(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newMTL4CommandQueue];
+      return (mtl_command_queue *)limina_mtl_note_new([dev newMTL4CommandQueue]);
    }
 }
 
