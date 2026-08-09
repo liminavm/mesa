@@ -6,6 +6,9 @@
 
 #include "mtl_command_queue.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
 
@@ -14,7 +17,7 @@ mtl_commit_options *
 mtl_new_commit_options(void)
 {
    @autoreleasepool {
-      return [[MTL4CommitOptions new] init];
+      return (mtl_commit_options *)limina_mtl_note_new([[MTL4CommitOptions new] init]);
    }
 }
 
@@ -50,7 +53,7 @@ mtl_new_command_queue(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newMTL4CommandQueue];
+      return (mtl_command_queue *)limina_mtl_note_new([dev newMTL4CommandQueue]);
    }
 }
 
@@ -105,6 +108,14 @@ mtl_command_queue_commit(mtl_command_queue *queue,
       id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
       id<MTL4CommandBuffer> *cmds = (id<MTL4CommandBuffer> *)command_buffers;
       MTL4CommitOptions *opt = (MTL4CommitOptions *)options;
+      /* limina probe: charge these command buffers to their allocators, and discharge them when
+       * the GPU says this commit completed. See mtl_command_buffer.m. */
+      uint64_t batch = limina_kk_alloc_track_commit((void **)command_buffers, count);
+      if (batch) {
+         [opt addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+           limina_kk_alloc_track_complete(batch);
+         }];
+      }
       [q commit:cmds count:count options:opt];
    }
 }
