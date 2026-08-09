@@ -6,6 +6,9 @@
 
 #include "mtl_sync.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTLEvent.h>
 
 /* MTLFence */
@@ -14,7 +17,7 @@ mtl_new_fence(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return (mtl_fence *)[dev newFence];
+      return (mtl_fence *)limina_mtl_note_new((mtl_fence *)[dev newFence]);
    }
 }
 
@@ -24,7 +27,7 @@ mtl_new_event(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newEvent];
+      return (mtl_event *)limina_mtl_note_new([dev newEvent]);
    }
 }
 
@@ -34,7 +37,7 @@ mtl_new_shared_event(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newSharedEvent];
+      return (mtl_shared_event *)limina_mtl_note_new([dev newSharedEvent]);
    }
 }
 
