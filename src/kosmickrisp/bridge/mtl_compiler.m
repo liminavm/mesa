@@ -5,6 +5,9 @@
  */
 
 #include "mtl_compiler.h"
+
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
 #include "mtl_format.h"
 
 #include <Metal/MTL4ComputePipeline.h>
@@ -29,7 +32,7 @@ mtl_new_compiler(mtl_device *device)
          fprintf(stderr, "Failed to create MTL4Compiler: %s\n", [error.localizedDescription UTF8String]);
       }
 
-      return compiler;
+      return (mtl_compiler *)limina_mtl_note_new(compiler);
    }
 }
 
@@ -62,7 +65,7 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
          fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
       }
 
-      return lib;
+      return (mtl_library *)limina_mtl_note_new(lib);
    }
 }
 
@@ -76,7 +79,7 @@ mtl_new_library_function_descriptor(mtl_library *library, const char *entry_poin
       MTL4LibraryFunctionDescriptor *desc = [MTL4LibraryFunctionDescriptor new];
       desc.name = ns_entry_point;
       desc.library = lib;
-      return desc;
+      return (mtl_function_descriptor *)limina_mtl_note_new(desc);
    }
 }
 
@@ -101,7 +104,7 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
          fprintf(stderr, "Failed to create MTLComputePipelineState: %s\n", [error.localizedDescription UTF8String]);
       }
 
-      return pipeline;
+      return (mtl_compute_pipeline_state *)limina_mtl_note_new(pipeline);
    }
 }
 
@@ -110,7 +113,7 @@ mtl_render_pipeline_descriptor *
 mtl_new_render_pipeline_descriptor()
 {
    @autoreleasepool {
-      return [MTL4RenderPipelineDescriptor new];
+      return (mtl_render_pipeline_descriptor *)limina_mtl_note_new([MTL4RenderPipelineDescriptor new]);
    }
 }
 
@@ -221,6 +224,6 @@ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *desc
          fprintf(stderr, "Failed to create MTLRenderPipelineState: %s\n", [error.localizedDescription UTF8String]);
       }
 
-      return pipeline;
+      return (mtl_render_pipeline_state *)limina_mtl_note_new(pipeline);
    }
 }

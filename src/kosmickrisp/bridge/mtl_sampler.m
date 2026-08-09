@@ -6,6 +6,9 @@
 
 #include "mtl_sampler.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTLSampler.h>
 
 mtl_sampler_descriptor *
@@ -16,7 +19,7 @@ mtl_new_sampler_descriptor()
       /* Set common variables we don't expose */
       descriptor.lodAverage = false;
       descriptor.supportArgumentBuffers = true;
-      return descriptor;
+      return (mtl_sampler_descriptor *)limina_mtl_note_new(descriptor);
    }
 }
 
@@ -104,7 +107,7 @@ mtl_new_sampler(mtl_device *device, mtl_sampler_descriptor *descriptor)
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
       MTLSamplerDescriptor *desc = (MTLSamplerDescriptor *)descriptor;
-      return [dev newSamplerStateWithDescriptor:desc];
+      return (mtl_sampler *)limina_mtl_note_new([dev newSamplerStateWithDescriptor:desc]);
    }
 }
 

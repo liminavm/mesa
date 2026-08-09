@@ -6,6 +6,9 @@
 
 #include "mtl_render_state.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include "mtl_format.h"
 
 /* TODO_KOSMICKRISP Remove */
@@ -22,7 +25,7 @@ mtl_render_pass_descriptor *
 mtl_new_render_pass_descriptor(void)
 {
    @autoreleasepool {
-      return [[MTL4RenderPassDescriptor new] init];
+      return (mtl_render_pass_descriptor *)limina_mtl_note_new([[MTL4RenderPassDescriptor new] init]);
    }
 }
 
@@ -215,7 +218,7 @@ mtl_stencil_descriptor *
 mtl_new_stencil_descriptor()
 {
    @autoreleasepool {
-      return [[MTLStencilDescriptor new] init];
+      return (mtl_stencil_descriptor *)limina_mtl_note_new([[MTLStencilDescriptor new] init]);
    }
 }
 
@@ -305,7 +308,7 @@ mtl_depth_stencil_descriptor *
 mtl_new_depth_stencil_descriptor()
 {
    @autoreleasepool {
-      return [[MTLDepthStencilDescriptor new] init];
+      return (mtl_depth_stencil_descriptor *)limina_mtl_note_new([[MTLDepthStencilDescriptor new] init]);
    }
 }
 
@@ -351,6 +354,6 @@ mtl_new_depth_stencil_state(mtl_device *device, mtl_depth_stencil_descriptor *de
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
       MTLDepthStencilDescriptor *desc = (MTLDepthStencilDescriptor *)descriptor;
-      return [dev newDepthStencilStateWithDescriptor:desc];
+      return (mtl_depth_stencil_state *)limina_mtl_note_new([dev newDepthStencilStateWithDescriptor:desc]);
    }
 }
