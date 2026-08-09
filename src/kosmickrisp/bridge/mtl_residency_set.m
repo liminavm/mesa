@@ -6,6 +6,9 @@
 
 #include "mtl_residency_set.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLResidencySet.h>
 
@@ -24,7 +27,7 @@ mtl_new_residency_set(mtl_device *device)
          fprintf(stderr, "Failed to create MTLResidencySet: %s\n", [error.localizedDescription UTF8String]);
       }
 
-      return set;
+      return (mtl_residency_set *)limina_mtl_note_new(set);
    }
 }
 
