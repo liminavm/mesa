@@ -6,6 +6,9 @@
 
 #include "mtl_argument_table.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 #include <Metal/MTL4ArgumentTable.h>
 #include <Metal/MTLDevice.h>
 
@@ -13,7 +16,7 @@ mtl_argument_table_descriptor *
 mtl_new_argument_table_descriptor()
 {
    @autoreleasepool {
-      return [[MTL4ArgumentTableDescriptor new] init];
+      return (mtl_argument_table_descriptor *)limina_mtl_note_new([[MTL4ArgumentTableDescriptor new] init]);
    }
 }
 
@@ -35,7 +38,7 @@ mtl_new_argument_table(mtl_device *device,
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
       MTL4ArgumentTableDescriptor *desc = (MTL4ArgumentTableDescriptor *)descriptor;
-      return [dev newArgumentTableWithDescriptor:desc error:NULL];
+      return (mtl_argument_table *)limina_mtl_note_new([dev newArgumentTableWithDescriptor:desc error:NULL]);
    }
 }
 

@@ -6,6 +6,9 @@
 
 #include "mtl_heap.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 /* TODO_KOSMICKRISP Remove */
 #include "kk_private.h"
 #include "kk_image_layout.h"
@@ -24,7 +27,7 @@ mtl_new_heap(mtl_device *device, uint64_t size,
       descriptor.resourceOptions = (MTLResourceOptions)resource_options;
       descriptor.size = size;
       descriptor.sparsePageSize = MTLSparsePageSize16;
-      return [dev newHeapWithDescriptor:descriptor];
+      return (mtl_heap *)limina_mtl_note_new([dev newHeapWithDescriptor:descriptor]);
    }
 }
 
@@ -55,7 +58,7 @@ mtl_new_texture_descriptor(const struct kk_image_layout *layout)
       descriptor.usage = (MTLTextureUsage)layout->usage;
       /* We don't set the swizzle because Metal complains when the usage has store or render target with swizzle... */
       
-      return descriptor;
+      return (MTLTextureDescriptor *)limina_mtl_note_new(descriptor);
    }
 }
 
@@ -65,7 +68,7 @@ mtl_new_buffer_with_length(mtl_heap *heap, uint64_t size_B, uint64_t offset_B)
 {
    @autoreleasepool {
       id<MTLHeap> hp = (id<MTLHeap>)heap;
-      return (mtl_buffer *)[hp newBufferWithLength:size_B options:KK_MTL_RESOURCE_OPTIONS offset:offset_B];
+      return (mtl_buffer *)limina_mtl_note_new((mtl_buffer *)[hp newBufferWithLength:size_B options:KK_MTL_RESOURCE_OPTIONS offset:offset_B]);
    }
 }
 
@@ -78,6 +81,6 @@ mtl_new_texture_with_descriptor(mtl_heap *heap,
       id<MTLHeap> hp = (id<MTLHeap>)heap;
       MTLTextureDescriptor *descriptor = [mtl_new_texture_descriptor(layout) autorelease];
       descriptor.resourceOptions = hp.resourceOptions;
-      return [hp newTextureWithDescriptor:descriptor offset:offset];
+      return (mtl_texture *)limina_mtl_note_new([hp newTextureWithDescriptor:descriptor offset:offset]);
    }
 }
