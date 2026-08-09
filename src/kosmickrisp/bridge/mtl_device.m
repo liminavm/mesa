@@ -6,6 +6,9 @@
 
 #include "mtl_device.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 /* TODO_KOSMICKRISP Remove */
 #include "kk_image_layout.h"
 #include "kk_private.h"
@@ -14,6 +17,9 @@
 #include <Metal/MTLCaptureManager.h>
 #include <Metal/MTLDevice.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <objc/runtime.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 /* Device creation */
 mtl_device *
@@ -221,10 +227,10 @@ mtl_new_timestamp_counter_heap(mtl_device *dev, uint32_t count)
       if (heap == nil) {
          fprintf(stderr, "Failed to create timestamp counter heap: %s\n",
                  error ? error.localizedDescription.UTF8String : "unknown");
-         return NULL;
+         return (mtl_counter_heap *)limina_mtl_note_new(NULL);
       }
 
-      return (mtl_counter_heap *)heap;
+      return (mtl_counter_heap *)limina_mtl_note_new((mtl_counter_heap *)heap);
    }
 }
 
@@ -260,8 +266,93 @@ mtl_new_texture_descriptor(const struct kk_image_layout *layout)
       descriptor.usage = (MTLTextureUsage)layout->usage;
       /* We don't set the swizzle because Metal complains when the usage has store or render target with swizzle... */
       
-      return descriptor;
+      return (MTLTextureDescriptor *)limina_mtl_note_new(descriptor);
    }
+}
+
+/* limina: DEALLOC census for the IOSurface-backed import textures.
+ *
+ * The 2026-08-07 storm left every scanout IOSurface resident (8.6 G) although both vkr and
+ * kk_destroy_bo released their refs. Release CALLS balancing proves nothing about the object
+ * dying, so count the death itself: an associated object is released when its host is
+ * deallocated, so a sentinel attached here turns "was this texture freed" into a number. If
+ * created and deallocated diverge, the holder is inside Metal/KK — and the IOSurface cannot
+ * die while a texture over it lives. */
+#define LIMINA_KK_CENSUS_BUILD_TAG "kk-sentinel-1"
+
+static _Atomic uint64_t g_limina_kk_tex_create;
+static _Atomic uint64_t g_limina_kk_tex_dealloc;
+static _Atomic uint64_t g_limina_kk_selftest_dealloc;
+
+@interface LiminaKKSentinel : NSObject
+@property(nonatomic) bool selftest;
+@end
+
+@implementation LiminaKKSentinel
+- (void)dealloc
+{
+   atomic_fetch_add(_selftest ? &g_limina_kk_selftest_dealloc
+                              : &g_limina_kk_tex_dealloc,
+                    1);
+   [super dealloc];
+}
+@end
+
+static const char g_limina_kk_sentinel_key; /* address only */
+
+static void
+limina_kk_sentinel_attach(id obj, bool selftest)
+{
+   if (!obj)
+      return;
+   LiminaKKSentinel *s = [[LiminaKKSentinel alloc] init];
+   s.selftest = selftest;
+   objc_setAssociatedObject(obj, &g_limina_kk_sentinel_key, s,
+                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   [s release]; /* the association holds the only ref; it dies with obj */
+}
+
+/* An instrument that never fires reads exactly like "nothing leaked". Prove the mechanism on
+ * an object whose death we control, and print a build tag so a stale dylib shows in the log. */
+static void
+limina_kk_sentinel_selftest(void)
+{
+   uint64_t before = atomic_load(&g_limina_kk_selftest_dealloc);
+   @autoreleasepool {
+      NSObject *victim = [[NSObject alloc] init];
+      limina_kk_sentinel_attach(victim, true);
+      [victim release];
+   }
+   fprintf(stderr,
+           "[LIMINA-SENTINEL] kk " LIMINA_KK_CENSUS_BUILD_TAG
+           " armed; dealloc sentinel self-test: %s\n",
+           atomic_load(&g_limina_kk_selftest_dealloc) > before
+              ? "OK"
+              : "FAILED (dealloc counts below are meaningless)");
+}
+
+static void
+limina_kk_sentinel_once(void)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, limina_kk_sentinel_selftest);
+}
+
+void
+mtl_limina_texture_census(char *buf, unsigned long len)
+{
+   uint64_t c = atomic_load(&g_limina_kk_tex_create),
+            d = atomic_load(&g_limina_kk_tex_dealloc);
+   snprintf(buf, len, "kk import-tex created %llu deallocated %llu (alive %lld)",
+            (unsigned long long)c, (unsigned long long)d, (long long)(c - d));
+}
+
+/* A retain count is a LEAD, not a verdict — the runtime takes transient refs — but "2 where we
+ * hold 1" names a second holder at a point in time the sentinels cannot report on. */
+long
+mtl_limina_retain_count(void *obj)
+{
+   return obj ? CFGetRetainCount((CFTypeRef)obj) : -1;
 }
 
 /* limina: is this external handle an IOSurfaceRef (vs an id<MTLTexture>)?
@@ -295,11 +386,17 @@ mtl_new_texture_with_descriptor_iosurface(mtl_device *device,
                  "plain 2D (type=%u levels=%u layers=%u samples=%u)\n",
                  layout->type, layout->levels, layout->layers,
                  layout->sample_count_sa);
-         return NULL;
+         return (mtl_texture *)limina_mtl_note_new(NULL);
       }
-      return [dev newTextureWithDescriptor:descriptor
-                                 iosurface:(IOSurfaceRef)iosurface
-                                     plane:0];
+      id<MTLTexture> tex = [dev newTextureWithDescriptor:descriptor
+                                              iosurface:(IOSurfaceRef)iosurface
+                                                  plane:0];
+      if (tex) {
+         limina_kk_sentinel_once();
+         limina_kk_sentinel_attach(tex, false);
+         atomic_fetch_add(&g_limina_kk_tex_create, 1);
+      }
+      return (mtl_texture *)limina_mtl_note_new(tex);
    }
 }
 
@@ -377,7 +474,7 @@ mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newBufferWithBytesNoCopy:ptr length:size_B options:KK_MTL_RESOURCE_OPTIONS deallocator:nil];
+      return (mtl_buffer *)limina_mtl_note_new([dev newBufferWithBytesNoCopy:ptr length:size_B options:KK_MTL_RESOURCE_OPTIONS deallocator:nil]);
    }
 }
 
@@ -386,7 +483,7 @@ mtl_new_command_allocator(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newCommandAllocator];
+      return (mtl_command_allocator *)limina_mtl_note_new([dev newCommandAllocator]);
    }
 }
 
@@ -395,6 +492,6 @@ mtl_new_command_buffer(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newCommandBuffer];
+      return (mtl_command_buffer *)limina_mtl_note_new([dev newCommandBuffer]);
    }
 }
