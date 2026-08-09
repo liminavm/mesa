@@ -23,14 +23,14 @@ limina_kk_alloc_stats_on(void)
    return 0;
 }
 
-void *
+uint64_t
 limina_kk_alloc_track_commit(void **cbs, uint32_t count)
 {
-   return NULL;
+   return 0u;
 }
 
 void
-limina_kk_alloc_track_complete(void *batch)
+limina_kk_alloc_track_complete(uint64_t token)
 {
 }
 

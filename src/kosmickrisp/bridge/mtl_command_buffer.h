@@ -22,8 +22,11 @@ uint64_t mtl_command_allocator_allocated_size(mtl_command_allocator *allocator);
  * counts the resets that land while an allocator still has command buffers in flight. See the
  * block comment in mtl_command_buffer.m. */
 int limina_kk_alloc_stats_on(void);
-void *limina_kk_alloc_track_commit(void **cbs, uint32_t count);
-void limina_kk_alloc_track_complete(void *batch);
+/* Returns an opaque (generation, ring-slot) token; 0 means "nothing tracked". Batches live in a
+ * static ring, so a stale feedback invocation fails the generation check rather than touching
+ * freed memory. */
+uint64_t limina_kk_alloc_track_commit(void **cbs, uint32_t count);
+void limina_kk_alloc_track_complete(uint64_t token);
 
 void mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
                               mtl_command_allocator *allocator);
