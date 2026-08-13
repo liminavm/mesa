@@ -136,7 +136,19 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
       .allocationSize = alloc_info->allocationSize,
       .memoryTypeIndex = alloc_info->memoryTypeIndex,
    };
-   result = vn_device_memory_alloc_simple(dev, mem, &memory_allocate_info);
+   /* The import allocation must be synchronous. A dma-buf import can fail
+    * host-side for expected runtime reasons (the resource may not be
+    * attachable in the renderer — unlike a plain allocation, where failure
+    * means OOM), and the async path reports VK_SUCCESS on ring-accept: a
+    * host-side rejection then leaves the app holding a ghost VkDeviceMemory,
+    * and the next command naming it poisons the ring — one failed import
+    * kills the whole context. Same trade VN_PERF(NO_ASYNC_MEM_ALLOC) makes,
+    * applied unconditionally to the one path where failure is expected.
+    */
+   VkDevice dev_handle = vn_device_to_handle(dev);
+   VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
+   result = vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
+                                     &memory_allocate_info, NULL, &mem_handle);
    if (result != VK_SUCCESS) {
       vn_renderer_bo_unref(dev->renderer, bo);
       return result;
