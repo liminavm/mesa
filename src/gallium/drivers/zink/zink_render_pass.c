@@ -215,13 +215,26 @@ zink_render_attachment_shadow(struct zink_context *ctx, uint32_t attachment_shad
       ctx->blitting = false;
       zink_blit_barriers(ctx, zink_resource(src), transient, true);
       ctx->blitting = true;
-      unsigned clear_mask = i == PIPE_MAX_COLOR_BUFS ?
-                              (BITFIELD_MASK(PIPE_MAX_COLOR_BUFS) << 2) :
-                              (PIPE_CLEAR_DEPTHSTENCIL | ((BITFIELD_MASK(PIPE_MAX_COLOR_BUFS) & ~BITFIELD_BIT(i)) << 2));
-      unsigned clears_enabled = ctx->clears_enabled & clear_mask;
-      unsigned rp_clears_enabled = ctx->rp_clears_enabled & clear_mask;
-      ctx->clears_enabled &= ~clear_mask;
-      ctx->rp_clears_enabled &= ~clear_mask;
+      /* Mask off ALL pending clears across the blit, this attachment's own
+       * included, and restore them afterwards.
+       *
+       * util_blitter rebinds the framebuffer, and zink_set_framebuffer_state
+       * flushes pending clears when the bound attachments change. Leaving this
+       * attachment's clear enabled meant that flush re-entered
+       * zink_batch_rp -> begin_rendering while the transient was still invalid
+       * (it is only marked valid once the blit below returns), so the replicate
+       * blit started over: unbounded recursion until the stack ran out.
+       * u_blitter's "Caught recursion" only logs, it does not break the cycle.
+       *
+       * The clear is not lost, only deferred: restored below, it is applied by
+       * the renderpass that follows, against the now-populated transient. That
+       * is the order the application asked for anyway — the clear was issued
+       * after the contents this blit is replicating.
+       */
+      unsigned clears_enabled = ctx->clears_enabled;
+      unsigned rp_clears_enabled = ctx->rp_clears_enabled;
+      ctx->clears_enabled = 0;
+      ctx->rp_clears_enabled = 0;
       util_blitter_blit_generic(ctx->blitter, &dst_view, &dstbox,
                                  src_view, &dstbox, ctx->fb_state.width, ctx->fb_state.height,
                                  PIPE_MASK_RGBAZS, PIPE_TEX_FILTER_NEAREST, NULL,
