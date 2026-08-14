@@ -653,8 +653,16 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
     * for this format/width, or violating its linear-texture row alignment) is
     * an invalid plane layout — app-side undefined behavior, which we define as
     * "the image uses the computed pitch instead", loudly. Rationale: in the VM
-    * stack the exporter's image at the same width computes the same pitch, so
-    * this stays coherent end to end; and the transition-era guest driver
+    * stack the exporter's buffer at the same width really does have this pitch,
+    * so substituting stays coherent end to end. That is ENFORCED, not
+    * coincidental: virglrenderer (limina 5c76245) forces the exported
+    * IOSurface's bytesPerRow to Metal's minimumLinearTextureAlignment for the
+    * format, precisely so the pitch we compute here is the truth. Before that
+    * fix IOSurface's own 256-byte row alignment won and every linear import
+    * addressed rows short — diagonal shear in every GL window, with this log
+    * line silent at most of the affected widths. If that virgl commit is ever
+    * reverted or the exporter changes, this substitution goes back to
+    * corrupting; and the transition-era guest driver
     * (mesa 0010(b)) fabricates tight-packed pitches that are wrong exactly
     * when width*bpp misses the alignment. The queries always report the pitch
     * actually in use, never the rejected value — the claim stays truthful.
