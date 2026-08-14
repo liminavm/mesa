@@ -780,55 +780,41 @@ kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
    return root_ptr.gpu;
 }
 
-/* limina: upload only the bytes the set layout actually uses instead of the
- * full KK_PUSH_DESCRIPTOR_SET_SIZE (2 KiB). Zink pushes descriptors per draw,
- * so this directly scales the upload-pool burn rate (and BO/residency churn).
- * Matches regular descriptor sets, which already size by the layout. */
-static inline bool
-kk_limina_slimpush(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      /* Default ON (round 19; sized by per-set high-water mark, see
-       * limina_used_size); LIMINA_KK_SLIMPUSH=0 restores full-size uploads. */
-      const char *e = getenv("LIMINA_KK_SLIMPUSH");
-      v = !e || e[0] != '0';
-   }
-   return v;
-}
-
 void
 kk_cmd_buffer_flush_push_descriptors(struct kk_cmd_buffer *cmd,
                                      struct kk_descriptor_state *desc)
 {
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct kk_push_descriptor_set *push_set = desc->push[set_idx];
-      uint32_t size = sizeof(push_set->data);
-      if (kk_limina_slimpush()) {
-         /* Size by the per-set high-water mark, NOT the latest push's layout:
-          * retained bindings from earlier (larger-layout) pushes must stay in
-          * the upload. Latest-layout sizing truncated them — visible as
-          * flickering/transparent frames in glmark2 texture/shading/effect2d
-          * (round 19 regression, caught by eyeball). */
-         static int limina_stats = -1;
-         if (limina_stats < 0)
-            limina_stats = getenv("LIMINA_KK_STATS") != NULL;
-         if (limina_stats &&
-             push_set->limina_used_size >
-                push_set->layout->non_variable_descriptor_buffer_size) {
-            static int truncs = 0;
-            if (truncs++ % 1000 == 0)
-               fprintf(stderr,
-                       "[LIMINA-KK-SLIMPUSH] retained-binding carry: used=%u > "
-                       "latest-layout=%u (x%d) — latest-layout sizing would "
-                       "truncate\n",
-                       push_set->limina_used_size,
-                       push_set->layout->non_variable_descriptor_buffer_size,
-                       truncs);
-         }
-         size = align(push_set->limina_used_size, KK_MIN_UBO_ALIGNMENT);
-         size = CLAMP(size, KK_MIN_UBO_ALIGNMENT, sizeof(push_set->data));
+
+      /* limina: upload only the bytes the set actually uses instead of the full
+       * KK_PUSH_DESCRIPTOR_SET_SIZE (2 KiB). Zink pushes descriptors per draw,
+       * so this directly scales the upload-pool burn rate (and BO/residency
+       * churn). Matches regular descriptor sets, which already size by the
+       * layout. Was LIMINA_KK_SLIMPUSH, default-ON since round 19 and
+       * unconditional since 2026-08-14.
+       *
+       * Size by the per-set high-water mark, NOT the latest push's layout:
+       * retained bindings from earlier (larger-layout) pushes must stay in the
+       * upload. Latest-layout sizing truncated them — visible as
+       * flickering/transparent frames in glmark2 texture/shading/effect2d
+       * (round 19 regression, caught by eyeball). */
+      const uint32_t latest_layout_size =
+         push_set->layout->non_variable_descriptor_buffer_size;
+      static int limina_stats = -1;
+      if (limina_stats < 0)
+         limina_stats = getenv("LIMINA_KK_STATS") != NULL;
+      if (limina_stats && push_set->limina_used_size > latest_layout_size) {
+         static int truncs = 0;
+         if (truncs++ % 1000 == 0)
+            fprintf(stderr,
+                    "[LIMINA-KK-SLIMPUSH] retained-binding carry: used=%u > "
+                    "latest-layout=%u (x%d) — latest-layout sizing would "
+                    "truncate\n",
+                    push_set->limina_used_size, latest_layout_size, truncs);
       }
+      uint32_t size = align(push_set->limina_used_size, KK_MIN_UBO_ALIGNMENT);
+      size = CLAMP(size, KK_MIN_UBO_ALIGNMENT, sizeof(push_set->data));
       struct kk_ptr push_gpu =
          kk_pool_upload(cmd, push_set->data, size, KK_MIN_UBO_ALIGNMENT);
       if (unlikely(!push_gpu.gpu))

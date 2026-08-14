@@ -39,21 +39,6 @@ kk_limina_rtlog(void)
    return v;
 }
 
-/* limina: gates the per-draw upload dedup below (identical per-draw content
- * reuses its previous pool location — pool data is immutable for the life of
- * the cmd buffer). The MTL3-era bind cache this knob also covered died with
- * the MTL4 argument-table rework. LIMINA_KK_FASTBIND=0 disables. */
-static inline bool
-kk_limina_fastbind(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      const char *e = getenv("LIMINA_KK_FASTBIND");
-      v = !e || e[0] != '0';
-   }
-   return v;
-}
-
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
 {
@@ -1798,7 +1783,7 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
     * never matches (it pool-allocs fresh param addresses into the struct
     * above). */
    struct kk_ptr shader_data_gpu;
-   if (kk_limina_fastbind() && !tess && gfx->per_draw_gpu.gpu &&
+   if (!tess && gfx->per_draw_gpu.gpu &&
        memcmp(&gfx->per_draw_data, &gfx->last_per_draw_data,
               sizeof(gfx->per_draw_data)) == 0) {
       shader_data_gpu = gfx->per_draw_gpu;

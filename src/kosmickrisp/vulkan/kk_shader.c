@@ -500,31 +500,24 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
       }
       NIR_PASS(_, nir, msl_lower_static_sample_mask, state->ms->sample_mask);
    }
-   /* Check https://github.com/KhronosGroup/Vulkan-Portability/issues/54 for
-    * explanation on why we need this. */
-   else if (nir->info.fs.needs_full_quad_helper_invocations ||
-            nir->info.fs.needs_coarse_quad_helper_invocations) {
-      struct kk_physical_device *pdev = kk_device_physical(dev);
-
-      /* Metal by default merges triangles which results in incorrect edges, see
-       * mentioned issue above. The issue is that if we disable them through
-       * writing to the sample mask, then derivatives are broken for multisample
-       * rendering in M1 and M2 with macOS 26. This bug is fixed in macOS 27.
-       *
-       * This is why we are choosing the lesser evil which is incorrect edges
-       * for multisampled rendering. Since CTS does not have tests for the edge
-       * case with multisample, we get a clean run. This does not mean we are
-       * Vulkan conformant with macOS26 for M1 and M2.
-       *
-       * limina: LIMINA_KK_EARLYZ additionally skips the lowering as an opt-in
-       * perf policy (the pass forces late-Z on every helper-invocation FS). */
-      bool ms_bug_present = !ns_is_os_version_at_least(27, 0, 0) &&
-                            (pdev->info.gpu_apple_family == 7 ||
-                             pdev->info.gpu_apple_family == 8) &&
-                            state->ms && state->ms->rasterization_samples > 1;
-      if (!ms_bug_present && !kk_limina_earlyz())
-         NIR_PASS(_, nir, msl_lower_static_sample_mask, 0xFFFFFFFF);
-   }
+   /* limina: stock KK lowers a static full sample mask here for
+    * helper-invocation fragment shaders (see
+    * https://github.com/KhronosGroup/Vulkan-Portability/issues/54) to stop
+    * Metal merging triangles and drawing incorrect edges. We deliberately do
+    * NOT: writing the sample mask forces late-Z on Metal, which disables
+    * early-Z/HSR for effectively all real content, and the desktop workloads we
+    * care about pay that on every frame. Incorrect merged edges are the price.
+    *
+    * This was LIMINA_KK_EARLYZ, default-ON since round 20 and unconditional
+    * since 2026-08-14 — a 10.9k-case CTS A/B was status-identical with it on.
+    *
+    * Two things the deleted code knew, kept here because they matter if this is
+    * ever revisited: stock's lowering was itself already skipped on M1/M2 under
+    * macOS 26 with rasterization_samples > 1, because there it breaks
+    * derivatives for multisample rendering (fixed in macOS 27) — so on that
+    * configuration stock and limina behave the same. And CTS has no test for
+    * the multisample edge case, so a clean CTS run does NOT demonstrate
+    * conformance for it either way. */
 
    /* KK_WORKAROUND_5 */
    if (!(dev->disabled_workarounds & BITFIELD64_BIT(5)))
@@ -568,11 +561,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, kk_nir_lower_fs_multiview, state->mv->view_mask);
 
-      if (state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED &&
-          state->ial && state->ial->depth_att != MESA_VK_ATTACHMENT_NO_INDEX &&
-          !kk_limina_earlyz()) {
-         NIR_PASS(_, nir, msl_ensure_depth_write);
-      }
+      /* limina: stock KK runs msl_ensure_depth_write here whenever there is a
+       * depth attachment. We omit it for the same early-Z reason as the sample
+       * mask above — an injected FS depth write forces late-Z on Metal. */
    }
 
    const struct lower_ycbcr_state ycbcr_state = {

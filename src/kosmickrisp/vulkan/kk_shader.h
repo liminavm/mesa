@@ -163,22 +163,6 @@ kk_limina_norobust(void)
    return v;
 }
 
-/* limina: skip the injected FS depth write (msl_ensure_depth_write) and the
- * helper-quad [[sample_mask]] write — both force late-Z on Metal, disabling
- * early-Z/HSR for effectively all real content. Default ON since round 20
- * (10.9k-case CTS early-Z A/B status-identical + battery clean);
- * LIMINA_KK_EARLYZ=0 restores the stock blanket injections. */
-static inline bool
-kk_limina_earlyz(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      const char *e = getenv("LIMINA_KK_EARLYZ");
-      v = !e || e[0] != '0';
-   }
-   return v;
-}
-
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
 {
