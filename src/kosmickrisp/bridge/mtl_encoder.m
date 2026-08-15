@@ -13,12 +13,19 @@
 #include <Metal/MTL4ComputeCommandEncoder.h>
 #include <Metal/MTL4Counters.h>
 #include <Metal/MTL4RenderCommandEncoder.h>
+/* limina: the full MTL4RenderPassDescriptor interface (MTL4CommandBuffer.h only forward-declares
+ * it), needed by the LIMINA_KK_RPLOG dump below. */
+#include <Metal/MTL4RenderPass.h>
 #include <Metal/MTLRenderPass.h>
 
 /* limina: LIMINA_KK_STATS=1 — once-per-second aggregate counters to stderr.
  * Measures render-pass split rate (renc + Load-action reloads) vs draw rate. */
 #include <stdatomic.h>
 #include <time.h>
+/* limina: pthread_threadid_np for the LIMINA_KK_RPLOG thread tag. */
+#include <pthread.h>
+#include <execinfo.h>
+#include <unistd.h>
 
 /* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
  * ~7% of the hot ring core in __findenv_locked). */
@@ -289,6 +296,46 @@ mtl_dispatch_threadgroups_with_indirect_buffer(mtl_compute_encoder *encoder,
 /* MTLRenderEncoder */
 
 /* Encoder commands */
+/* limina: LIMINA_KK_RPLOG=1 — dump the fully-resolved render pass right BEFORE the encoder is
+ * created. Creating the encoder is what makes Metal compile its background object, and that
+ * compile is where MTLCompilerService aborts on `bitcode_url is NULL ... extension 'ds'`
+ * (spikes/agx-compiler-abort). The abort takes the whole process down from inside Metal, so the
+ * last line this prints on the aborting thread IS the trigger -- hence print before, and flush.
+ *
+ * Kept off the RTLOG knob on purpose: RTLOG is per-draw and would bury this in the compositor's
+ * traffic. Thread id is logged because several threads encode concurrently and only one aborts. */
+static inline bool
+limina_kk_rplog_cached(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RPLOG") != NULL;
+   return v;
+}
+
+static void
+limina_log_attachment(const char *what, uint32_t idx,
+                      MTLRenderPassAttachmentDescriptor *att)
+{
+   id<MTLTexture> t = att.texture;
+   if (!t)
+      return;
+   /* Two different "not an ordinary private texture" flags, and conflating them cost a run:
+    *   linear  = tex.buffer non-nil, i.e. buffer-backed.
+    *   iosurf  = tex.iosurface non-nil, i.e. what the scanout path
+    *             (LIMINA_KK_MTLTEXTURE_SCANOUT) produces.
+    * An IOSurface-backed texture has buffer == nil, so logging only `linear` reported 0 for
+    * every scanout attachment and made them look absent from every render pass. */
+   fprintf(stderr,
+           "[LIMINA-KK-RP]   %s[%u] tex=%p fmt=%lu storage=%lu usage=0x%lx %lux%lu "
+           "samples=%lu linear=%d iosurf=%d load=%lu store=%lu\n",
+           what, idx, (void *)t, (unsigned long)t.pixelFormat,
+           (unsigned long)t.storageMode, (unsigned long)t.usage,
+           (unsigned long)t.width, (unsigned long)t.height,
+           (unsigned long)t.sampleCount, t.buffer ? 1 : 0, t.iosurface ? 1 : 0,
+           (unsigned long)att.loadAction, (unsigned long)att.storeAction);
+}
+
 mtl_render_encoder *
 mtl_new_render_command_encoder_with_descriptor(
    mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor)
@@ -296,6 +343,67 @@ mtl_new_render_command_encoder_with_descriptor(
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
       MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
+      /* limina: an attachment-less pass whose defaultRasterSampleCount is still 0 makes AGX
+       * abort the whole process from inside the Metal compiler, uncatchably. Counting the
+       * attachments here (rather than inferring "no attachment lines were printed") is what
+       * makes the log honest: a header with natt=0 and a header truncated by a concurrent
+       * abort used to look identical, and I built a wrong theory on exactly that. When the
+       * fatal shape is seen, dump a backtrace -- it names the caller instead of leaving the
+       * origin to be guessed at. */
+      uint32_t natt = 0;
+      for (uint32_t i = 0; i < 8; i++)
+         natt += desc.colorAttachments[i].texture ? 1 : 0;
+      natt += desc.depthAttachment.texture ? 1 : 0;
+      natt += desc.stencilAttachment.texture ? 1 : 0;
+
+      if (natt == 0 && desc.defaultRasterSampleCount == 0) {
+         /* Clamping to 1 is what turns an uncatchable process abort into, at worst, a lost
+          * render: mtlrp.m measured attachment-less passes as green at sample count 1 and 2
+          * and fatal only at 0. Anything reaching here is still an upstream bug -- the pass
+          * has nothing to draw into -- so keep warning (rate-limited; the shape can repeat
+          * every frame) even though it no longer kills us. */
+         static _Atomic uint64_t seen;
+         uint64_t n_seen = atomic_fetch_add_explicit(&seen, 1, memory_order_relaxed);
+         if (n_seen < 8 || (n_seen & 1023) == 0) {
+            fprintf(stderr,
+                    "[LIMINA-KK-RP] attachment-less render pass with "
+                    "defaultRasterSampleCount=0 (rt=%lux%lu, #%llu) -- clamping to 1; "
+                    "without this AGX aborts the process from inside the Metal compiler\n",
+                    (unsigned long)desc.renderTargetWidth,
+                    (unsigned long)desc.renderTargetHeight,
+                    (unsigned long long)n_seen + 1);
+            if (limina_kk_rplog_cached()) {
+               void *bt[32];
+               int nframes = backtrace(bt, 32);
+               fflush(stderr);
+               backtrace_symbols_fd(bt, nframes, STDERR_FILENO);
+            }
+         }
+         desc.defaultRasterSampleCount = 1;
+      }
+
+      if (limina_kk_rplog_cached()) {
+         uint64_t tid = 0;
+         pthread_threadid_np(NULL, &tid);
+         /* imageblockSampleLength is the per-sample tile byte size -- the one field that could
+          * plausibly index Apple's blit_fast_clear_gen2_{1,2,4,5,8,16} family directly. */
+         fprintf(stderr,
+                 "[LIMINA-KK-RP] natt=%u tid=0x%llx rt=%lux%lu arraylen=%lu samples=%lu "
+                 "imageblock=%lu tile=%lux%lu tgmem=%lu\n",
+                 natt, (unsigned long long)tid,
+                 (unsigned long)desc.renderTargetWidth,
+                 (unsigned long)desc.renderTargetHeight,
+                 (unsigned long)desc.renderTargetArrayLength,
+                 (unsigned long)desc.defaultRasterSampleCount,
+                 (unsigned long)desc.imageblockSampleLength,
+                 (unsigned long)desc.tileWidth, (unsigned long)desc.tileHeight,
+                 (unsigned long)desc.threadgroupMemoryLength);
+         for (uint32_t i = 0; i < 8; i++)
+            limina_log_attachment("color", i, desc.colorAttachments[i]);
+         limina_log_attachment("depth", 0, desc.depthAttachment);
+         limina_log_attachment("stencil", 0, desc.stencilAttachment);
+         fflush(stderr);
+      }
       return (mtl_render_encoder *)limina_mtl_note_new([[cmd renderCommandEncoderWithDescriptor:desc] retain]);
    }
 }
