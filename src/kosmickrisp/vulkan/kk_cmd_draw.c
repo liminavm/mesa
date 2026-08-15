@@ -331,10 +331,15 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       mtl_render_pass_descriptor_set_default_raster_sample_count(
          pass_descriptor, 1u);
    } else {
+      /* limina: same >= 1 floor as the no_framebuffer branch. A 0-area render pass over real
+       * attachments would otherwise ask Metal for a 0-wide render target and get a nil
+       * encoder back. */
       mtl_render_pass_descriptor_set_render_target_width(
-         pass_descriptor, render->area.extent.width + render->area.offset.x);
+         pass_descriptor,
+         MAX2(render->area.extent.width + render->area.offset.x, 1u));
       mtl_render_pass_descriptor_set_render_target_height(
-         pass_descriptor, render->area.extent.height + render->area.offset.y);
+         pass_descriptor,
+         MAX2(render->area.extent.height + render->area.offset.y, 1u));
    }
 
    /* Check if we are rendering to the whole framebuffer. Required to understand
@@ -409,8 +414,30 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    /* Rendering with no attachments requires pushing the start of the render
     * pass to first pipeline binding to know sample count. */
+
+   /* limina: "attachment-less" has to be judged on what actually landed on the
+    * Metal descriptor, not on whether the Vulkan iviews had an extent. A colour
+    * attachment with a valid iview contributes to framebuffer_extent but is
+    * SKIPPED by kk_set_color_attachments when the dynamic location map marks it
+    * MESA_VK_ATTACHMENT_UNUSED -- so the descriptor can come out with zero
+    * attachments while no_framebuffer is false. Starting such a pass leaves
+    * defaultRasterSampleCount at 0, and AGX then aborts the entire process from
+    * inside the Metal compiler (AGCLLVMBackgroundObjectFragmentShader ->
+    * "bitcode_url is NULL ... extension 'ds'"), which no client can catch. Metal
+    * API validation names it outright: "no sampleCount for color and raster
+    * available, either set defaultColorSampleCount or set
+    * defaultRasterSampleCount or set appropriate attachments".
+    *
+    * render->samples is raised only by attachments that were really used, so
+    * samples == 0 here is exactly that condition. Defer to first pipeline bind
+    * like the no_framebuffer path does, which yields the true sample count
+    * rather than a guessed 1.
+    *
+    * Standalone Metal reproducer: spikes/agx-compiler-abort/mtlrp-min.m. */
+   const bool no_attachments = render->samples == 0u;
+
    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
-   if (!no_framebuffer)
+   if (!no_framebuffer && !no_attachments)
       cs_start_render(cmd);
 
    /* Store descriptor in case we need to restart the pass at pipeline barrier,
@@ -436,7 +463,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       mtl_render_pass_attachment_descriptor_set_load_action(
          attachment_descriptor, MTL_LOAD_ACTION_LOAD);
    }
-   cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
+   cmd->state.gfx.need_to_start_render_pass = no_framebuffer || no_attachments;
 
    kk_cmd_buffer_dirty_all_gfx(cmd);
 
