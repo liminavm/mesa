@@ -41,6 +41,12 @@ mtl_texture *
 mtl_new_texture_view_with_no_swizzle(mtl_texture *texture,
                                      const struct kk_view_layout *layout);
 
+/* limina: reinterpret a whole texture in another pixel format, keeping its type, mip levels and
+ * array slices. Used to adopt an imported MTLTexture whose format is the linear/sRGB counterpart
+ * of the image being bound to it. */
+mtl_texture *mtl_new_texture_view_with_format(mtl_texture *texture,
+                                              uint32_t pixel_format);
+
 void mtl_texture_get_bytes(mtl_texture *texture, void *host_ptr,
                            struct mtl_texture_memory_copy *data);
 

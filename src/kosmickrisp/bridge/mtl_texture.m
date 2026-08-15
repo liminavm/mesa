@@ -134,6 +134,26 @@ mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_
    }
 }
 
+mtl_texture *
+mtl_new_texture_view_with_format(mtl_texture *texture, uint32_t pixel_format)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      id<MTLTexture> v =
+         [tex newTextureViewWithPixelFormat:(MTLPixelFormat)pixel_format
+                               textureType:tex.textureType
+                                    levels:NSMakeRange(0, tex.mipmapLevelCount)
+                                    slices:NSMakeRange(0, tex.arrayLength)];
+      if (!v)
+         fprintf(stderr,
+                 "[LIMINA-KK-VIEW] NIL reformat parent=%p(%lux%lu fmt=%lu usage=0x%lx) -> fmt=%lu\n",
+                 (void *)tex, (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.pixelFormat, (unsigned long)tex.usage,
+                 (unsigned long)pixel_format);
+      return (mtl_texture *)limina_mtl_note_new(v);
+   }
+}
+
 void
 mtl_texture_get_bytes(mtl_texture *texture, void *host_ptr,
                       struct mtl_texture_memory_copy *data)

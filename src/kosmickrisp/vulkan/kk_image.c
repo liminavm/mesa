@@ -1003,11 +1003,34 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
          props.sample_count == plane->layout.sample_count_sa &&
          props.texture_type == (uint32_t)plane->layout.type;
       const bool format_ok = props.pixel_format == plane->layout.format.mtl;
+
+      /* limina: an sRGB image over a linear-format imported texture is the ONE mismatch worth
+       * accepting rather than rejecting. It is exactly what the scanout path produces -- venus
+       * imports a BGRA8Unorm IOSurface (fmt 80) and the guest binds a BGRA8Unorm_sRGB image
+       * (fmt 81) to it -- and it is not the silent-wrong-render class the hard reject exists
+       * for: the two formats have identical memory layout and Metal's own texture view does
+       * the sRGB reinterpretation. Rejecting it instead left the plane with a NULL texture,
+       * whose attachment then made an attachment-less render pass and AGX aborted the whole
+       * process from inside the Metal compiler (see mtl_new_render_command_encoder_with_-
+       * descriptor and spikes/agx-compiler-abort in the limina tree).
+       *
+       * Gate it tightly: the formats must be exactly each other's linear/sRGB counterpart, and
+       * the imported texture must carry MTLTextureUsagePixelFormatView -- without that bit
+       * newTextureViewWithPixelFormat: cannot reinterpret and returns nil. Every other
+       * mismatch keeps dying loudly at bind time. */
+      const enum pipe_format linear_pipe =
+         util_format_linear(plane->layout.format.pipe);
+      const struct kk_va_format *linear_fmt =
+         linear_pipe != plane->layout.format.pipe ? kk_get_va_format(linear_pipe) : NULL;
+      const bool srgb_view_ok =
+         !format_ok && linear_fmt != NULL &&
+         props.pixel_format == (uint32_t)linear_fmt->mtl_pixel_format &&
+         (props.usage & MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW) != 0u;
       /* The texture must offer at least what the image will ask of it; extra
        * usage bits on the imported texture are harmless. */
       const bool usage_ok =
          (props.usage & (uint32_t)plane->layout.usage) == (uint32_t)plane->layout.usage;
-      if (!geometry_ok || !format_ok || !usage_ok) {
+      if (!geometry_ok || (!format_ok && !srgb_view_ok) || !usage_ok) {
          fprintf(stderr,
                  "[LIMINA-KK-IMPORT] REJECTED MTLTexture (geom=%d fmt=%d usage=%d): "
                  "tex %ux%u type=%u samples=%u lv=%u ly=%u fmt=%u usage=0x%x | image "
@@ -1037,13 +1060,26 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
 
       plane->mem = mem;
       plane->mem_offset_B = 0u;
-      plane->mtl_handle = mtl_retain(mem->bo->texture);
-      KK_TEX_CENSUS_ACQUIRE(); /* limina census: adopted import */
+      /* limina: when the import needed the sRGB reinterpretation, the plane owns the VIEW, not
+       * the imported texture -- so the rest of KK sees a handle in the image's own format, as
+       * it would for a texture it allocated itself. The view retains its parent. */
+      if (srgb_view_ok) {
+         plane->mtl_handle = mtl_new_texture_view_with_format(
+            mem->bo->texture, plane->layout.format.mtl);
+         if (plane->mtl_handle == NULL)
+            return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                             "could not reinterpret imported MTLTexture (fmt %u) as the "
+                             "image format (fmt %u)",
+                             props.pixel_format, plane->layout.format.mtl);
+      } else {
+         plane->mtl_handle = mtl_retain(mem->bo->texture);
+      }
+      KK_TEX_CENSUS_ACQUIRE(); /* limina census: adopted import (or its sRGB view) */
       plane->addr = 0u;
       fprintf(stderr,
-              "[LIMINA-KK-IMPORT] adopted MTLTexture %p for image plane: %ux%u "
+              "[LIMINA-KK-IMPORT] adopted MTLTexture %p (srgb_view=%d) for image plane: %ux%u "
               "type=%u fmt=%u usage=0x%x (image usage=0x%x linear=%u optimized=%u)\n",
-              mem->bo->texture, plane->layout.width_px, plane->layout.height_px,
+              mem->bo->texture, srgb_view_ok, plane->layout.width_px, plane->layout.height_px,
               props.texture_type, props.pixel_format, props.usage,
               (unsigned)plane->layout.usage, plane->layout.linear,
               plane->layout.optimized_layout);
