@@ -592,6 +592,12 @@ virgl_drm_winsys_resource_create_handle(struct virgl_winsys *qws,
    _mesa_hash_table_insert(qdws->bo_handles, (void *)(uintptr_t)res->bo_handle, res);
 
 done:
+   /* Also report blob_mem on a cache hit: planes of a multi-planar dma-buf
+    * share one fd and are imported last to first, so plane 0 -- the one that
+    * sends SET_TYPE -- is always a hit. */
+   if (res)
+      *blob_mem = res->blob_mem;
+
    mtx_unlock(&qdws->bo_handles_mutex);
    return res;
 }
