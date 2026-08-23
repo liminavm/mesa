@@ -592,6 +592,17 @@ virgl_drm_winsys_resource_create_handle(struct virgl_winsys *qws,
    _mesa_hash_table_insert(qdws->bo_handles, (void *)(uintptr_t)res->bo_handle, res);
 
 done:
+   /* Report the blob kind on the cache-hit paths too, not just where
+    * RESOURCE_INFO ran. A multi-planar dma-buf imports every plane from the
+    * same fd, so only the first plane allocates the virgl_hw_res; the rest hit
+    * the hash tables above. dri_create_image_from_winsys imports planes in
+    * reverse order, so plane 0 -- the only one virgl_resource_from_handle lets
+    * emit SET_TYPE -- is always a cache hit. Leaving *blob_mem at 0 there makes
+    * it look like a classic (non-blob) resource, SET_TYPE is skipped, and the
+    * host resource stays untyped: the image samples as garbage. */
+   if (res)
+      *blob_mem = res->blob_mem;
+
    mtx_unlock(&qdws->bo_handles_mutex);
    return res;
 }
