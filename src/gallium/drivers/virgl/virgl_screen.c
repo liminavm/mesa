@@ -747,6 +747,15 @@ virgl_is_format_supported( struct pipe_screen *screen,
      goto out_lookup;
    }
 
+   /* Planar YUV has no channels to inspect -- util_format describes it by its
+    * planes -- so the generic checks below would reject it out of hand and the
+    * gallium frontend would fall back to importing each plane as its own
+    * resource. Whether the host can sample the composite format is exactly
+    * what the sampler bitmask says, so go ask it. */
+   if (format_desc->layout == UTIL_FORMAT_LAYOUT_PLANAR2 ||
+       format_desc->layout == UTIL_FORMAT_LAYOUT_PLANAR3)
+      goto out_lookup;
+
    i = util_format_get_first_non_void_channel(format);
    if (i == -1)
       return false;
