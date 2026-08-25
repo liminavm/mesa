@@ -103,6 +103,7 @@ kk_files = files(
   'kk_query_table.h',
   'kk_query_table.c',
   'kk_queue.h',
+  'kk_limina_capture.c',
   'kk_queue.c',
   'kk_sampler.h',
   'kk_sampler.c',

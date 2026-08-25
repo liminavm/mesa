@@ -685,3 +685,14 @@ void mtl_render_set_stencil_store_action(mtl_render_encoder *encoder,
         [enc setStencilStoreAction:(MTLStoreAction)action];
     }
 }
+
+/* limina: see mtl_encoder.h. Labelling only the passes a triggered capture cares about keeps the
+ * Xcode frame navigator readable -- the pair under investigation shows up by name. */
+void
+mtl_render_encoder_set_label(mtl_render_encoder *encoder, const char *label)
+{
+   @autoreleasepool {
+      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
+      enc.label = [NSString stringWithUTF8String:label];
+   }
+}

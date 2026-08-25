@@ -122,6 +122,9 @@ struct kk_rendering_state {
    uint32_t color_att_count;
    struct kk_attachment color_att[KK_MAX_RTS];
    uint8_t color_map[KK_MAX_RTS];
+   /* LIMINA: the load action actually written into the Metal descriptor for each attachment,
+    * kept so cs_start_render can judge a pass against the content already in its target. */
+   uint8_t limina_load_action[KK_MAX_RTS];
    struct kk_attachment depth_att;
    struct kk_attachment stencil_att;
    struct kk_attachment fsr_att;
@@ -456,5 +459,69 @@ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 #define MESA_DISPATCH_PRECOMP kk_dispatch_precomp
 
 void kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write);
+
+
+/* LIMINA instrumentation counters (see kk_cmd_buffer.c). */
+struct kk_limina_counts {
+   uint64_t ticks;
+   uint64_t barriers;
+   uint64_t barrier_breaks_pass;
+   uint64_t render_pass_starts;
+   uint64_t render_pass_restarts;
+   /* Which branch of kk_CmdPipelineBarrier2 a barrier actually took. The three are exhaustive,
+    * so barriers == breaks_pass + pregfx + noop; a large `noop` means the barrier reached KK
+    * with no encoder open and was dropped entirely. */
+   uint64_t barrier_pregfx;
+   uint64_t barrier_noop;
+   /* Compute work (every KK copy is a compute dispatch -- there is no blit encoder) issued while
+    * a render pass is open. All such work passes pre_gfx=true, so it is submitted BEFORE the gfx
+    * command buffer that holds the draws recorded before it. */
+   uint64_t compute_during_pass_pregfx;
+   uint64_t compute_during_pass_postgfx;
+   /* Pass restarts driven by kk_flush_render_pass (color-attachment-map or sample-location
+    * change), which the barrier-path counter above never saw. */
+   uint64_t render_pass_restarts_flush;
+   /* Passes begun whose Metal color-attachment slot differs from the Vulkan attachment index,
+    * i.e. dyn->cal.color_map is not the identity. Only then can the force-LOAD loop in
+    * kk_CmdBeginRendering -- the one site that indexes the descriptor by the raw index rather
+    * than the mapped one -- write LOAD to the wrong slot. */
+   uint64_t color_map_nonidentity;
+   uint64_t color_att_seen;
+   uint64_t unroll_calls;
+   uint64_t unroll_fan;
+   uint64_t unroll_strip;
+   uint64_t unroll_other;
+   uint64_t unroll_trig_fan;
+   uint64_t unroll_trig_promote;
+   uint64_t unroll_trig_robust;
+   uint64_t unroll_trig_restart;
+   /* Passes that begin on a texture already rendered to, without loading it. Whatever was there
+    * is discarded or cleared, which is what losing a card's early rows would look like. */
+   uint64_t reload_hazard;
+   uint64_t reload_hazard_small;
+   /* Every pass start on an already-rendered texture, split by load action. */
+   uint64_t start_seen_load;
+   uint64_t start_seen_clear;
+   uint64_t start_seen_dontcare;
+   uint64_t start_fresh;
+   uint64_t start_fresh_small;
+   /* Pass ENDS that discard their colour attachment instead of storing it. The load side has been
+    * measured and exonerated; content lost at pass end is the shape still unaccounted for, and a
+    * guest-side flush is exactly what moves where passes end. */
+   uint64_t store_dontcare;
+   uint64_t store_dontcare_small;
+};
+extern struct kk_limina_counts kk_limina_counts;
+void kk_limina_counts_tick(const char *why);
+void kk_limina_note_midpass_caller(void *ret_addr);
+extern uint32_t kk_limina_heap_size;
+extern uint32_t kk_limina_heap_hiwater;
+
+enum kk_limina_barrier_mode {
+   KK_LIMINA_BARRIER_DEFAULT = 0,
+   KK_LIMINA_BARRIER_NORESTART,
+   KK_LIMINA_BARRIER_WIDEN,
+};
+enum kk_limina_barrier_mode kk_limina_barrier_mode(void);
 
 #endif

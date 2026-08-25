@@ -10,6 +10,7 @@
 #include "kk_entrypoints.h"
 
 #include "kk_buffer.h"
+#include "kk_bo.h"
 #include "kk_cmd_buffer.h"
 #include "kk_format.h"
 #include "kk_image_view.h"
@@ -128,7 +129,7 @@ kk_clear_common_attachment_description(
       descriptor, MTL_STORE_ACTION_UNKNOWN);
 }
 
-static void
+static enum mtl_load_action
 kk_fill_common_attachment_description(
    mtl_render_pass_attachment_descriptor *descriptor,
    const struct kk_attachment *info, bool force_attachment_load)
@@ -162,6 +163,8 @@ kk_fill_common_attachment_description(
                                                          load_action);
    mtl_render_pass_attachment_descriptor_set_store_action(
       descriptor, MTL_STORE_ACTION_UNKNOWN);
+
+   return load_action;
 }
 
 static struct mtl_clear_color
@@ -214,6 +217,11 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
       const struct kk_image_view *iview = color_att->iview;
       uint8_t logical_index = dyn->cal.color_map[i];
       render->color_map[i] = logical_index;
+      if (logical_index != MESA_VK_ATTACHMENT_UNUSED) {
+         kk_limina_counts.color_att_seen++;
+         if (logical_index != i)
+            kk_limina_counts.color_map_nonidentity++;
+      }
 
       if (!iview || logical_index == MESA_VK_ATTACHMENT_UNUSED) {
          continue;
@@ -228,8 +236,8 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
          container_of(iview->vk.image, struct kk_image, vk);
       render->samples = MAX2(render->samples, image->vk.samples);
 
-      kk_fill_common_attachment_description(attachment_descriptor, color_att,
-                                            force_attachment_load);
+      render->limina_load_action[i] = kk_fill_common_attachment_description(
+         attachment_descriptor, color_att, force_attachment_load);
 
       struct mtl_clear_color clear_color =
          vk_clear_color_value_to_mtl_clear_color(color_att->clear_value.color,
@@ -441,13 +449,22 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       cs_start_render(cmd);
 
    /* Store descriptor in case we need to restart the pass at pipeline barrier,
-    * but force loads */
+    * but force loads.
+    *
+    * Address the descriptor by the MAPPED slot, as kk_set_color_attachments and
+    * kk_apply_attachment_store_ops both do. dyn->cal.color_map may permute or retire attachments
+    * (VK_KHR_dynamic_rendering_local_read), and indexing by the raw attachment index instead
+    * wrote LOAD to a slot the pass does not use while the real target kept the CLEAR or
+    * DONT_CARE it was created with -- so a restarted pass discarded everything drawn before the
+    * restart and kept everything after. An attachment the map retires has no slot to force. */
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       const struct kk_image_view *iview = render->color_att[i].iview;
-      if (!iview)
+      uint8_t logical_index = render->color_map[i];
+      if (!iview || logical_index == MESA_VK_ATTACHMENT_UNUSED)
          continue;
       mtl_render_pass_attachment_descriptor *attachment_descriptor =
-         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
+         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor,
+                                                         logical_index);
       mtl_render_pass_attachment_descriptor_set_load_action(
          attachment_descriptor, MTL_LOAD_ACTION_LOAD);
    }
@@ -750,6 +767,26 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
       rects[i].height = maxy - miny;
    }
 
+   /* [LIMINA] The label offscreen's second render pass rasterises nothing (samples=0) while every
+    * GL-visible input matches the pass that works. The scissor is clamped to the render area here
+    * because Metal rejects anything outside it -- and a rect whose offset already lies past a
+    * 44-tall target collapses to a few rows or to nothing, which would produce exactly that. Log
+    * what actually reaches Metal for small targets; the GL-side box is not what zink sends. */
+   if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+       cmd->state.gfx.render.area.extent.height <= 64) {
+      for (uint32_t i = 0; i < dyn->vp.scissor_count && i < 2; i++)
+         fprintf(stderr,
+                 "[LIMINA-KK] area %ux%u+%d+%d | scissor in %d,%d %ux%u -> out %u,%u %ux%u\n",
+                 cmd->state.gfx.render.area.extent.width,
+                 cmd->state.gfx.render.area.extent.height,
+                 cmd->state.gfx.render.area.offset.x, cmd->state.gfx.render.area.offset.y,
+                 dyn->vp.scissors[i].offset.x, dyn->vp.scissors[i].offset.y,
+                 dyn->vp.scissors[i].extent.width, dyn->vp.scissors[i].extent.height,
+                 (unsigned)rects[i].x, (unsigned)rects[i].y,
+                 (unsigned)rects[i].width, (unsigned)rects[i].height);
+      fflush(stderr);
+   }
+
    mtl_render_encoder *encoder = cs_get_render(cmd);
    mtl_set_scissor_rects(encoder, rects, count);
 
@@ -769,6 +806,22 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
 
       viewports[i].znear = vp->minDepth;
       viewports[i].zfar = vp->maxDepth;
+   }
+
+   /* [LIMINA] The viewport was never compared between the pass that lands and the pass that does
+    * not, and KK flips it (originY = y + height, height = -height). A degenerate or flipped
+    * viewport maps the geometry outside the target and rasterises nothing, which is the observed
+    * symptom with everything else matching. */
+   if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+       cmd->state.gfx.render.area.extent.height <= 64) {
+      for (uint32_t i = 0; i < dyn->vp.viewport_count && i < 2; i++)
+         fprintf(stderr,
+                 "[LIMINA-KK] viewport in %.1f,%.1f %.1fx%.1f -> out %.1f,%.1f %.1fx%.1f\n",
+                 dyn->vp.viewports[i].x, dyn->vp.viewports[i].y,
+                 dyn->vp.viewports[i].width, dyn->vp.viewports[i].height,
+                 viewports[i].originX, viewports[i].originY,
+                 viewports[i].width, viewports[i].height);
+      fflush(stderr);
    }
 
    mtl_set_viewports(encoder, viewports, count);
@@ -821,6 +874,67 @@ set_empty_scissor(mtl_render_encoder *enc)
 }
 
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
+/* [LIMINA] A label's repeat render binds a different shader pair than the render that works. The
+ * generated MSL is right there on the kk_shader, so dump each distinct one once and diff them --
+ * this is the cheapest possible way to ask what the failing program does differently, and it costs
+ * no fence, which matters on a bug every synchronisation cures.
+ *
+ * KK_LIMINA_SHADER_DUMP=<dir> arms it. Each shader is written once, named by its pointer, with the
+ * pipeline-relevant bits of kk_shader_info in a header comment so the file is self-describing. */
+static void
+kk_limina_dump_shader(struct kk_shader *sh, const char *tag)
+{
+   static const char *dir;
+   static int checked;
+   static const void *dumped[64];
+   static unsigned dumped_n;
+
+   if (!checked) {
+      checked = 1;
+      dir = getenv("KK_LIMINA_SHADER_DUMP");
+   }
+   if (dir == NULL || sh == NULL)
+      return;
+
+   for (unsigned i = 0; i < dumped_n; i++)
+      if (dumped[i] == sh)
+         return;
+   if (dumped_n < 64)
+      dumped[dumped_n++] = sh;
+
+   char path[512];
+   snprintf(path, sizeof(path), "%s/%s-%p.msl", dir, tag, (void *)sh);
+   FILE *f = fopen(path, "w");
+   if (f == NULL)
+      return;
+
+   fprintf(f, "// kk_shader %p stage=%u\n", (void *)sh, (unsigned)sh->info.stage);
+   if (sh->info.stage == MESA_SHADER_VERTEX) {
+      fprintf(f,
+              "// attribs_read=0x%x outputs_written=0x%llx sample_count=%u topology=%u\n"
+              "// color_attachment_count=%u has_ms=%d has_ds=%d view_mask=0x%x\n",
+              sh->info.vs.attribs_read,
+              (unsigned long long)sh->info.vs.outputs_written, sh->info.vs.sample_count,
+              (unsigned)sh->info.vs.topology, sh->info.vs.color_attachment_count,
+              sh->info.vs.has_ms, sh->info.vs.has_ds, sh->info.vs.view_mask);
+   }
+   for (unsigned st = 0; st < MESA_SHADER_STAGES; st++) {
+      if (sh->msl_data[st].code == NULL)
+         continue;
+      fprintf(f, "\n// ---- stage %u entrypoint %s ----\n", st,
+              sh->msl_data[st].entrypoint_name ? sh->msl_data[st].entrypoint_name : "(none)");
+      fputs(sh->msl_data[st].code, f);
+   }
+   fclose(f);
+   fprintf(stderr, "[LIMINA-KK] dumped %s shader %p -> %s\n", tag, (void *)sh, path);
+   fflush(stderr);
+}
+
+static void *kk_limina_last_pipeline;
+static void *kk_limina_last_pipeline_enc;
+static void *kk_limina_last_vs;
+static void *kk_limina_last_fs;
+
 #define IS_SHADER_DIRTY(bit)                                                   \
    (cmd->state.dirty_shaders & BITFIELD_BIT(MESA_SHADER_##bit))
 
@@ -935,6 +1049,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
       }
 
       cs_end(cmd);
+      kk_limina_counts.render_pass_restarts_flush++;
       kk_cmd_buffer_dirty_all_gfx(cmd);
       cmd->state.gfx.need_to_start_render_pass = true;
    }
@@ -967,6 +1082,21 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
    if (IS_SHADER_DIRTY(VERTEX)) {
       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
       mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+      /* [LIMINA] Remember WHICH encoder this pipeline was bound on. A fresh Metal encoder starts
+       * with no pipeline state, and this bind is dirty-tracked -- so a pass that draws on an
+       * encoder the pipeline was never bound on would rasterise nothing while every other state
+       * we can read matches the pass that worked. cs_start_render does dirty everything, but that
+       * is the claim under test, not the evidence. */
+      kk_limina_last_pipeline = vs->pipeline.gfx.render;
+      kk_limina_last_pipeline_enc = enc;
+      /* [LIMINA] The failing pass binds a DIFFERENT Metal pipeline than the pass that works, for
+       * the same label. Name where each one came from: the same kk_shader can hold more than one
+       * compiled Metal pipeline, so "which shader" and "which of its pipelines" are separate
+       * questions and only the pair identifies the object. */
+      kk_limina_last_vs = vs;
+      kk_limina_last_fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+      kk_limina_dump_shader(vs, "vs");
+      kk_limina_dump_shader(cmd->state.shaders[MESA_SHADER_FRAGMENT], "fs");
       if (gfx->depth_stencil_state)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
@@ -1009,6 +1139,9 @@ kk_init_heap(const void *data)
       .base = dev->heap->gpu + sizeof(struct poly_heap),
       .size = size - sizeof(struct poly_heap),
    };
+
+   dev->limina_heap_bottom = (volatile uint32_t *)&map->bottom;
+   kk_limina_heap_size = map->size;
 }
 
 static uint64_t
@@ -1018,13 +1151,41 @@ kk_heap(struct kk_cmd_buffer *cmd)
 
    util_call_once_data(&dev->heap_init_once, kk_init_heap, cmd);
 
+   /* Sample the bump pointer from the CPU on every use rather than only at a counter tick, so
+    * the high-water mark is built from many observations instead of two. */
+   if (dev->limina_heap_bottom) {
+      uint32_t cur = *dev->limina_heap_bottom;
+      if (cur > kk_limina_heap_hiwater)
+         kk_limina_heap_hiwater = cur;
+   }
+
    /* We need to free all allocations after each command buffer execution */
    if (!cmd->uses_heap) {
       uint64_t addr = dev->heap->gpu;
 
+      /* LIMINA A/B lever, KK_LIMINA_HEAP_NORESET=1: skip the reset entirely.
+       *
+       * The reset is issued through kk_cmd_write, which passes pre_gfx = !cmd->gfx.encoder --
+       * so while a render pass is open it lands in post_gfx and is submitted AFTER the draws,
+       * while the unroll allocations feeding those draws are hoisted to pre_gfx and submitted
+       * BEFORE them. If a reset ever lands on top of allocations still being consumed, the
+       * bump pointer restarts and two draws share one index range: the earlier draw's geometry
+       * is overwritten while the later one is intact -- the shape of the corruption. Dropping
+       * the reset makes every allocation unique. The heap then fills and overflows loudly
+       * (poly_heap_alloc_offs printf+aborts), so this is a diagnostic, never a fix. */
+      static int noreset = -1;
+      if (unlikely(noreset < 0)) {
+         const char *env = getenv("KK_LIMINA_HEAP_NORESET");
+         noreset = env && strcmp(env, "0") != 0;
+         fprintf(stderr, "[LIMINA] KK poly-heap reset %s\n",
+                 noreset ? "SUPPRESSED (KK_LIMINA_HEAP_NORESET)" : "on (default)");
+         fflush(stderr);
+      }
+
       /* Zeroing the allocated index frees everything */
-      kk_cmd_write(cmd, (struct libkk_imm_write){
-                           addr + offsetof(struct poly_heap, bottom), 0});
+      if (!noreset)
+         kk_cmd_write(cmd, (struct libkk_imm_write){
+                              addr + offsetof(struct poly_heap, bottom), 0});
 
       cmd->uses_heap = true;
    }
@@ -1408,6 +1569,15 @@ kk_predicate_draws(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    assert(data->predicate_count);
 
+   kk_limina_counts.unroll_calls++;
+   if (data->prim == MESA_PRIM_TRIANGLE_FAN)
+      kk_limina_counts.unroll_fan++;
+   else if (data->prim == MESA_PRIM_TRIANGLE_STRIP ||
+            data->prim == MESA_PRIM_LINE_STRIP)
+      kk_limina_counts.unroll_strip++;
+   else
+      kk_limina_counts.unroll_other++;
+
    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
       return false;
 
@@ -1471,6 +1641,15 @@ static bool
 kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   kk_limina_counts.unroll_calls++;
+   if (data->prim == MESA_PRIM_TRIANGLE_FAN)
+      kk_limina_counts.unroll_fan++;
+   else if (data->prim == MESA_PRIM_TRIANGLE_STRIP ||
+            data->prim == MESA_PRIM_LINE_STRIP)
+      kk_limina_counts.unroll_strip++;
+   else
+      kk_limina_counts.unroll_other++;
 
    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
       return false;
@@ -1640,6 +1819,24 @@ requires_index_promotion(const struct kk_draw_command *data)
     * valid indices from being treated as restarts. For uint32_t indices with
     * restart disabled, we realistically will never have enough vertices for the
     * restart index to be valid anyway. */
+   /* LIMINA A/B lever, KK_LIMINA_NO_PROMOTE=1: skip the restart-disabled promotion below, so
+    * that together with LIMINA_ZINK_NO_FANS the geometry-unroll path carries no traffic at all
+    * and can be tested as a whole. The uint8 promotion above is left alone -- those indices have
+    * no hardware support, and dropping them would break rendering outright rather than tell us
+    * anything. Skipping this one only misreads geometry that actually contains 0xFFFF as a
+    * restart; a desktop's meshes do not, which makes it sound enough to measure with and still
+    * not a fix. */
+   static int nopromote = -1;
+   if (unlikely(nopromote < 0)) {
+      const char *env = getenv("KK_LIMINA_NO_PROMOTE");
+      nopromote = env && strcmp(env, "0") != 0;
+      fprintf(stderr, "[LIMINA] KK index promotion (restart-disabled) %s\n",
+              nopromote ? "SUPPRESSED (KK_LIMINA_NO_PROMOTE)" : "on (default)");
+      fflush(stderr);
+   }
+   if (nopromote)
+      return false;
+
    switch (data->prim) {
    case MESA_PRIM_LINE_STRIP:
    case MESA_PRIM_TRIANGLE_STRIP:
@@ -2286,6 +2483,40 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    kk_flush_gfx_state(cmd);
 
+   /* [LIMINA] The one input still unread when a label's second render pass rasterises nothing.
+    * Every GL-side attempt to read the geometry aborted the worker, but the vertex binding is
+    * plain state here -- an address and a range, with no synchronisation needed to look at it,
+    * which is what made every GL probe either fatal or curative. */
+   if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+       cmd->state.gfx.render.area.extent.height <= 64) {
+      {
+         const float *v = kk_limina_addr_to_cpu(cmd->state.gfx.vb.addr_range[0].addr);
+         const unsigned char *ix = kk_limina_addr_to_cpu(data->index_buffer.addr);
+
+         if (v)
+            fprintf(stderr,
+                    "[LIMINA-KK] geom v=%.1f,%.1f %.1f,%.1f %.1f,%.1f %.1f,%.1f | idx %u %u %u\n",
+                    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                    ix ? ix[0] : 999u, ix ? ix[1] : 999u, ix ? ix[2] : 999u);
+         else
+            fprintf(stderr, "[LIMINA-KK] geom UNRESOLVED addr=0x%llx\n",
+                    (unsigned long long)cmd->state.gfx.vb.addr_range[0].addr);
+      }
+      fprintf(stderr,
+              "[LIMINA-KK] draw area %ux%u vb0 addr=0x%llx range=%llu vb1 addr=0x%llx range=%llu"
+              " ib addr=0x%llx range=%llu elsz=%u indexed=%d draws=%u\n",
+              cmd->state.gfx.render.area.extent.width,
+              cmd->state.gfx.render.area.extent.height,
+              (unsigned long long)cmd->state.gfx.vb.addr_range[0].addr,
+              (unsigned long long)cmd->state.gfx.vb.addr_range[0].range,
+              (unsigned long long)cmd->state.gfx.vb.addr_range[1].addr,
+              (unsigned long long)cmd->state.gfx.vb.addr_range[1].range,
+              (unsigned long long)data->index_buffer.addr,
+              (unsigned long long)data->index_buffer.range,
+              data->index_buffer_el_size_B, data->indexed ? 1 : 0, data->draw_count);
+      fflush(stderr);
+   }
+
    data->restart = cmd->vk.dynamic_graphics_state.ia.primitive_restart_enable;
    data->restart_index =
       cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
@@ -2298,10 +2529,27 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    /* Unroll geometry. Skip draw if we fail. No need to unroll if tessellation
     * is present since it also handles unrolling. */
-   bool requires_unroll = !tess && (data->prim == MESA_PRIM_TRIANGLE_FAN ||
-                                    requires_index_promotion(data) ||
-                                    requires_unroll_robustness(cmd, data) ||
-                                    requires_unroll_restart(cmd, data));
+   /* LIMINA: attribute each unroll to the trigger that demanded it. "fan" and "promotion" are
+    * properties of the draw; robustness and restart are properties of state, and only the first
+    * matching trigger is charged, so the buckets sum to unroll_calls. */
+   bool trig_fan = data->prim == MESA_PRIM_TRIANGLE_FAN;
+   bool trig_promote = !trig_fan && requires_index_promotion(data);
+   bool trig_robust =
+      !trig_fan && !trig_promote && requires_unroll_robustness(cmd, data);
+   bool trig_restart = !trig_fan && !trig_promote && !trig_robust &&
+                       requires_unroll_restart(cmd, data);
+   bool requires_unroll =
+      !tess && (trig_fan || trig_promote || trig_robust || trig_restart);
+   if (requires_unroll) {
+      if (trig_fan)
+         kk_limina_counts.unroll_trig_fan++;
+      else if (trig_promote)
+         kk_limina_counts.unroll_trig_promote++;
+      else if (trig_robust)
+         kk_limina_counts.unroll_trig_robust++;
+      else
+         kk_limina_counts.unroll_trig_restart++;
+   }
    if (requires_unroll && !kk_unroll_geometry(cmd, data))
       return;
 
@@ -2331,6 +2579,51 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
       if (tess)
          draw_data = kk_launch_tess(cmd, draw_data);
+      /* [LIMINA] Reached the actual encode, past every early return in kk_draw -- the predicate
+       * path and the geometry unroll both bail out silently, and a draw that never gets here
+       * would look exactly like one that rasterises nothing. */
+      if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+          cmd->state.gfx.render.area.extent.height <= 64)
+         /* [LIMINA] Which texture is this draw's colour attachment, at the moment it is
+          * encoded? Every other dimension of the two passes now matches exactly, so the last
+          * distinct possibility is that the draw is landing in a pass attached to something other
+          * than the label it is supposed to fill. */
+         {
+            const struct kk_rendering_state *r = &cmd->state.gfx.render;
+            const void *att = (r->color_att_count > 0 && r->color_att[0].iview)
+                                 ? r->color_att[0].iview->planes[0].mtl_handle_render
+                                 : NULL;
+
+            mtl_render_encoder *denc = cs_get_render(cmd);
+            fprintf(stderr,
+                    "[LIMINA-KK] dispatch attachment=%p count=%u pipeline=%p bound_on=%p enc=%p%s\n",
+                    att, r->color_att_count, kk_limina_last_pipeline,
+                    kk_limina_last_pipeline_enc, denc,
+                    denc == kk_limina_last_pipeline_enc ? "" : "  <-- PIPELINE NOT BOUND ON THIS ENCODER");
+            /* [LIMINA] Metal bakes the primitive topology CLASS into the pipeline, so a draw
+             * whose live topology belongs to a different class than the pipeline was compiled for
+             * is the shape that rasterises nothing while every other state matches. Print both. */
+            {
+               const struct vk_dynamic_graphics_state *dy = &cmd->vk.dynamic_graphics_state;
+               unsigned live = dy->ia.primitive_topology;
+               unsigned live_class =
+                  vk_primitive_topology_to_mtl_primitive_topology_class(live);
+               unsigned baked = kk_limina_last_vs
+                  ? ((struct kk_shader *)kk_limina_last_vs)->info.vs.topology : 99u;
+               fprintf(stderr,
+                       "[LIMINA-KK] dispatch topology live=%u class=%u baked=%u%s\n",
+                       live, live_class, baked,
+                       live_class == baked ? "" : "  <-- CLASS MISMATCH");
+            }
+            fprintf(stderr, "[LIMINA-KK] dispatch vs=%p fs=%p samples=%u fmt0=%u\n",
+                    kk_limina_last_vs, kk_limina_last_fs,
+                    (unsigned)cmd->state.gfx.render.samples,
+                    (r->color_att_count > 0 && r->color_att[0].iview)
+                       ? (unsigned)r->color_att[0].iview->vk.format : 0u);
+            fprintf(stderr, "[LIMINA-KK] dispatch area %ux%u\n",
+                    cmd->state.gfx.render.area.extent.width,
+                    cmd->state.gfx.render.area.extent.height);
+         }
       kk_dispatch_draw(cmd, draw_data);
 
       if (xfb_track)

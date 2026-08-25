@@ -1335,6 +1335,16 @@ zink_is_format_supported(struct pipe_screen *pscreen,
              vk_sample_count_flags(sample_count);
 
    if (bind & PIPE_BIND_INDEX_BUFFER) {
+      /* LIMINA A/B lever, LIMINA_ZINK_NO_FANS=1 also refuses 8-bit index buffers. On
+       * KosmicKrisp a uint8 index buffer has no hardware support and is promoted by a GPU
+       * geometry-unroll dispatch, which is the same hoisted-ahead-of-the-pass path fans take.
+       * Refusing the format here makes gallium hand down 16-bit indices instead, so the two
+       * levers together leave the unroll path with no traffic at all. */
+      if (format == PIPE_FORMAT_R8_UINT) {
+         const char *env = getenv("LIMINA_ZINK_NO_FANS");
+         if (env && strcmp(env, "0") != 0)
+            return false;
+      }
       if (format == PIPE_FORMAT_R8_UINT &&
           !screen->info.have_EXT_index_type_uint8)
          return false;
@@ -3424,6 +3434,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    glsl_type_singleton_init_or_ref();
    zink_debug = debug_get_option_zink_debug();
+   /* LIMINA: announce the parsed flags on stderr. mesa's own GALLIUM_PRINT_OPTIONS path goes
+    * through debug_printf(), which compiles to nothing in a non-DEBUG build, so a ZINK_DEBUG
+    * A/B arm had no way to prove the flag was actually applied. An unverifiable lever is worse
+    * than no lever -- this makes every zink arm self-evidencing in the worker log. */
+   fprintf(stderr, "[LIMINA] ZINK_DEBUG = 0x%llx (%s)\n",
+           (unsigned long long)zink_debug, getenv("ZINK_DEBUG") ? getenv("ZINK_DEBUG") : "<unset>");
+   fflush(stderr);
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_AUTO)
       zink_descriptor_mode = debug_get_option_zink_descriptor_mode();
 
@@ -3658,6 +3675,19 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       goto fail;
 
    screen->have_triangle_fans = true;
+   /* LIMINA A/B lever, LIMINA_ZINK_NO_FANS=1: claim the driver cannot do triangle fans, so zink
+    * lowers them itself instead of passing them down. On KosmicKrisp every fan becomes a GPU
+    * geometry-unroll dispatch that is hoisted ahead of the render pass; this removes that traffic
+    * at the source so the whole unroll path can be tested wholesale rather than hazard by
+    * hazard. Diagnostic only -- it trades a driver fast path for zink's CPU lowering. */
+   {
+      const char *env = getenv("LIMINA_ZINK_NO_FANS");
+      if (env && strcmp(env, "0") != 0) {
+         screen->have_triangle_fans = false;
+         fprintf(stderr, "[LIMINA] zink triangle fans DISABLED (LIMINA_ZINK_NO_FANS)\n");
+         fflush(stderr);
+      }
+   }
 #if defined(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)
    if (screen->info.have_KHR_portability_subset) {
       screen->have_triangle_fans = (VK_TRUE == screen->info.portability_subset_feats.triangleFans);

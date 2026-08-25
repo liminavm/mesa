@@ -67,6 +67,10 @@ void mtl_dispatch_threadgroups_with_indirect_buffer(
 mtl_render_encoder *mtl_new_render_command_encoder_with_descriptor(
    mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor);
 
+/* limina: name a render encoder so a triggered GPU capture is navigable in Xcode -- the
+ * interesting pass is otherwise one unlabelled encoder among hundreds. */
+void mtl_render_encoder_set_label(mtl_render_encoder *encoder, const char *label);
+
 void mtl_set_viewports(mtl_render_encoder *encoder,
                        struct mtl_viewport *viewports, uint32_t count);
 

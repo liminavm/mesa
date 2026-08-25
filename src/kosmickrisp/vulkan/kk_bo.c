@@ -40,6 +40,29 @@
  * Cost: two atomics on a path that already creates a Metal heap. The env read is cached —
  * a getenv on a hot path takes the environ lock and has twice cost us real throughput.
  */
+/* [LIMINA] A debug-only GPU-address -> CPU-pointer registry.
+ *
+ * Metal buffers are CPU-visible, so the geometry a draw fetches can be read with NO
+ * synchronisation. That matters here because every GL-side attempt to read it either aborted the
+ * worker or cured the bug being measured. The only missing piece was turning the GPU address in a
+ * vertex binding back into a pointer. Racy by construction and never pruned; it exists to answer
+ * one question. */
+struct kk_limina_bo_rec kk_limina_bos[KK_LIMINA_BO_MAX];
+unsigned kk_limina_bo_n;
+
+void *
+kk_limina_addr_to_cpu(uint64_t addr)
+{
+   unsigned n = kk_limina_bo_n;
+
+   for (unsigned i = 0; i < n && i < KK_LIMINA_BO_MAX; i++) {
+      if (kk_limina_bos[i].cpu && addr >= kk_limina_bos[i].gpu &&
+          addr < kk_limina_bos[i].gpu + kk_limina_bos[i].size)
+         return (char *)kk_limina_bos[i].cpu + (addr - kk_limina_bos[i].gpu);
+   }
+   return NULL;
+}
+
 static atomic_ullong kk_bo_census_alloc, kk_bo_census_free;
 static atomic_ullong kk_bo_census_live_B, kk_bo_census_peak_B;
 /* MTLTextures are minted on a different path from BOs (kk_image_plane_create_texture, plus
@@ -168,6 +191,14 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
    bo->map = map;
    bo->gpu = mtl_buffer_get_gpu_address(map);
    bo->cpu = mtl_get_contents(map);
+
+   if (bo->cpu && kk_limina_bo_n < KK_LIMINA_BO_MAX) {
+      unsigned slot = kk_limina_bo_n++;
+
+      kk_limina_bos[slot].gpu = bo->gpu;
+      kk_limina_bos[slot].size = size_B;
+      kk_limina_bos[slot].cpu = bo->cpu;
+   }
 
    kk_device_add_heap_to_residency_set(dev, handle);
 

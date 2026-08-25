@@ -914,6 +914,46 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       }
    }
 
+   /* [LIMINA] KK_LIMINA_SHADER_DUMP: write the NIR that goes IN, keyed by the same kk_shader
+    * pointer the MSL dump uses, so input and output can be diffed per shader.
+    *
+    * This is the decisive question for the notification-text spike. The primitive topology class
+    * is pipeline state, not shader source, so if zink hands KK the same NIR for the render that
+    * works and the render that produces nothing, everything that differs was introduced by KK's
+    * own topology-specialised code generation -- and the search collapses to one translation
+    * unit. If the NIR already differs, the answer is upstream, in zink or the guest. */
+   {
+      const char *dumpdir = getenv("KK_LIMINA_SHADER_DUMP");
+      if (unlikely(dumpdir != NULL)) {
+         char path[512];
+         snprintf(path, sizeof(path), "%s/nir-%p-stage%u.nir", dumpdir, (void *)shader,
+                  (unsigned)stage);
+         FILE *f = fopen(path, "w");
+         if (f != NULL) {
+            /* The NIR here is post vertex-input lowering, so an attribute fetched as 32x2 in one
+             * compile and 32x3 in another came from a different vk_vertex_input_state, not from
+             * different SPIR-V. Record that state next to the NIR so the two are attributable. */
+            if (state != NULL && state->vi != NULL) {
+               fprintf(f, "// vi attributes_valid=0x%x bindings_valid=0x%x\n",
+                       state->vi->attributes_valid, state->vi->bindings_valid);
+               u_foreach_bit(a, state->vi->attributes_valid)
+                  fprintf(f, "// vi attr[%u] binding=%u format=%u offset=%u\n", a,
+                          state->vi->attributes[a].binding,
+                          (unsigned)state->vi->attributes[a].format,
+                          state->vi->attributes[a].offset);
+               u_foreach_bit(b, state->vi->bindings_valid)
+                  fprintf(f, "// vi binding[%u] stride=%u input_rate=%u\n", b,
+                          state->vi->bindings[b].stride,
+                          (unsigned)state->vi->bindings[b].input_rate);
+            } else {
+               fprintf(f, "// vi (none: dynamic vertex input)\n");
+            }
+            nir_print_shader(nir, f);
+            fclose(f);
+         }
+      }
+   }
+
    struct msl_compile_data *data = &shader->msl_data[stage];
    data->code = nir_to_msl(nir, &translate_options);
    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
@@ -1248,6 +1288,26 @@ gather_graphics_pipeline_create_info(
 
    info->vs.topology =
       vk_primitive_topology_to_mtl_primitive_topology_class(topology);
+
+   /* LIMINA A/B lever, KK_LIMINA_FORCE_TOPO_UNSPEC=1: compile every graphics pipeline for the
+    * UNSPECIFIED topology class, which Metal treats as permissive.
+    *
+    * A notification label's two renders differ in exactly this: the render that WORKS is compiled
+    * UNSPECIFIED (its shader was created while the topology was a fan), the render that produces
+    * nothing is compiled TRIANGLE. Same live topology at draw time in both. If forcing the
+    * permissive class cures the card, the fault is in the topology-specialised codegen and not
+    * anywhere the previous weeks looked. Not a fix -- it discards a specialisation Metal wants. */
+   {
+      static int force = -1;
+      if (unlikely(force < 0)) {
+         force = getenv("KK_LIMINA_FORCE_TOPO_UNSPEC") != NULL;
+         fprintf(stderr, "[LIMINA] KK pipeline topology class %s\n",
+                 force ? "FORCED to UNSPECIFIED (KK_LIMINA_FORCE_TOPO_UNSPEC)" : "as derived");
+         fflush(stderr);
+      }
+      if (force)
+         info->vs.topology = MTL_PRIMITIVE_TOPOLOGY_CLASS_UNSPECIFIED;
+   }
 }
 
 static VkResult

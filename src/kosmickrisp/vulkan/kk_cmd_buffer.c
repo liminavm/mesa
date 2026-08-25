@@ -7,10 +7,14 @@
 
 #include "kk_cmd_buffer.h"
 
+#include <dlfcn.h>
+
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_entrypoints.h"
+#include "kk_image_view.h"
+#include "kk_limina_capture.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_command_buffer.h"
@@ -299,14 +303,130 @@ kk_can_ignore_barrier(VkAccessFlags2 access, VkPipelineStageFlags2 stage)
    return (!(access ^ ignore_access)) || (!(stage ^ ignore_stage));
 }
 
+/* LIMINA instrumentation: has this texture ever been a render target before?
+ *
+ * Ordering is exhausted as an explanation, so the question becomes what a pass ENCODES rather
+ * than when it runs. A pass that begins on a texture already containing drawing, with a load
+ * action of CLEAR or DONT_CARE, discards that drawing -- which is precisely the shape of a card
+ * keeping its background and its later rows while losing its header and title.
+ *
+ * An open-addressing set of texture pointers, never emptied: it only ever answers "seen before",
+ * and a stale entry for a freed texture is harmless here (it can only make the detector more
+ * suspicious, and false hits are cheap to check by hand). */
+#define KK_LIMINA_SEEN_BITS 14u
+#define KK_LIMINA_SEEN_SIZE (1u << KK_LIMINA_SEEN_BITS)
+static const void *kk_limina_seen[KK_LIMINA_SEEN_SIZE];
+
+static bool
+kk_limina_seen_texture(const void *tex)
+{
+   uintptr_t h = (uintptr_t)tex;
+   h = (h >> 4) * 2654435761u;
+   for (unsigned probe = 0; probe < 64u; ++probe) {
+      unsigned i = (unsigned)((h + probe) & (KK_LIMINA_SEEN_SIZE - 1u));
+      if (kk_limina_seen[i] == tex)
+         return true;
+      if (kk_limina_seen[i] == NULL) {
+         kk_limina_seen[i] = tex;
+         return false;
+      }
+   }
+   /* Table full along this probe run: report "seen" so a miss is never invented. */
+   return true;
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
+   kk_limina_counts.render_pass_starts++;
+   kk_limina_counts_tick("rp");
+
+   {
+      struct kk_rendering_state *r = &cmd->state.gfx.render;
+      for (uint32_t i = 0; i < r->color_att_count; i++) {
+         const struct kk_image_view *iview = r->color_att[i].iview;
+         if (!iview || r->color_map[i] == MESA_VK_ATTACHMENT_UNUSED)
+            continue;
+
+         const void *tex = iview->planes[0].mtl_handle_render;
+         enum mtl_load_action load = r->limina_load_action[i];
+         bool seen = kk_limina_seen_texture(tex);
+
+         /* limina: count this pass for the triggered GPU capture while the extent is in hand. */
+         kk_limina_capture_note_pass(iview->vk.extent.width, iview->vk.extent.height, tex);
+
+         if (!seen) {
+            /* A label offscreen is created per card, so its first pass is ALWAYS a fresh
+             * attachment -- which means the one bucket the missing text lives in was being
+             * counted and then skipped. Split it by size so a new label or icon is separable
+             * from a new full-surface target. */
+            kk_limina_counts.start_fresh++;
+            if (iview->vk.extent.width <= 512u && iview->vk.extent.height <= 512u)
+               kk_limina_counts.start_fresh_small++;
+            continue;
+         }
+
+         if (load == MTL_LOAD_ACTION_LOAD) {
+            kk_limina_counts.start_seen_load++;
+            continue;
+         }
+
+         if (load == MTL_LOAD_ACTION_CLEAR)
+            kk_limina_counts.start_seen_clear++;
+         else
+            kk_limina_counts.start_seen_dontcare++;
+
+         kk_limina_counts.reload_hazard++;
+
+         /* LIMINA A/B lever, KK_LIMINA_FORCE_LOAD=1: begin the pass by loading the target
+          * instead of clearing or discarding it. Detecting these says little on its own --
+          * clearing a reused offscreen before redrawing it is ordinary -- so turn the detector
+          * into an arm. If the corruption survives every attachment keeping its previous
+          * contents, then nothing is being discarded that should have been kept, and content
+          * loss at pass start is out. Not a fix: it leaves stale pixels wherever a clear was
+          * genuinely intended. */
+         static int force_load = -1;
+         if (unlikely(force_load < 0)) {
+            const char *env = getenv("KK_LIMINA_FORCE_LOAD");
+            force_load = !env || !strcmp(env, "0") ? 0
+                         : !strcmp(env, "small")   ? 2
+                                                   : 1;
+            fprintf(stderr, "[LIMINA] KK pass-start load %s\n",
+                    force_load == 2 ? "FORCED to LOAD on small drawn targets "
+                                      "(KK_LIMINA_FORCE_LOAD=small)"
+                    : force_load ? "FORCED to LOAD on all drawn targets (KK_LIMINA_FORCE_LOAD)"
+                                 : "as encoded (default)");
+            fflush(stderr);
+         }
+         /* =1 on every drawn target is unusable as a measurement: card backgrounds stop being
+          * cleared, previous frames pile up inside them, and the leftover ink reads as a healthy
+          * header -- a clean 0/20 that pixel inspection shows is stale text drawn twice over. So
+          * =small restricts the force to the offscreen size class a label or icon uses, where a
+          * discarded target would actually explain the missing rows, and leaves the large
+          * surfaces to clear as encoded. */
+         bool small = iview->vk.extent.width <= 512u && iview->vk.extent.height <= 512u;
+         if (force_load == 1 || (force_load == 2 && small)) {
+            mtl_render_pass_attachment_descriptor_set_load_action(
+               mtl_render_pass_descriptor_get_color_attachment(
+                  cmd->state.gfx.render_pass_descriptor, r->color_map[i]),
+               MTL_LOAD_ACTION_LOAD);
+         }
+         /* A card's label and icon offscreens are small; the scanout is not. Splitting them
+          * keeps a full-surface clear -- which is normal and expected every frame -- from
+          * drowning out the case that matters. */
+         if (iview->vk.extent.width <= 512u && iview->vk.extent.height <= 512u)
+            kk_limina_counts.reload_hazard_small++;
+      }
+   }
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    struct kk_graphics_state *state = &cmd->state.gfx;
    uint32_t view_mask = state->render.view_mask;
    assert(state->render_pass_descriptor);
 
+   /* limina: the only place a triggered GPU capture may open. Metal records at the API layer and
+    * only sees command buffers CREATED after startCapture, so the hook has to sit before the
+    * creation below -- one line later and the capture would silently omit this command buffer. */
+   kk_limina_capture_cmdbuf_begin(dev);
    cmd->gfx.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
    if (!kk_encoder_begin(cmd, &cmd->gfx, KK_ALLOC_CLASS_RENDER)) {
       mtl_release(cmd->gfx.cmd_buf);
@@ -316,6 +436,13 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    }
    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
       cmd->gfx.cmd_buf, state->render_pass_descriptor);
+
+   /* limina: name the encoder when this pass is one the triggered capture is hunting, so the
+    * working/failing pair is findable by name in Xcode rather than by scrubbing every encoder. */
+   if (unlikely(kk_limina_capture_pending_label[0] != '\0')) {
+      mtl_render_encoder_set_label(cmd->gfx.encoder, kk_limina_capture_pending_label);
+      kk_limina_capture_pending_label[0] = '\0';
+   }
 
    uint32_t layer_ids[KK_MAX_MULTIVIEW_VIEW_COUNT] = {};
    uint32_t count = 0u;
@@ -362,6 +489,7 @@ kk_start_compute_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
                          mtl_device *handle,
                          mtl_argument_table *argument_table)
 {
+   kk_limina_capture_cmdbuf_begin(kk_cmd_buffer_device(cmd));
    es->cmd_buf = mtl_new_command_buffer(handle);
    if (!kk_encoder_begin(cmd, es, KK_ALLOC_CLASS_COMPUTE)) {
       mtl_release(es->cmd_buf);
@@ -379,6 +507,18 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    mtl_compute_encoder *encoder;
+   if (cmd->gfx.encoder) {
+      /* pre_gfx while a pass is open is the dangerous route: cs_end submits pre_gfx BEFORE the
+       * gfx command buffer, so this work overtakes draws recorded earlier in the same pass.
+       * post_gfx is the safe-by-design route. Vulkan forbids copies and dispatches inside a
+       * render pass, so conformant traffic should only ever reach post_gfx here. */
+      if (pre_gfx) {
+         kk_limina_counts.compute_during_pass_pregfx++;
+         kk_limina_note_midpass_caller(__builtin_return_address(1));
+      }
+      else
+         kk_limina_counts.compute_during_pass_postgfx++;
+   }
    /* If we are not inside a render, we can just take pre_gfx. */
    if (!cmd->gfx.encoder || pre_gfx) {
       if (!cmd->pre_gfx->encoder) {
@@ -461,27 +601,195 @@ kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd, uint64_t addr)
    cmd->state.root_addr = addr;
 }
 
+/* LIMINA A/B lever for kk_CmdPipelineBarrier2, read once from KK_LIMINA_BARRIER. Both arms are
+ * deliberately off by default: `norestart` is not generally correct (input attachments read as
+ * textures need the pass break) and `widen` is a blunt over-synchronisation. They exist to split
+ * "KK delivers the ordering zink asks for" from "KK drops or mis-scopes it". */
+enum kk_limina_barrier_mode
+kk_limina_barrier_mode(void)
+{
+   static int mode = -1;
+   if (unlikely(mode < 0)) {
+      const char *env = getenv("KK_LIMINA_BARRIER");
+      if (env && !strcmp(env, "norestart"))
+         mode = KK_LIMINA_BARRIER_NORESTART;
+      else if (env && !strcmp(env, "widen"))
+         mode = KK_LIMINA_BARRIER_WIDEN;
+      else
+         mode = KK_LIMINA_BARRIER_DEFAULT;
+      /* Self-evidencing: an arm whose engagement cannot be observed in the log is worse than no
+       * arm at all -- a silent no-op reads exactly like a clean exoneration. */
+      fprintf(stderr, "[LIMINA] KK barrier mode = %s\n",
+              mode == KK_LIMINA_BARRIER_NORESTART ? "norestart (pass restart SUPPRESSED)"
+              : mode == KK_LIMINA_BARRIER_WIDEN   ? "widen (pre_gfx barrier scope = ALL)"
+                                                  : "default");
+      fflush(stderr);
+   }
+   return mode;
+}
+
+/* LIMINA instrumentation: the GPU-side bump allocator behind geometry unrolling. There is one
+ * 128 MiB heap per device, its `bottom` is a plain uint32 in a CPU-mapped BO, and it is reset by
+ * zeroing that word. The reset is issued through kk_cmd_write, which routes to post_gfx while a
+ * render pass is open -- so the reset is submitted AFTER the draws, while the allocations that
+ * feed them are hoisted to pre_gfx and submitted BEFORE. Reading the watermark says whether that
+ * ever actually runs the heap dry, rather than leaving it to argument. */
+uint32_t kk_limina_heap_size;
+uint32_t kk_limina_heap_hiwater;
+
+/* LIMINA instrumentation: attribute the compute work that is issued with pre_gfx=true while a
+ * render pass is open. That route is the interesting one -- cs_end submits pre_gfx BEFORE the gfx
+ * command buffer, so the work overtakes draws already recorded in the same pass. Vulkan forbids
+ * copies and dispatches inside a render pass, so a large count here must come from KK's own
+ * draw-time helpers rather than from client traffic; dladdr says which. */
+#define KK_LIMINA_CALLERS 12
+static struct {
+   const void *addr;
+   const char *name;
+   uint64_t count;
+} kk_limina_midpass[KK_LIMINA_CALLERS];
+
+void
+kk_limina_note_midpass_caller(void *ret_addr)
+{
+   for (unsigned i = 0; i < KK_LIMINA_CALLERS; ++i) {
+      if (kk_limina_midpass[i].addr == ret_addr) {
+         kk_limina_midpass[i].count++;
+         return;
+      }
+      if (kk_limina_midpass[i].addr == NULL) {
+         Dl_info info;
+         kk_limina_midpass[i].addr = ret_addr;
+         kk_limina_midpass[i].name =
+            dladdr(ret_addr, &info) && info.dli_sname ? info.dli_sname : "?";
+         kk_limina_midpass[i].count = 1u;
+         return;
+      }
+   }
+}
+
+static void
+kk_limina_print_midpass_callers(void)
+{
+   for (unsigned i = 0; i < KK_LIMINA_CALLERS; ++i) {
+      if (kk_limina_midpass[i].addr == NULL)
+         break;
+      fprintf(stderr, "[LIMINA]   midpass pre_gfx caller: %-44s %llu\n",
+              kk_limina_midpass[i].name,
+              (unsigned long long)kk_limina_midpass[i].count);
+   }
+}
+
+/* LIMINA instrumentation: which KK paths a workload actually exercises. Printed periodically
+ * rather than per event -- the point is the ratio, not a trace. */
+struct kk_limina_counts kk_limina_counts;
+
+void
+kk_limina_counts_tick(const char *why)
+{
+   static uint64_t last;
+   uint64_t n = ++kk_limina_counts.ticks;
+   if (n > 3u && n - last < 2000u)
+      return;
+   last = n;
+   fprintf(stderr,
+           "[LIMINA] KK counts: barriers=%llu (breaks_pass=%llu pregfx=%llu noop=%llu) "
+           "render_pass_starts=%llu restarts=%llu/%llu(flush) "
+           "compute_during_pass=%llu/%llu(pregfx) color_map_nonidentity=%llu/%llu (%s)\n",
+           (unsigned long long)kk_limina_counts.barriers,
+           (unsigned long long)kk_limina_counts.barrier_breaks_pass,
+           (unsigned long long)kk_limina_counts.barrier_pregfx,
+           (unsigned long long)kk_limina_counts.barrier_noop,
+           (unsigned long long)kk_limina_counts.render_pass_starts,
+           (unsigned long long)kk_limina_counts.render_pass_restarts,
+           (unsigned long long)kk_limina_counts.render_pass_restarts_flush,
+           (unsigned long long)kk_limina_counts.compute_during_pass_postgfx,
+           (unsigned long long)kk_limina_counts.compute_during_pass_pregfx,
+           (unsigned long long)kk_limina_counts.color_map_nonidentity,
+           (unsigned long long)kk_limina_counts.color_att_seen, why);
+   /* Only the accumulated high-water mark: this site has no device, and the bump pointer at an
+    * arbitrary tick is not the number of interest anyway. kk_heap() samples it per use. */
+   if (kk_limina_heap_size) {
+      fprintf(stderr, "[LIMINA]   poly heap: hiwater=%u size=%u (%.2f%% of heap)\n",
+              kk_limina_heap_hiwater, kk_limina_heap_size,
+              100.0 * kk_limina_heap_hiwater / kk_limina_heap_size);
+   }
+   fprintf(stderr,
+           "[LIMINA]   unroll triggers: fan=%llu promote=%llu robust=%llu restart=%llu\n",
+           (unsigned long long)kk_limina_counts.unroll_trig_fan,
+           (unsigned long long)kk_limina_counts.unroll_trig_promote,
+           (unsigned long long)kk_limina_counts.unroll_trig_robust,
+           (unsigned long long)kk_limina_counts.unroll_trig_restart);
+   fprintf(stderr, "[LIMINA]   unroll_geometry calls=%llu (fan=%llu strip=%llu other=%llu)\n",
+           (unsigned long long)kk_limina_counts.unroll_calls,
+           (unsigned long long)kk_limina_counts.unroll_fan,
+           (unsigned long long)kk_limina_counts.unroll_strip,
+           (unsigned long long)kk_limina_counts.unroll_other);
+   fprintf(stderr,
+           "[LIMINA]   pass starts: fresh=%llu seen+LOAD=%llu seen+CLEAR=%llu "
+           "seen+DONTCARE=%llu (fresh small=%llu) | reload_hazard=%llu (small=%llu)"
+           " | pass ends DONTCARE=%llu (small=%llu)\n",
+           (unsigned long long)kk_limina_counts.start_fresh,
+           (unsigned long long)kk_limina_counts.start_seen_load,
+           (unsigned long long)kk_limina_counts.start_seen_clear,
+           (unsigned long long)kk_limina_counts.start_seen_dontcare,
+           (unsigned long long)kk_limina_counts.start_fresh_small,
+           (unsigned long long)kk_limina_counts.reload_hazard,
+           (unsigned long long)kk_limina_counts.reload_hazard_small,
+           (unsigned long long)kk_limina_counts.store_dontcare,
+           (unsigned long long)kk_limina_counts.store_dontcare_small);
+   kk_limina_print_midpass_callers();
+   fflush(stderr);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
+   kk_limina_counts.barriers++;
+   kk_limina_counts_tick("barrier");
+
    /* TODO_KOSMICKRISP Don't break the render pass and add a single encoder
     * barrier. This requires to read directly from the framebuffer which
     * requires not reading input attachments as textures.
     */
    if (cmd->gfx.encoder) {
+      /* LIMINA A/B lever, KK_LIMINA_BARRIER=norestart: implement the TODO above -- keep the
+       * render pass open and issue an in-encoder barrier instead of tearing the pass down and
+       * restarting it. This is NOT generally correct (input attachments read as textures need
+       * the break), so it is off by default. It exists to answer one question: is the
+       * store/end/restart-with-LOAD round trip losing everything drawn before the barrier?
+       * That is the shape of the gnome-shell card corruption -- earlier-painted content (a
+       * notification's header row and title) gone, later-painted content (icon, body) intact. */
+      kk_limina_counts.barrier_breaks_pass++;
+      if (kk_limina_barrier_mode() == KK_LIMINA_BARRIER_NORESTART) {
+         mtl_barrier_after_stages(cmd->gfx.encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+         return;
+      }
       kk_apply_attachment_store_ops(cmd, true);
       cs_end(cmd);
+      kk_limina_counts.render_pass_restarts++;
       cs_start_render(cmd);
    } else if (cmd->pre_gfx->encoder) {
       /* We chain encoders, so an intra-encoder barrier is enough here:
        * no need to tear down and recreate the encoder.
        */
-      mtl_barrier_after_encoder_stages(cmd->pre_gfx->encoder,
-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+      kk_limina_counts.barrier_pregfx++;
+      /* LIMINA A/B lever, KK_LIMINA_BARRIER=widen. The default scope below covers only
+       * DISPATCH|BLIT on both sides, so a barrier whose consumer is a RENDER stage -- which is
+       * every "upload a glyph, then sample it" edge, since KK encodes copies as compute -- is
+       * scoped away to nothing. `widen` takes both sides to MTL_STAGE_ALL. */
+      enum mtl_stages stages = kk_limina_barrier_mode() == KK_LIMINA_BARRIER_WIDEN
+                                  ? MTL_STAGE_ALL
+                                  : (MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+      mtl_barrier_after_encoder_stages(cmd->pre_gfx->encoder, stages, stages);
+   } else {
+      /* Neither encoder is open, so there is nothing to barrier against and the dependency is
+       * simply dropped. Counted because "the barrier did nothing" and "the barrier was scoped
+       * wrong" are different faults with the same symptom. */
+      kk_limina_counts.barrier_noop++;
    }
 }
 
@@ -930,6 +1238,26 @@ void kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
 
    force_store |= render->force_attachment_store;
 
+   /* LIMINA A/B lever, KK_LIMINA_FORCE_STORE=1: end every pass by storing its colour attachments
+    * rather than discarding them. The mirror of KK_LIMINA_FORCE_LOAD, which was measured and did
+    * not cure -- so loss at pass START is out, and loss at pass END is what is left. A cure here
+    * names a store; no cure retires the store side as cleanly as the load side was retired.
+    * Announces itself, because a lever whose engagement cannot be observed is worse than none. */
+   {
+      static int limina_force_store = -1;
+
+      if (unlikely(limina_force_store < 0)) {
+         const char *env = getenv("KK_LIMINA_FORCE_STORE");
+         limina_force_store = env && strcmp(env, "0") ? 1 : 0;
+         fprintf(stderr, "[LIMINA] KK pass-end store %s\n",
+                 limina_force_store ? "FORCED to STORE on all attachments "
+                                      "(KK_LIMINA_FORCE_STORE)"
+                                    : "as encoded (default)");
+         fflush(stderr);
+      }
+      force_store |= (bool)limina_force_store;
+   }
+
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       uint32_t logical_index = cmd->state.gfx.render.color_map[i];
 
@@ -944,6 +1272,17 @@ void kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
             || retain
             ? MTL_STORE_ACTION_STORE
             : vk_attachment_store_op_to_mtl_store_action(render->color_att[i].store_op);
+         /* Count what the pass WOULD have done, not what the arm made it do -- counting the
+          * forced result makes the number read 0 by construction whenever the arm is on, which
+          * is exactly when someone is looking at it. */
+         if (vk_attachment_store_op_to_mtl_store_action(render->color_att[i].store_op)
+             == MTL_STORE_ACTION_DONT_CARE && !resolve && !retain) {
+            const struct kk_image_view *siview = render->color_att[i].iview;
+
+            kk_limina_counts.store_dontcare++;
+            if (siview->vk.extent.width <= 512u && siview->vk.extent.height <= 512u)
+               kk_limina_counts.store_dontcare_small++;
+         }
          mtl_render_set_color_store_action(encoder, store_action, logical_index);
       }
    }

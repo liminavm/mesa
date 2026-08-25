@@ -54,6 +54,13 @@ mtl_start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory)
       captureDesc.captureObject = mtl_dev;
       captureDesc.destination = MTLCaptureDestinationDeveloperTools;
 
+      /* limina: without MTL_CAPTURE_ENABLED=1 (or the Info.plist key) Metal refuses programmatic
+       * capture, and a directory we cannot write to falls back to DeveloperTools, which needs
+       * Xcode already attached. Both failures otherwise look identical to "no trace appeared". */
+      if (directory && ![captureMgr supportsDestination: MTLCaptureDestinationGPUTraceDocument])
+         fprintf(stderr, "[LIMINA-KK-CAPTURE] GPUTraceDocument unsupported -- falling back to "
+                         "DeveloperTools, which writes no file. Is MTL_CAPTURE_ENABLED=1 set?\n");
+
       if (directory && [captureMgr supportsDestination: MTLCaptureDestinationGPUTraceDocument]) {
          NSString *dir = [NSString stringWithUTF8String:directory];
          NSString *pname = [[NSProcessInfo processInfo] processName];

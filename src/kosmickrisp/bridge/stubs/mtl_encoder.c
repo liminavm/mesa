@@ -249,3 +249,8 @@ void mtl_render_set_stencil_store_action(mtl_render_encoder *encoder,
                                        enum mtl_store_action action)
 {
 }
+
+void
+mtl_render_encoder_set_label(mtl_render_encoder *encoder, const char *label)
+{
+}

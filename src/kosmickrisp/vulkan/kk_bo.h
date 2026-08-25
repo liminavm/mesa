@@ -17,6 +17,17 @@
 struct kk_device;
 struct vk_object_base;
 
+/* [LIMINA] debug-only GPU-address -> CPU-pointer registry; see kk_bo.c */
+#define KK_LIMINA_BO_MAX 4096
+struct kk_limina_bo_rec {
+   uint64_t gpu;
+   uint64_t size;
+   void *cpu;
+};
+extern struct kk_limina_bo_rec kk_limina_bos[KK_LIMINA_BO_MAX];
+extern unsigned kk_limina_bo_n;
+void *kk_limina_addr_to_cpu(uint64_t addr);
+
 struct kk_bo {
    mtl_heap *mtl_handle;
    mtl_buffer *map;

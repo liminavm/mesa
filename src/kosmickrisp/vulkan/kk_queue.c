@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kk_limina_capture.h"
 #include "kk_queue.h"
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
@@ -171,6 +172,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
          mtl_command_queue_commit(queue->mtl_handle, cmds, count,
                                   queue->commit_options);
+
+         /* limina: a triggered GPU capture closes here, after the commit, never mid-encode --
+          * stopping with an encoded-but-uncommitted command buffer truncates the trace. */
+         kk_limina_capture_after_commit();
       }
 
       if (cmd_buffer->drawable) {

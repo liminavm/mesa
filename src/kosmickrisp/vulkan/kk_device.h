@@ -179,6 +179,13 @@ struct kk_device {
    struct kk_bo *heap;
    util_once_flag heap_init_once;
 
+   /* LIMINA instrumentation: CPU view of this heap's bump pointer, for the
+    * high-water mark. Per device, NOT a global: one process hosts two KK
+    * devices -- host zink-on-KK serving vrend's GL, and guest venus/vkr -- and
+    * a global left dangling into a torn-down device's mapping SIGSEGVs the next
+    * draw the surviving device makes. */
+   volatile uint32_t *limina_heap_bottom;
+
    uint64_t disabled_workarounds;
    bool gpu_capture_enabled;
 
