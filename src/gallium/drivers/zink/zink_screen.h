@@ -25,6 +25,7 @@
 #define ZINK_SCREEN_H
 
 #include "zink_types.h"
+#include "util/u_atomic.h"
 
 
 #ifdef __cplusplus
@@ -42,18 +43,21 @@ static inline void
 zink_screen_update_last_finished(struct zink_screen *screen, uint64_t batch_id)
 {
    const uint32_t check_id = (uint32_t)batch_id;
+   /* read once: this is written from several threads (the driver thread, the
+    * flush queue, and -- under virgl -- a second GL context's fence thread) */
+   const uint32_t last_finished = p_atomic_read(&screen->last_finished);
    /* last_finished may have wrapped */
-   if (screen->last_finished < UINT_MAX / 2) {
+   if (last_finished < UINT_MAX / 2) {
       /* last_finished has wrapped, batch_id has not */
       if (check_id > UINT_MAX / 2)
          return;
    } else if (check_id < UINT_MAX / 2) {
       /* batch_id has wrapped, last_finished has not */
-      screen->last_finished = check_id;
+      p_atomic_set(&screen->last_finished, check_id);
       return;
    }
    /* neither have wrapped */
-   screen->last_finished = MAX2(check_id, screen->last_finished);
+   p_atomic_set(&screen->last_finished, MAX2(check_id, last_finished));
 }
 
 /* check a batch_id against last_finished while accounting for wrapping */
@@ -64,8 +68,9 @@ zink_screen_check_last_finished(struct zink_screen *screen, uint32_t batch_id)
    /* 0 means an in-flight batch */
    if (check_id == 0)
       return false;
+   const uint32_t last_finished = p_atomic_read(&screen->last_finished);
    /* last_finished may have wrapped */
-   if (screen->last_finished < UINT_MAX / 2) {
+   if (last_finished < UINT_MAX / 2) {
       /* last_finished has wrapped, batch_id has not */
       if (check_id > UINT_MAX / 2)
          return true;
@@ -73,7 +78,7 @@ zink_screen_check_last_finished(struct zink_screen *screen, uint32_t batch_id)
       /* batch_id has wrapped, last_finished has not */
       return false;
    }
-   return screen->last_finished >= check_id;
+   return last_finished >= check_id;
 }
 
 bool
