@@ -1,4 +1,5 @@
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_compiler.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
@@ -1302,7 +1303,7 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       zink_batch_reference_resource_rw(ctx, zink_resource(info->indirect), false);
    } else
       VKCTX(CmdDispatch)(bs->cmdbuf, info->grid[0], info->grid[1], info->grid[2]);
-   bs->has_work = true;
+   p_atomic_set(&bs->has_work, true);
    ctx->last_work_was_compute = true;
    /* flush if there's >100k computes */
    if (!ctx->unordered_blitting && (unlikely(ctx->work_count >= 30000) || ctx->oom_flush))

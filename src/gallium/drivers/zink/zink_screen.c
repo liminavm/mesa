@@ -22,6 +22,7 @@
  */
 
 #include "zink_screen.h"
+#include "util/u_atomic.h"
 
 #include "zink_kopper.h"
 #include "zink_compiler.h"
@@ -1947,7 +1948,7 @@ zink_flush_frontbuffer(struct pipe_screen *pscreen,
 
    /* handle any outstanding acquire submits (not just from above) */
    if (ctx->swapchain || ctx->needs_present) {
-      ctx->bs->has_work = true;
+      p_atomic_set(&ctx->bs->has_work, true);
       pctx->flush(pctx, NULL, PIPE_FLUSH_END_OF_FRAME);
       if (ctx->last_batch_state && screen->threaded_submit) {
          struct zink_batch_state *bs = ctx->last_batch_state;

@@ -1,4 +1,5 @@
 #include "zink_query.h"
+#include "util/u_atomic.h"
 
 #include "zink_context.h"
 #include "zink_clear.h"
@@ -548,7 +549,7 @@ zink_create_query(struct pipe_context *pctx,
 
    if (!qbo_append(pctx->screen, query))
       goto fail;
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    query->needs_reset = true;
    query->predicate_dirty = true;
    if (query->type == PIPE_QUERY_TIMESTAMP) {
@@ -791,7 +792,7 @@ copy_pool_results_to_buffer(struct zink_context *ctx, struct zink_query *query, 
    zink_resource_buffer_transfer_dst_barrier(ctx, res, offset, result_size);
    util_range_add(&res->base.b, &res->valid_buffer_range, offset, offset + result_size);
    assert(query_id < NUM_QUERIES);
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    VKCTX(CmdCopyQueryPoolResults)(ctx->bs->cmdbuf, pool, query_id, num_results, res->obj->buffer,
                                   offset, base_result_size, flags);
    zink_cmd_debug_marker_end(ctx, ctx->bs->cmdbuf, marker);
@@ -913,7 +914,7 @@ begin_query(struct zink_context *ctx, struct zink_query *q)
       reset_qbos(ctx, q);
    reset_query_range(ctx, q);
    q->active = true;
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
 
    struct zink_query_start *start = util_dynarray_top_ptr(&q->starts, struct zink_query_start);
    if (q->type == PIPE_QUERY_TIME_ELAPSED) {
@@ -1009,7 +1010,7 @@ static void
 update_query_id(struct zink_context *ctx, struct zink_query *q)
 {
    query_pool_get_range(ctx, q);
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    q->has_draws = false;
 }
 
@@ -1102,7 +1103,7 @@ zink_end_query(struct pipe_context *pctx,
       struct zink_query_start *start = util_dynarray_top_ptr(&query->starts, struct zink_query_start);
       VKCTX(CmdWriteTimestamp)(ctx->bs->cmdbuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                start->vkq[0]->pool->query_pool, start->vkq[0]->query_id);
-      ctx->bs->has_work = true;
+      p_atomic_set(&ctx->bs->has_work, true);
       zink_batch_usage_set(&query->batch_uses, ctx->bs);
       _mesa_set_add(&ctx->bs->active_queries, query);
       query->needs_update = true;
@@ -1360,7 +1361,7 @@ zink_render_condition(struct pipe_context *pctx,
    zink_batch_no_rp(ctx);
    VkQueryResultFlagBits flags = 0;
 
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    if (query == NULL) {
       /* force conditional clears if they exist */
       if (ctx->clears_enabled && !ctx->in_rp)

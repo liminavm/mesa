@@ -22,6 +22,7 @@
  */
 
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_fence.h"
 
@@ -40,8 +41,12 @@
 static void
 destroy_fence(struct zink_screen *screen, struct zink_tc_fence *mfence)
 {
-   if (mfence->fence)
-      util_dynarray_delete_unordered(&mfence->fence->mfences, struct zink_tc_fence *, mfence);
+   struct zink_fence *fence = mfence->fence;
+   if (fence) {
+      simple_mtx_lock(&fence->mfences_lock);
+      util_dynarray_delete_unordered(&fence->mfences, struct zink_tc_fence *, mfence);
+      simple_mtx_unlock(&fence->mfences_lock);
+   }
    mfence->fence = NULL;
    tc_unflushed_batch_token_reference(&mfence->tc_token, NULL);
    if (mfence->sem)
@@ -132,7 +137,7 @@ fence_wait(struct zink_screen *screen, struct zink_fence *fence, uint64_t timeou
    struct zink_batch_state *bs = zink_batch_state(fence);
    if (screen->device_lost)
       return true;
-   if (fence->completed)
+   if (p_atomic_read(&fence->completed))
       return true;
 
    if (screen->threaded_submit) {
@@ -141,15 +146,15 @@ fence_wait(struct zink_screen *screen, struct zink_fence *fence, uint64_t timeou
          return false;
    }
 
-   assert(fence->batch_id);
-   assert(fence->submitted);
+   assert(p_atomic_read(&fence->batch_id));
+   assert(p_atomic_read(&fence->submitted));
 
-   bool success = zink_screen_timeline_wait(screen, fence->batch_id, timeout_ns);
+   bool success = zink_screen_timeline_wait(screen, p_atomic_read(&fence->batch_id), timeout_ns);
 
    if (success) {
-      fence->completed = true;
-      bs->usage.usage = 0;
-      zink_screen_update_last_finished(screen, fence->batch_id);
+      p_atomic_set(&fence->completed, true);
+      p_atomic_set(&bs->usage.usage, 0);
+      zink_screen_update_last_finished(screen, p_atomic_read(&fence->batch_id));
    }
    return success;
 }
@@ -166,7 +171,7 @@ zink_fence_finish(struct zink_screen *screen, struct pipe_context *pctx, struct 
 
    if (pctx && mfence->deferred_ctx == pctx) {
       if (mfence->fence == ctx->deferred_fence) {
-         zink_context(pctx)->bs->has_work = true;
+         p_atomic_set(&zink_context(pctx)->bs->has_work, true);
          /* this must be the current batch */
          pctx->flush(pctx, NULL, !timeout_ns ? PIPE_FLUSH_ASYNC : 0);
          if (!timeout_ns)
@@ -185,7 +190,7 @@ zink_fence_finish(struct zink_screen *screen, struct pipe_context *pctx, struct 
 
    struct zink_fence *fence = mfence->fence;
 
-   unsigned submit_diff = zink_batch_submit_count_diff(zink_batch_state(mfence->fence)->usage.submit_count, mfence->submit_count);
+   unsigned submit_diff = zink_batch_submit_count_diff(p_atomic_read(&zink_batch_state(mfence->fence)->usage.submit_count), mfence->submit_count);
    /* this batch is known to have finished because it has been submitted more than 1 time
     * since the tc fence last saw it
     */
@@ -196,8 +201,9 @@ zink_fence_finish(struct zink_screen *screen, struct pipe_context *pctx, struct 
     * - if fence is not submitted here, it must be reset; batch_id will be 0 and submitted is false
     * in either case, the fence has finished
     */
-   if ((fence->submitted && zink_screen_check_last_finished(screen, fence->batch_id)) ||
-       (!fence->submitted && submit_diff))
+   const bool submitted = p_atomic_read(&fence->submitted);
+   if ((submitted && zink_screen_check_last_finished(screen, p_atomic_read(&fence->batch_id))) ||
+       (!submitted && submit_diff))
       return true;
 
    return fence_wait(screen, fence, timeout_ns);
@@ -247,7 +253,7 @@ zink_fence_server_signal(struct pipe_context *pctx, struct pipe_fence_handle *pf
 
    util_dynarray_append(&ctx->bs->user_signal_semaphores, mfence->sem);
    util_dynarray_append(&ctx->bs->user_signal_semaphore_values, value);
-   bs->has_work = true;
+   p_atomic_set(&bs->has_work, true);
 
 
    /* this must produce a synchronous flush that completes before the function returns */

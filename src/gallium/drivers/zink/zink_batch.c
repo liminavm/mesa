@@ -1,4 +1,5 @@
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
 #include "zink_kopper.h"
@@ -141,20 +142,23 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    util_dynarray_clear(&bs->fences);
 
    /* only increment batch generation if previously in-use to avoid false detection of batch completion */
-   if (bs->fence.submitted)
-      bs->usage.submit_count++;
+   if (p_atomic_read(&bs->fence.submitted))
+      p_atomic_inc(&bs->usage.submit_count);
    /* only reset submitted here so that tc fence desync can pick up the 'completed' flag
     * before the state is reused
     */
-   bs->fence.submitted = false;
-   if (bs->fence.batch_id)
-      zink_screen_update_last_finished(screen, bs->fence.batch_id);
-   bs->fence.batch_id = 0;
-   bs->usage.usage = 0;
+   p_atomic_set(&bs->fence.submitted, false);
+   {
+      const uint64_t bid = p_atomic_read(&bs->fence.batch_id);
+      if (bid)
+         zink_screen_update_last_finished(screen, bid);
+   }
+   p_atomic_set(&bs->fence.batch_id, 0);
+   p_atomic_set(&bs->usage.usage, 0);
    bs->next = NULL;
-   bs->last_added_obj = NULL;
+   p_atomic_set(&bs->last_added_obj, NULL);
 
-   bs->has_work = false;
+   p_atomic_set(&bs->has_work, false);
    bs->has_reordered_work = false;
    bs->has_unsync = false;
 }
@@ -191,7 +195,7 @@ zink_reset_batch_state(struct zink_context *ctx, struct zink_batch_state *bs)
 void
 zink_clear_batch_state(struct zink_context *ctx, struct zink_batch_state *bs)
 {
-   bs->fence.completed = true;
+   p_atomic_set(&bs->fence.completed, true);
    zink_reset_batch_state(ctx, bs);
 }
 
@@ -201,7 +205,7 @@ pop_batch_state(struct zink_context *ctx)
 {
    const struct zink_batch_state *bs = ctx->batch_states;
    ctx->batch_states = bs->next;
-   ctx->batch_states_count--;
+   p_atomic_dec(&ctx->batch_states_count);
    if (ctx->last_batch_state == bs)
       ctx->last_batch_state = NULL;
 }
@@ -214,7 +218,7 @@ zink_batch_reset_all(struct zink_context *ctx)
 {
    while (ctx->batch_states) {
       struct zink_batch_state *bs = ctx->batch_states;
-      bs->fence.completed = true;
+      p_atomic_set(&bs->fence.completed, true);
       pop_batch_state(ctx);
       zink_reset_batch_state(ctx, bs);
       zink_batch_state_append(&ctx->free_batch_states, &ctx->last_free_batch_state, bs);
@@ -268,12 +272,15 @@ zink_batch_state_destroy(struct zink_screen *screen, struct zink_batch_state *bs
    util_dynarray_fini(&bs->tracked_semaphores);
    util_dynarray_fini(&bs->acquire_flags);
    util_dynarray_fini(&bs->fences);
+   simple_mtx_lock(&bs->fence.mfences_lock);
    unsigned num_mfences = util_dynarray_num_elements(&bs->fence.mfences, void *);
    struct zink_tc_fence **mfence = bs->fence.mfences.data;
    for (unsigned i = 0; i < num_mfences; i++) {
       mfence[i]->fence = NULL;
    }
    util_dynarray_fini(&bs->fence.mfences);
+   simple_mtx_unlock(&bs->fence.mfences_lock);
+   simple_mtx_destroy(&bs->fence.mfences_lock);
    zink_batch_descriptor_deinit(screen, bs);
    ralloc_free(bs);
 }
@@ -386,6 +393,7 @@ create_batch_state(struct zink_context *ctx)
    cnd_init(&bs->usage.flush);
    mtx_init(&bs->usage.mtx, mtx_plain);
    simple_mtx_init(&bs->exportable_lock, mtx_plain);
+   simple_mtx_init(&bs->fence.mfences_lock, mtx_plain);
    memset(&bs->buffer_indices_hashlist, -1, sizeof(bs->buffer_indices_hashlist));
 
    if (!zink_batch_descriptor_init(screen, bs))
@@ -438,9 +446,9 @@ find_completed_batch_state(struct zink_context *ctx)
    while (i) {
       struct zink_batch_state *j = i->next;
       /* only a submitted state can be reused */
-      if (i->fence.submitted &&
+      if (p_atomic_read(&i->fence.submitted) &&
           /* a submitted state must have completed before it can be reused */
-          (zink_screen_check_last_finished(screen, i->fence.batch_id) || i->fence.completed)) {
+          (zink_screen_check_last_finished(screen, p_atomic_read(&i->fence.batch_id)) || p_atomic_read(&i->fence.completed))) {
          pop_batch_state(ctx);
          reset_batch_state_ctx(ctx, i);
          if (ctx->flags & ZINK_CONTEXT_COPY_ONLY) {
@@ -568,7 +576,7 @@ zink_start_batch(struct zink_context *ctx)
          mesa_loge("ZINK: vkBeginCommandBuffer failed (%s)", vk_Result_to_str(result));
    );
 
-   bs->fence.completed = false;
+   p_atomic_set(&bs->fence.completed, false);
 
 #if HAVE_RENDERDOC_INTEGRATION
    if (VKCTX(CmdInsertDebugUtilsLabelEXT) && screen->renderdoc_api) {
@@ -620,12 +628,14 @@ post_submit(struct zink_batch_state *bs, struct zink_screen *screen)
          /* if nothing can save us, abort */
          abort();
       screen->device_lost = true;
-   } else if (bs->ctx->batch_states_count > 5000) {
+   } else if (p_atomic_read(&bs->ctx->batch_states_count) > 5000) {
       /* throttle in case something crazy is happening */
-      zink_screen_timeline_wait(screen, bs->fence.batch_id - 2500, OS_TIMEOUT_INFINITE);
-   } else if (screen->curr_batch - screen->last_finished > 5) {
-      /* try to avoid ooming by regularly checking for batch completion */
-      zink_screen_timeline_wait(screen, screen->last_finished + 1, 0);
+      zink_screen_timeline_wait(screen, p_atomic_read(&bs->fence.batch_id) - 2500, OS_TIMEOUT_INFINITE);
+   } else {
+      const uint32_t last_finished = p_atomic_read(&screen->last_finished);
+      if (screen->curr_batch - last_finished > 5)
+         /* try to avoid ooming by regularly checking for batch completion */
+         zink_screen_timeline_wait(screen, last_finished + 1, 0);
    }
 }
 
@@ -650,7 +660,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    VkSubmitInfo si[ZINK_SUBMIT_MAX] = {0};
    VkSubmitInfo *submit = si;
    int num_si = ZINK_SUBMIT_MAX;
-   while (!bs->fence.batch_id)
+   while (!p_atomic_read(&bs->fence.batch_id))
       bs->fence.batch_id = (uint32_t)p_atomic_inc_return(&screen->curr_batch);
    /* the unflushed clear must happen under the usage mutex: waiters in
     * zink_batch_usage_unflushed_wait() check the flag under that mutex before
@@ -659,12 +669,12 @@ submit_queue(void *data, void *gdata, int thread_index)
     * with every flush queue idle)
     */
    mtx_lock(&bs->usage.mtx);
-   bs->usage.usage = bs->fence.batch_id;
-   assert(bs->usage.usage);
+   p_atomic_set(&bs->usage.usage, bs->fence.batch_id);
+   assert(p_atomic_read(&bs->usage.usage));
    bs->usage.unflushed = false;
    mtx_unlock(&bs->usage.mtx);
 
-   uint64_t batch_id = bs->fence.batch_id;
+   uint64_t batch_id = p_atomic_read(&bs->fence.batch_id);
    /* first submit is just for acquire waits since they have a separate array */
    for (unsigned i = 0; i < ARRAY_SIZE(si); i++)
       si[i].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -710,7 +720,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    if (si[ZINK_SUBMIT_CMDBUF].waitSemaphoreCount)
       si[ZINK_SUBMIT_CMDBUF].pNext = &sem_submit;
    {
-      VkCommandBuffer sync_cmdbuf = bs->has_work ? bs->cmdbuf :
+      VkCommandBuffer sync_cmdbuf = p_atomic_read(&bs->has_work) ? bs->cmdbuf :
                                                    bs->has_reordered_work ? bs->reordered_cmdbuf :
                                                                             bs->has_unsync ? bs->unsynchronized_cmdbuf :
                                                                                              VK_NULL_HANDLE;
@@ -732,7 +742,7 @@ submit_queue(void *data, void *gdata, int thread_index)
       cmdbufs[c++] = bs->unsynchronized_cmdbuf;
    if (bs->has_reordered_work)
       cmdbufs[c++] = bs->reordered_cmdbuf;
-   if (bs->has_work)
+   if (p_atomic_read(&bs->has_work))
       cmdbufs[c++] = bs->cmdbuf;
    si[ZINK_SUBMIT_CMDBUF].pCommandBuffers = cmdbufs;
    si[ZINK_SUBMIT_CMDBUF].commandBufferCount = c;
@@ -780,7 +790,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    }
 
    VkResult result;
-   if (bs->has_work) {
+   if (p_atomic_read(&bs->has_work)) {
       VRAM_ALLOC_LOOP(result,
          VKSCR(EndCommandBuffer)(bs->cmdbuf),
          if (result != VK_SUCCESS) {
@@ -848,7 +858,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    if (bs->sparse_semaphore)
       (void)util_dynarray_pop(&bs->acquires, VkSemaphore);
 
-   bs->usage.submit_count++;
+   p_atomic_inc(&bs->usage.submit_count);
 end:
    /* broadcast under the mutex so the wake can't slip between a waiter's locked
     * predicate check and its cnd_wait
@@ -889,7 +899,7 @@ zink_end_batch(struct zink_context *ctx)
 
    bs = ctx->bs;
    zink_batch_state_append(&ctx->batch_states, &ctx->last_batch_state, bs);
-   ctx->batch_states_count++;
+   p_atomic_inc(&ctx->batch_states_count);
    ctx->work_count = 0;
 
    /* this is swapchain presentation semaphore handling */
@@ -960,7 +970,7 @@ zink_end_batch(struct zink_context *ctx)
             util_dynarray_append(&ctx->bs->signal_semaphores, sem);
          }
       }
-      bs->has_work = true;
+      p_atomic_set(&bs->has_work, true);
    }
 
    util_dynarray_foreach(&bs->fences, struct zink_tc_fence*, mfence)
@@ -1078,7 +1088,7 @@ batch_reference_resource_move_internal(struct zink_batch_state *bs, struct zink_
    list->objs[idx] = res->obj;
    unsigned hash = bo->unique_id & (BUFFER_HASHLIST_SIZE-1);
    bs->buffer_indices_hashlist[hash] = idx & 0x7fff;
-   bs->last_added_obj = res->obj;
+   p_atomic_set(&bs->last_added_obj, res->obj);
    if (!(res->base.b.flags & PIPE_RESOURCE_FLAG_SPARSE)) {
       bs->resource_size += res->obj->size;
    } else {
@@ -1118,7 +1128,7 @@ zink_batch_reference_resource_move(struct zink_context *ctx, struct zink_resourc
     * This is very effective with suballocators and linear uploaders that
     * are outside of the winsys.
     */
-   if (res->obj == bs->last_added_obj) {
+   if (res->obj == p_atomic_read(&bs->last_added_obj)) {
       return true;
    }
 
@@ -1169,7 +1179,7 @@ zink_batch_reference_program(struct zink_context *ctx,
       return;
    pipe_reference(NULL, &pg->reference);
    zink_batch_usage_set(&pg->batch_uses, bs);
-   bs->has_work = true;
+   p_atomic_set(&bs->has_work, true);
 }
 
 /* a fast (hopefully) way to check whether a given batch has completed */
@@ -1181,7 +1191,7 @@ zink_screen_usage_check_completion(struct zink_screen *screen, const struct zink
    if (zink_batch_usage_is_unflushed(u))
       return false;
 
-   return zink_screen_timeline_wait(screen, u->usage, 0);
+   return zink_screen_timeline_wait(screen, p_atomic_read(&u->usage), 0);
 }
 
 /* an even faster check that doesn't ioctl */
@@ -1193,7 +1203,7 @@ zink_screen_usage_check_completion_fast(struct zink_screen *screen, const struct
    if (zink_batch_usage_is_unflushed(u))
       return false;
 
-   return zink_screen_check_last_finished(screen, u->usage);
+   return zink_screen_check_last_finished(screen, p_atomic_read(&u->usage));
 }
 
 bool
@@ -1203,7 +1213,7 @@ zink_batch_usage_check_completion(struct zink_context *ctx, const struct zink_ba
       return true;
    if (zink_batch_usage_is_unflushed(u))
       return false;
-   return zink_check_batch_completion(ctx, u->usage);
+   return zink_check_batch_completion(ctx, p_atomic_read(&u->usage));
 }
 
 bool
@@ -1213,7 +1223,7 @@ zink_batch_usage_unflushed_wait(struct zink_context *ctx, struct zink_batch_usag
    if (!zink_batch_usage_exists(u))
       return true;
    /* this batch state was already completed and reset */
-   if (zink_batch_submit_count_diff(u->submit_count, submit_count) > 1)
+   if (zink_batch_submit_count_diff(p_atomic_read(&u->submit_count), submit_count) > 1)
       return true;
    if (zink_batch_usage_is_unflushed(u)) {
       if (likely(u == &ctx->bs->usage)) {
@@ -1257,10 +1267,10 @@ batch_usage_wait(struct zink_context *ctx, struct zink_batch_usage *u, unsigned 
    if (!zink_batch_usage_exists(u))
       return;
    /* this batch state was already completed and reset */
-   if (zink_batch_submit_count_diff(u->submit_count, submit_count) > 1)
+   if (zink_batch_submit_count_diff(p_atomic_read(&u->submit_count), submit_count) > 1)
       return;
    if (zink_batch_usage_unflushed_wait(ctx, u, submit_count, trywait))
-      zink_wait_on_batch(ctx, u->usage);
+      zink_wait_on_batch(ctx, p_atomic_read(&u->usage));
 }
 
 void

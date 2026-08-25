@@ -23,6 +23,7 @@
  */
 
 #include "util/detect_os.h"
+#include "util/u_atomic.h"
 
 #include "zink_context.h"
 #include "zink_screen.h"
@@ -201,7 +202,7 @@ prune_old_swapchains(struct zink_screen *screen, struct kopper_displaytarget *cd
          if (!wait || zink_batch_usage_is_unflushed(u))
             return;
 
-         zink_screen_timeline_wait(screen, u->usage, UINT64_MAX);
+         zink_screen_timeline_wait(screen, p_atomic_read(&u->usage), UINT64_MAX);
          cswap->batch_uses = NULL;
       }
       cdt->old_swapchain = cswap->next;

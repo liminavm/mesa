@@ -298,6 +298,11 @@ struct zink_fence {
    uint64_t batch_id;
    bool submitted;
    bool completed;
+   /* mfences is appended to by zink_flush() on the driver thread and entries are
+    * removed from it by destroy_fence() -- which, when a GL context's fence is
+    * released from a *second* context's thread (virglrenderer runs one), is not
+    * the same thread. Leaf lock: never take another lock under it. */
+   simple_mtx_t mfences_lock;
    struct util_dynarray mfences;
 };
 
@@ -1992,10 +1997,15 @@ struct zink_context {
    bool shobj_draw : 1; //using shader objects for draw
    bool is_device_lost;
    bool primitive_restart;
-   bool blitting : 1;
+   /* NOT bitfields: these two are read on the driver thread while the threaded
+    * context's thread writes neighbouring flags, and distinct bitfields sharing a
+    * storage unit are ONE memory location as far as the memory model (and
+    * ThreadSanitizer) are concerned -- so a bitfield here is a data race that no
+    * amount of atomics on the individual flags can fix. Give them their own bytes. */
+   bool blitting;
+   bool unordered_blitting;
    bool blit_scissor : 1;
    bool blit_nearest : 1;
-   bool unordered_blitting : 1;
    bool vertex_state_changed : 1;
    bool blend_state_changed : 1;
    bool blend_color_changed : 1;
