@@ -6,6 +6,7 @@
  */
 
 #include "kk_cmd_buffer.h"
+#include "util/u_atomic.h"
 
 #include <dlfcn.h>
 
@@ -338,7 +339,7 @@ kk_limina_seen_texture(const void *tex)
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
-   kk_limina_counts.render_pass_starts++;
+   p_atomic_inc(&kk_limina_counts.render_pass_starts);
    kk_limina_counts_tick("rp");
 
    {
@@ -360,23 +361,23 @@ cs_start_render(struct kk_cmd_buffer *cmd)
              * attachment -- which means the one bucket the missing text lives in was being
              * counted and then skipped. Split it by size so a new label or icon is separable
              * from a new full-surface target. */
-            kk_limina_counts.start_fresh++;
+            p_atomic_inc(&kk_limina_counts.start_fresh);
             if (iview->vk.extent.width <= 512u && iview->vk.extent.height <= 512u)
-               kk_limina_counts.start_fresh_small++;
+               p_atomic_inc(&kk_limina_counts.start_fresh_small);
             continue;
          }
 
          if (load == MTL_LOAD_ACTION_LOAD) {
-            kk_limina_counts.start_seen_load++;
+            p_atomic_inc(&kk_limina_counts.start_seen_load);
             continue;
          }
 
          if (load == MTL_LOAD_ACTION_CLEAR)
-            kk_limina_counts.start_seen_clear++;
+            p_atomic_inc(&kk_limina_counts.start_seen_clear);
          else
-            kk_limina_counts.start_seen_dontcare++;
+            p_atomic_inc(&kk_limina_counts.start_seen_dontcare);
 
-         kk_limina_counts.reload_hazard++;
+         p_atomic_inc(&kk_limina_counts.reload_hazard);
 
          /* LIMINA A/B lever, KK_LIMINA_FORCE_LOAD=1: begin the pass by loading the target
           * instead of clearing or discarding it. Detecting these says little on its own --
@@ -415,7 +416,7 @@ cs_start_render(struct kk_cmd_buffer *cmd)
           * keeps a full-surface clear -- which is normal and expected every frame -- from
           * drowning out the case that matters. */
          if (iview->vk.extent.width <= 512u && iview->vk.extent.height <= 512u)
-            kk_limina_counts.reload_hazard_small++;
+            p_atomic_inc(&kk_limina_counts.reload_hazard_small);
       }
    }
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
@@ -513,11 +514,11 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
        * post_gfx is the safe-by-design route. Vulkan forbids copies and dispatches inside a
        * render pass, so conformant traffic should only ever reach post_gfx here. */
       if (pre_gfx) {
-         kk_limina_counts.compute_during_pass_pregfx++;
+         p_atomic_inc(&kk_limina_counts.compute_during_pass_pregfx);
          kk_limina_note_midpass_caller(__builtin_return_address(1));
       }
       else
-         kk_limina_counts.compute_during_pass_postgfx++;
+         p_atomic_inc(&kk_limina_counts.compute_during_pass_postgfx);
    }
    /* If we are not inside a render, we can just take pre_gfx. */
    if (!cmd->gfx.encoder || pre_gfx) {
@@ -688,7 +689,7 @@ void
 kk_limina_counts_tick(const char *why)
 {
    static uint64_t last;
-   uint64_t n = ++kk_limina_counts.ticks;
+   uint64_t n = p_atomic_inc_return(&kk_limina_counts.ticks);
    if (n > 3u && n - last < 2000u)
       return;
    last = n;
@@ -748,7 +749,7 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
-   kk_limina_counts.barriers++;
+   p_atomic_inc(&kk_limina_counts.barriers);
    kk_limina_counts_tick("barrier");
 
    /* TODO_KOSMICKRISP Don't break the render pass and add a single encoder
@@ -763,20 +764,20 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
        * store/end/restart-with-LOAD round trip losing everything drawn before the barrier?
        * That is the shape of the gnome-shell card corruption -- earlier-painted content (a
        * notification's header row and title) gone, later-painted content (icon, body) intact. */
-      kk_limina_counts.barrier_breaks_pass++;
+      p_atomic_inc(&kk_limina_counts.barrier_breaks_pass);
       if (kk_limina_barrier_mode() == KK_LIMINA_BARRIER_NORESTART) {
          mtl_barrier_after_stages(cmd->gfx.encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
          return;
       }
       kk_apply_attachment_store_ops(cmd, true);
       cs_end(cmd);
-      kk_limina_counts.render_pass_restarts++;
+      p_atomic_inc(&kk_limina_counts.render_pass_restarts);
       cs_start_render(cmd);
    } else if (cmd->pre_gfx->encoder) {
       /* We chain encoders, so an intra-encoder barrier is enough here:
        * no need to tear down and recreate the encoder.
        */
-      kk_limina_counts.barrier_pregfx++;
+      p_atomic_inc(&kk_limina_counts.barrier_pregfx);
       /* LIMINA A/B lever, KK_LIMINA_BARRIER=widen. The default scope below covers only
        * DISPATCH|BLIT on both sides, so a barrier whose consumer is a RENDER stage -- which is
        * every "upload a glyph, then sample it" edge, since KK encodes copies as compute -- is
@@ -789,7 +790,7 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       /* Neither encoder is open, so there is nothing to barrier against and the dependency is
        * simply dropped. Counted because "the barrier did nothing" and "the barrier was scoped
        * wrong" are different faults with the same symptom. */
-      kk_limina_counts.barrier_noop++;
+      p_atomic_inc(&kk_limina_counts.barrier_noop);
    }
 }
 
@@ -1279,9 +1280,9 @@ void kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
              == MTL_STORE_ACTION_DONT_CARE && !resolve && !retain) {
             const struct kk_image_view *siview = render->color_att[i].iview;
 
-            kk_limina_counts.store_dontcare++;
+            p_atomic_inc(&kk_limina_counts.store_dontcare);
             if (siview->vk.extent.width <= 512u && siview->vk.extent.height <= 512u)
-               kk_limina_counts.store_dontcare_small++;
+               p_atomic_inc(&kk_limina_counts.store_dontcare_small);
          }
          mtl_render_set_color_store_action(encoder, store_action, logical_index);
       }

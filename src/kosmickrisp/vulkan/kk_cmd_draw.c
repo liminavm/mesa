@@ -8,6 +8,7 @@
  */
 
 #include "kk_entrypoints.h"
+#include "util/u_atomic.h"
 
 #include "kk_buffer.h"
 #include "kk_bo.h"
@@ -218,9 +219,9 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
       uint8_t logical_index = dyn->cal.color_map[i];
       render->color_map[i] = logical_index;
       if (logical_index != MESA_VK_ATTACHMENT_UNUSED) {
-         kk_limina_counts.color_att_seen++;
+         p_atomic_inc(&kk_limina_counts.color_att_seen);
          if (logical_index != i)
-            kk_limina_counts.color_map_nonidentity++;
+            p_atomic_inc(&kk_limina_counts.color_map_nonidentity);
       }
 
       if (!iview || logical_index == MESA_VK_ATTACHMENT_UNUSED) {
@@ -1049,7 +1050,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
       }
 
       cs_end(cmd);
-      kk_limina_counts.render_pass_restarts_flush++;
+      p_atomic_inc(&kk_limina_counts.render_pass_restarts_flush);
       kk_cmd_buffer_dirty_all_gfx(cmd);
       cmd->state.gfx.need_to_start_render_pass = true;
    }
@@ -1569,14 +1570,14 @@ kk_predicate_draws(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    assert(data->predicate_count);
 
-   kk_limina_counts.unroll_calls++;
+   p_atomic_inc(&kk_limina_counts.unroll_calls);
    if (data->prim == MESA_PRIM_TRIANGLE_FAN)
-      kk_limina_counts.unroll_fan++;
+      p_atomic_inc(&kk_limina_counts.unroll_fan);
    else if (data->prim == MESA_PRIM_TRIANGLE_STRIP ||
             data->prim == MESA_PRIM_LINE_STRIP)
-      kk_limina_counts.unroll_strip++;
+      p_atomic_inc(&kk_limina_counts.unroll_strip);
    else
-      kk_limina_counts.unroll_other++;
+      p_atomic_inc(&kk_limina_counts.unroll_other);
 
    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
       return false;
@@ -1642,14 +1643,14 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
-   kk_limina_counts.unroll_calls++;
+   p_atomic_inc(&kk_limina_counts.unroll_calls);
    if (data->prim == MESA_PRIM_TRIANGLE_FAN)
-      kk_limina_counts.unroll_fan++;
+      p_atomic_inc(&kk_limina_counts.unroll_fan);
    else if (data->prim == MESA_PRIM_TRIANGLE_STRIP ||
             data->prim == MESA_PRIM_LINE_STRIP)
-      kk_limina_counts.unroll_strip++;
+      p_atomic_inc(&kk_limina_counts.unroll_strip);
    else
-      kk_limina_counts.unroll_other++;
+      p_atomic_inc(&kk_limina_counts.unroll_other);
 
    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
       return false;
@@ -2542,13 +2543,13 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       !tess && (trig_fan || trig_promote || trig_robust || trig_restart);
    if (requires_unroll) {
       if (trig_fan)
-         kk_limina_counts.unroll_trig_fan++;
+         p_atomic_inc(&kk_limina_counts.unroll_trig_fan);
       else if (trig_promote)
-         kk_limina_counts.unroll_trig_promote++;
+         p_atomic_inc(&kk_limina_counts.unroll_trig_promote);
       else if (trig_robust)
-         kk_limina_counts.unroll_trig_robust++;
+         p_atomic_inc(&kk_limina_counts.unroll_trig_robust);
       else
-         kk_limina_counts.unroll_trig_restart++;
+         p_atomic_inc(&kk_limina_counts.unroll_trig_restart);
    }
    if (requires_unroll && !kk_unroll_geometry(cmd, data))
       return;
