@@ -34,6 +34,21 @@
 #include <smmintrin.h>
 #endif
 
+/* limina: Apple clang 21 cannot assemble this file under -fsanitize=thread: the aarch64
+ * non-temporal-load path below contains an inline __asm__ block, and combined with TSan's
+ * instrumentation it produces "error: invalid CFI advance_loc expression". Neither a
+ * tsan-blacklist src: entry nor __attribute__((no_sanitize("thread"))) avoids it -- TSan changes
+ * CFI generation for the whole translation unit, not just instrumented functions.
+ *
+ * So compile the portable path instead when building with TSan. This costs a non-temporal-load
+ * optimisation in a sanitizer build, which is the cheapest thing in sight to give up, and it is
+ * what makes a TSan build of Mesa possible on this toolchain at all. THREAD_SANITIZER is Mesa's
+ * own define, set by meson whenever b_sanitize includes thread. */
+#if defined(THREAD_SANITIZER)
+#undef DETECT_CC_GCC
+#define DETECT_CC_GCC 0
+#endif
+
 /* Copies memory from src to dst, using non-temporal load instructions to get
  * streaming read performance from uncached memory.
  */
