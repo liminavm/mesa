@@ -25,6 +25,7 @@
  */
 
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
 #include "zink_resource.h"
@@ -157,7 +158,7 @@ zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink
       ctx->bs->has_reordered_work = true;
       return ctx->bs->reordered_cmdbuf;
    }
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    return ctx->bs->cmdbuf;
 }
 

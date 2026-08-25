@@ -22,6 +22,7 @@
  */
 
 #include "zink_clear.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
 #include "zink_fence.h"
@@ -108,7 +109,7 @@ zink_context_destroy(struct pipe_context *pctx)
 
 #if HAVE_RENDERDOC_INTEGRATION
    if (screen->base.num_contexts == 1 && screen->renderdoc_capturing) {
-      ctx->bs->has_work = true;
+      p_atomic_set(&ctx->bs->has_work, true);
       pctx->flush(pctx, NULL, 0);
    }
 #endif
@@ -3636,7 +3637,7 @@ zink_batch_rp(struct zink_context *ctx)
    if (ctx->unordered_blitting)
       ctx->bs->has_reordered_work = true;
    else
-      ctx->bs->has_work = true;
+      p_atomic_set(&ctx->bs->has_work, true);
 
    /* update the render-passes HUD query */
    ctx->hud.render_passes++;
@@ -4020,7 +4021,7 @@ stall(struct zink_context *ctx)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    sync_flush(ctx, ctx->last_batch_state);
-   zink_screen_timeline_wait(screen, ctx->last_batch_state->fence.batch_id, OS_TIMEOUT_INFINITE);
+   zink_screen_timeline_wait(screen, p_atomic_read(&ctx->last_batch_state->fence.batch_id), OS_TIMEOUT_INFINITE);
 }
 
 void
@@ -4155,7 +4156,7 @@ unbind_fb_surface(struct zink_context *ctx, const struct pipe_surface *surf, uns
    res->fb_binds &= ~BITFIELD_BIT(idx);
    batch_ref_fb_surface(ctx, surf);
    /* this is called just before the resource loses a reference, so a refcount==1 means the resource will be destroyed */
-   if (!res->fb_bind_count && res->base.b.reference.count > 1) {
+   if (!res->fb_bind_count && p_atomic_read(&res->base.b.reference.count) > 1) {
       if (ctx->track_renderpasses && !ctx->blitting && res->obj->access & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) {
          pre_sync_transfer_barrier(ctx, res, false);
       }
@@ -4505,7 +4506,7 @@ zink_flush(struct pipe_context *pctx,
       if (zink_screen_handle_vkresult(screen, result)) {
          assert(!ctx->bs->signal_semaphore);
          ctx->bs->signal_semaphore = export_sem;
-         ctx->bs->has_work = true;
+         p_atomic_set(&ctx->bs->has_work, true);
       } else {
          mesa_loge("ZINK: vkCreateSemaphore failed (%s)", vk_Result_to_str(result));
 
@@ -4555,8 +4556,10 @@ zink_flush(struct pipe_context *pctx,
       mfence->fence = &bs->fence;
       mfence->sem = export_sem;
       if (bs) {
-         mfence->submit_count = bs->usage.submit_count;
+         mfence->submit_count = p_atomic_read(&bs->usage.submit_count);
+         simple_mtx_lock(&bs->fence.mfences_lock);
          util_dynarray_append(&bs->fence.mfences, mfence);
+         simple_mtx_unlock(&bs->fence.mfences_lock);
       }
       if (export_sem) {
          pipe_reference(NULL, &mfence->reference);
@@ -4601,7 +4604,7 @@ zink_wait_on_batch(struct zink_context *ctx, uint64_t batch_id)
       flush_batch(ctx, true);
       bs = ctx->last_batch_state;
       assert(bs);
-      batch_id = bs->fence.batch_id;
+      batch_id = p_atomic_read(&bs->fence.batch_id);
    }
    assert(batch_id);
    if (!zink_screen_timeline_wait(zink_screen(ctx->base.screen), batch_id, UINT64_MAX))
@@ -4680,7 +4683,7 @@ zink_texture_barrier(struct pipe_context *pctx, unsigned flags)
          0, NULL
       );
    }
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
 }
 
 static inline void
@@ -4693,7 +4696,7 @@ mem_barrier(struct zink_context *ctx, VkPipelineStageFlags src_stage, VkPipeline
    mb.dstAccessMask = dst;
    zink_batch_no_rp(ctx);
    VKCTX(CmdPipelineBarrier)(ctx->bs->cmdbuf, src_stage, dst_stage, 0, 1, &mb, 0, NULL, 0, NULL);
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
 }
 
 void
@@ -5555,7 +5558,7 @@ zink_resource_commit(struct pipe_context *pctx, struct pipe_resource *pres, unsi
    bool ret = zink_bo_commit(ctx, res, level, box, commit, &ctx->bs->sparse_semaphore);
    if (ret) {
       zink_batch_reference_resource_rw(ctx, res, true);
-      ctx->bs->has_work = true;
+      p_atomic_set(&ctx->bs->has_work, true);
    } else {
       check_device_lost(ctx);
    }
