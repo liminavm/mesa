@@ -22,6 +22,7 @@
  */
 
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_fence.h"
 
@@ -165,7 +166,7 @@ zink_fence_finish(struct zink_screen *screen, struct pipe_context *pctx, struct 
    if (pctx && mfence->deferred_ctx == pctx) {
       if (mfence->fence == ctx->deferred_fence &&
           zink_batch_state(mfence->fence)->usage.submit_count == mfence->submit_count) {
-         zink_context(pctx)->bs->has_work = true;
+         p_atomic_set(&zink_context(pctx)->bs->has_work, true);
          /* this must be the current batch */
          pctx->flush(pctx, NULL, !timeout_ns ? PIPE_FLUSH_ASYNC : 0);
          if (!timeout_ns)
@@ -272,7 +273,7 @@ zink_fence_server_signal(struct pipe_context *pctx, struct pipe_fence_handle *pf
 
    util_dynarray_append(&ctx->bs->user_signal_semaphores, mfence->sem);
    util_dynarray_append(&ctx->bs->user_signal_semaphore_values, value);
-   bs->has_work = true;
+   p_atomic_set(&bs->has_work, true);
 
 
    /* this must produce a synchronous flush that completes before the function returns */
