@@ -22,6 +22,7 @@
  */
 
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_clear.h"
 #include "zink_context.h"
 #include "zink_format.h"
@@ -108,7 +109,7 @@ clear_in_rp(struct pipe_context *pctx,
    cr.layerCount = util_framebuffer_get_num_layers(fb);
    assert(ctx->in_rp);
    VKCTX(CmdClearAttachments)(ctx->bs->cmdbuf, num_attachments, attachments, 1, &cr);
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    /*
        Rendering within a subpass containing a feedback loop creates a data race, except in the following
        cases:
