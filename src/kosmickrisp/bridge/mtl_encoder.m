@@ -409,7 +409,18 @@ mtl_new_render_command_encoder_with_descriptor(
          limina_log_attachment("stencil", 0, desc.stencilAttachment);
          fflush(stderr);
       }
-      return (mtl_render_encoder *)limina_mtl_note_new([[cmd renderCommandEncoderWithDescriptor:desc] retain]);
+      id<MTL4RenderCommandEncoder> new_enc =
+         [[cmd renderCommandEncoderWithDescriptor:desc] retain];
+      /* limina: RPLOG prints the descriptor BEFORE the encoder exists, so a log
+       * reader has no way to tie draws (keyed by encoder) to the pass they
+       * belong to. Encoder pointers recycle across command buffers, so binding
+       * enc->pass on first sight silently attributes later draws to a dead
+       * pass. This line closes the pass; parse it, never infer. */
+      if (limina_kk_rplog_cached()) {
+         fprintf(stderr, "[LIMINA-KK-RPENC] enc=%p\n", (void *)new_enc);
+         fflush(stderr);
+      }
+      return (mtl_render_encoder *)limina_mtl_note_new(new_enc);
    }
 }
 
@@ -452,6 +463,13 @@ mtl_render_set_pipeline_state(mtl_render_encoder *encoder,
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       id<MTLRenderPipelineState> pipe = (id<MTLRenderPipelineState>)pipeline;
+      /* limina: the pipeline identity is the discriminator between the cogl
+       * journal draw (which inks) and the clutter/pango glyph draw (which does
+       * not) -- see spikes/notification-text-corruption. Cheap and needs no
+       * fence, unlike every dimension the investigation reached for first. */
+      if (limina_kk_rtlog_cached())
+         fprintf(stderr, "[LIMINA-KK-PIPE] enc=%p pipe=%p\n", (void *)enc,
+                 (void *)pipe);
       [enc setRenderPipelineState:pipe];
    }
 }
@@ -584,6 +602,12 @@ mtl_draw_indexed_primitives(mtl_render_encoder *encoder,
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       MTLIndexType ndx_type = (MTLIndexType)index_type;
       MTLPrimitiveType primitive = (MTLPrimitiveType)primitve_type;
+      if (limina_kk_rtlog_cached())
+         fprintf(stderr,
+                 "[LIMINA-KK-DRAW] enc=%p type=%lu indexed count=%u inst=%u\n",
+                 (void *)enc, (unsigned long)primitive, index_count,
+                 instance_count);
+      limina_stats_bump(&limina_st_draw);
       [enc drawIndexedPrimitives:primitive
                       indexCount:index_count
                        indexType:ndx_type
@@ -602,6 +626,10 @@ mtl_draw_primitives_indirect(mtl_render_encoder *encoder,
 {
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
+      if (limina_kk_rtlog_cached())
+         fprintf(stderr, "[LIMINA-KK-DRAW] enc=%p type=%lu indirect\n",
+                 (void *)enc, (unsigned long)primitve_type);
+      limina_stats_bump(&limina_st_draw);
       [enc drawPrimitives:(MTLPrimitiveType)primitve_type indirectBuffer:addr];
    }
 }
@@ -618,6 +646,11 @@ mtl_draw_indexed_primitives_indirect(mtl_render_encoder *encoder,
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       MTLPrimitiveType type = (MTLPrimitiveType)primitve_type;
       MTLIndexType ndx_type = (MTLIndexType)index_type;
+      if (limina_kk_rtlog_cached())
+         fprintf(stderr,
+                 "[LIMINA-KK-DRAW] enc=%p type=%lu indexed-indirect\n",
+                 (void *)enc, (unsigned long)type);
+      limina_stats_bump(&limina_st_draw);
       [enc drawIndexedPrimitives:type
                        indexType:ndx_type
                      indexBuffer:index_addr

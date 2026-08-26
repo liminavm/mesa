@@ -926,8 +926,14 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       const char *dumpdir = getenv("KK_LIMINA_SHADER_DUMP");
       if (unlikely(dumpdir != NULL)) {
          char path[512];
-         snprintf(path, sizeof(path), "%s/nir-%p-stage%u.nir", dumpdir, (void *)shader,
-                  (unsigned)stage);
+         /* limina: the file name must carry a compile counter. Keyed by shader pointer
+          * alone, a SECOND compile of the same shader against a DIFFERENT
+          * vk_vertex_input_state silently overwrites the first, and the surviving file
+          * then attributes the wrong vertex layout to every draw that bound it. */
+         static _Atomic unsigned dump_seq;
+         unsigned nth = atomic_fetch_add_explicit(&dump_seq, 1, memory_order_relaxed);
+         snprintf(path, sizeof(path), "%s/nir-%p-stage%u-c%04u.nir", dumpdir, (void *)shader,
+                  (unsigned)stage, nth);
          FILE *f = fopen(path, "w");
          if (f != NULL) {
             /* The NIR here is post vertex-input lowering, so an attribute fetched as 32x2 in one

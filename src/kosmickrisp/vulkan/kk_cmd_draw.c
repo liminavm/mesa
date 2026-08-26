@@ -2482,6 +2482,15 @@ kk_xfb_post_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
 static void
 kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
+   /* [LIMINA] Entry counter for the notification-text work: paired with the
+    * mtl_draw_* probes it brackets a vanishing draw to one side of dispatch.
+    * Present here and absent at encode means KK dropped it on one of the bails
+    * below; absent here means it never left zink. */
+   if (kk_limina_rtlog())
+      fprintf(stderr, "[LIMINA-KK-KKDRAW] enter area=%ux%u indexed=%d draws=%u\n",
+              cmd->state.gfx.render.area.extent.width,
+              cmd->state.gfx.render.area.extent.height,
+              data->indexed ? 1 : 0, data->draw_count);
    kk_flush_gfx_state(cmd);
 
    /* [LIMINA] The one input still unread when a label's second render pass rasterises nothing.
@@ -2523,8 +2532,11 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
 
    /* Convert to indirect and process predicates. Skip draw if we fail. */
-   if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
+   if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data)) {
+      if (kk_limina_rtlog())
+         fprintf(stderr, "[LIMINA-KK-KKDRAW] BAIL predicate\n");
       return;
+   }
 
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
 
@@ -2551,8 +2563,11 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       else
          p_atomic_inc(&kk_limina_counts.unroll_trig_restart);
    }
-   if (requires_unroll && !kk_unroll_geometry(cmd, data))
+   if (requires_unroll && !kk_unroll_geometry(cmd, data)) {
+      if (kk_limina_rtlog())
+         fprintf(stderr, "[LIMINA-KK-KKDRAW] BAIL unroll\n");
       return;
+   }
 
    bool xfb_track =
       unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);
