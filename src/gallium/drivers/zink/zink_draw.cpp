@@ -696,7 +696,19 @@ zink_draw(struct pipe_context *pctx,
    if (have_streamout && ctx->dirty_so_targets)
       zink_emit_stream_output_targets(pctx);
 
-   bool pipeline_changed = ctx->gfx_pipeline_state.dirty || rp_state != ctx->gfx_pipeline_state.rp_state || ctx->gfx_dirty || ctx->dirty_gfx_stages || prim_changed || BATCH_CHANGED ?
+   /* Where vertex input is compiled into the pipeline rather than set dynamically,
+    * a vertex-element change must force the pipeline lookup: element_state feeds
+    * VkPipelineVertexInputStateCreateInfo (see needs_vi in zink_pipeline.c), so a draw
+    * that inherits the previously bound pipeline silently applies the previous draw's
+    * attribute formats and offsets. Vulkan cannot catch that -- the vertex stage simply
+    * fetches at the wrong stride and rasterises nothing. The VERTEX_INPUT paths are
+    * exempt because they set the state with CmdSetVertexInputEXT below instead.
+    */
+   const bool vi_is_static = DYNAMIC_STATE != ZINK_DYNAMIC_VERTEX_INPUT &&
+                             DYNAMIC_STATE != ZINK_DYNAMIC_VERTEX_INPUT2;
+   bool pipeline_changed = ctx->gfx_pipeline_state.dirty || rp_state != ctx->gfx_pipeline_state.rp_state ||
+                           ctx->gfx_dirty || ctx->dirty_gfx_stages || prim_changed || BATCH_CHANGED ||
+                           (vi_is_static && ctx->vertex_state_changed) ?
                            update_gfx_pipeline<DYNAMIC_STATE, BATCH_CHANGED>(ctx, bs, mode) :
                            false;
 
