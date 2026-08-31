@@ -48,12 +48,13 @@
  * the decay clock do the real work. */
 #define KK_ALLOC_FLOOR_DEFAULT 8
 
-/* Encoder closes between pool reports. Matches the KK counts block's own cadence so a log holds
- * both halves of the picture at the same moments. */
-#define KK_ALLOC_REPORT_EVERY 2000u
+/* Seconds between pool reports. A count of encoder closes reads as conservative and is not: a
+ * busy desktop closes thousands a second, so the cadence of a line meant for human eyes ends up
+ * set by how hard the GPU is working. Pace it by the clock instead. */
+#define KK_ALLOC_REPORT_SECS 10u
 
-/* Encoder closes between on-disk snapshots. Two orders tighter than the log line: this one is
- * read after a crash, so staleness is the only thing that matters about it. */
+/* Encoder closes between on-disk snapshot attempts. The snapshot has its own one-second clock;
+ * this only keeps the time read off the very hottest path. */
 #define KK_ALLOC_SNAPSHOT_EVERY 25u
 
 static uint64_t
@@ -424,9 +425,13 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa, uint32_
    /* Start the decay clock if it is already drained; otherwise the last discharge does it. */
    if (pa->draining && pa->pending == 0)
       pa->idle_since = os_time_get_nano();
-   /* Report on the same cadence as the KK counts block so the two read together in one log.
-    * Riding the release path rather than the tick keeps the device pointer in hand. */
-   const bool due = (++pool->releases % KK_ALLOC_REPORT_EVERY) == 0;
+   /* Riding the release path rather than a tick keeps the device pointer in hand; the clock,
+    * not the release count, decides when a line is due. */
+   pool->releases++;
+   const uint64_t now_ns = os_time_get_nano();
+   const bool due = now_ns - pool->report_last_ns >= (uint64_t)KK_ALLOC_REPORT_SECS * 1000000000ull;
+   if (due)
+      pool->report_last_ns = now_ns;
    /* The snapshot is a few hundred bytes over a truncating write, so it can run far more often
     * than the log line — the point is that it is never stale when a crash reads it. */
    if (pool->releases % KK_ALLOC_SNAPSHOT_EVERY == 0)
