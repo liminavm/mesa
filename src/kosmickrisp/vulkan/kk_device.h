@@ -170,6 +170,9 @@ struct kk_alloc_pool {
    uint32_t resets[KK_ALLOC_CLASS_COUNT];
    uint32_t unmatched_discharge;
    uint32_t releases; /* drives the periodic report; no cadence of its own to plumb */
+   /* Snapshot file, one per pool (a worker has many VkDevices), written at most once a second. */
+   char snapshot_path[1024];
+   uint64_t snapshot_last_ns;
 };
 
 /* util_dynarray's macros take a single type token, so give the pointer a name. */

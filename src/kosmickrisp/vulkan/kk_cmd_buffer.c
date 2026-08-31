@@ -615,6 +615,17 @@ kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd, uint64_t addr)
  * deliberately off by default: `norestart` is not generally correct (input attachments read as
  * textures need the pass break) and `widen` is a blunt over-synchronisation. They exist to split
  * "KK delivers the ordering zink asks for" from "KK drops or mis-scopes it". */
+bool
+kk_limina_import_trace(void)
+{
+   static int on = -1;
+   if (unlikely(on < 0)) {
+      const char *e = getenv("LIMINA_KK_IMPORT_TRACE");
+      on = e && e[0] && e[0] != '0';
+   }
+   return on;
+}
+
 enum kk_limina_barrier_mode
 kk_limina_barrier_mode(void)
 {

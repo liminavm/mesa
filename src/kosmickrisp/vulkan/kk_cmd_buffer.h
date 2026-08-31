@@ -538,4 +538,8 @@ enum kk_limina_barrier_mode {
 };
 enum kk_limina_barrier_mode kk_limina_barrier_mode(void);
 
+/* LIMINA_KK_IMPORT_TRACE: per-texture import logging. Off by default — it is one line per
+ * adopted texture, which is thousands a second at frame rate. */
+bool kk_limina_import_trace(void);
+
 #endif

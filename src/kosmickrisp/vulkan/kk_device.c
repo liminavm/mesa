@@ -137,18 +137,31 @@ __thread struct kk_pooled_alloc *kk_tls_open_alloc;
 static void
 kk_pool_snapshot(struct kk_alloc_pool *pool)
 {
-   static const char *path;
+   static const char *base;
    static bool looked_up;
    if (!looked_up) {
-      path = getenv("LIMINA_KK_POOL_SNAPSHOT");
-      if (path && !path[0])
-         path = NULL;
+      base = getenv("LIMINA_KK_POOL_SNAPSHOT");
+      if (base && !base[0])
+         base = NULL;
       looked_up = true;
    }
-   if (!path)
+   if (!base)
       return;
 
-   FILE *f = fopen(path, "w");
+   /* A worker holds MANY VkDevices — one per venus context — and each has its own pool. Writing
+    * them all to one path made the file whichever device wrote last, so its counters appeared to
+    * move BACKWARDS between samples. One file per pool instead. */
+   if (!pool->snapshot_path[0]) {
+      snprintf(pool->snapshot_path, sizeof(pool->snapshot_path), "%s.%p", base, (void *)pool);
+   }
+   /* And rate-limit by TIME, not by encoder closes: at 2000 closes a second the every-25 cadence
+    * was ~80 opens a second per device, on a hot path, for a file nothing reads until a crash. */
+   const uint64_t now = os_time_get_nano();
+   if (pool->snapshot_last_ns && now - pool->snapshot_last_ns < 1000000000ull)
+      return;
+   pool->snapshot_last_ns = now;
+
+   FILE *f = fopen(pool->snapshot_path, "w");
    if (!f)
       return;
    for (unsigned k = 0; k < KK_ALLOC_CLASS_COUNT; ++k) {

@@ -7,6 +7,8 @@
 
 #include "kk_image.h"
 
+#include "kk_cmd_buffer.h"
+
 #include "kk_bo.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
@@ -1076,7 +1078,10 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
       }
       KK_TEX_CENSUS_ACQUIRE(); /* limina census: adopted import (or its sRGB view) */
       plane->addr = 0u;
-      fprintf(stderr,
+      /* limina: one line per adopted texture is thousands a second at frame rate — 1.4 GB of
+       * dogfood supervisor log in 45 minutes. Keep it for import debugging, behind a switch. */
+      if (unlikely(kk_limina_import_trace()))
+         fprintf(stderr,
               "[LIMINA-KK-IMPORT] adopted MTLTexture %p (srgb_view=%d) for image plane: %ux%u "
               "type=%u fmt=%u usage=0x%x (image usage=0x%x linear=%u optimized=%u)\n",
               mem->bo->texture, srgb_view_ok, plane->layout.width_px, plane->layout.height_px,
