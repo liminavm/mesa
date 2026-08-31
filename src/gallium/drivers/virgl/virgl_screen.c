@@ -775,7 +775,28 @@ static bool virgl_is_video_format_supported(struct pipe_screen *screen,
                                             enum pipe_video_profile profile,
                                             enum pipe_video_entrypoint entrypoint)
 {
-    return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
+   /* A decoder does not produce three-plane 4:2:0. The generic helper answers a
+    * different question than the one asked -- its own comment is "we at least need to
+    * sample from it" -- so it accepts NV12, YV12 and IYUV alike, all of which decompose
+    * to R8 and so all of which the screen can sample. Every other driver implementing
+    * this hook answers from real decode caps instead (radeonsi, si_vid_is_format_supported);
+    * virgl deferred wholesale.
+    *
+    * The result is not a harmless surplus. ffmpeg chooses a surface format by exact match
+    * against sw_pix_fmt (vaapi_decode_find_best_format, and get_pix_fmt_score short-circuits
+    * to INT_MAX when dst == src), so for an 8-bit 4:2:0 stream I420 and YV12 both outscore
+    * NV12 and the last one advertised wins. Firefox then refuses the surface it is handed,
+    * tears down its frame pool and decodes in software: hardware decode is advertised,
+    * selected, and silently never used.
+    *
+    * So the two planar 4:2:0 layouts are withheld from decode targets, leaving NV12 -- what
+    * VA-API decoders actually emit. Encode and video processing are untouched, and so is
+    * every other format. */
+   if (entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM &&
+       (format == PIPE_FORMAT_YV12 || format == PIPE_FORMAT_IYUV))
+      return false;
+
+   return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
 }
 
 
