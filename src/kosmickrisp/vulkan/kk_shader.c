@@ -264,13 +264,26 @@ kk_nir_swizzle_fragment_output(nir_builder *b, nir_intrinsic_instr *intrin,
 
    const struct vk_graphics_pipeline_state *state =
       (const struct vk_graphics_pipeline_state *)data;
-   VkFormat vk_format =
-      state->rp->color_attachment_formats[slot - FRAG_RESULT_DATA0];
+   const unsigned index = slot - FRAG_RESULT_DATA0;
+
+   /* A fragment shader may legally write outputs the pipeline has no attachment for; Vulkan
+    * just ignores them. color_attachment_formats is a fixed-size array, so an unbacked output
+    * reads a slot that was never initialised for this pipeline rather than something out of
+    * bounds — which is worse, because the value looks like a format and is not one. */
+   if (!state->rp || index >= state->rp->color_attachment_count)
+      return false;
+
+   VkFormat vk_format = state->rp->color_attachment_formats[index];
    if (vk_format == VK_FORMAT_UNDEFINED)
       return false;
 
    enum pipe_format format = vk_format_to_pipe_format(vk_format);
    const struct kk_va_format *supported_format = kk_get_va_format(format);
+   /* NULL for any format outside kk_vf_formats. Dereferencing it unchecked killed a dogfood
+    * worker on 2026-08-31 (SIGSEGV reading is_native at NULL+0xb, from a browser's pipeline
+    * creation on a venus ring thread). Nothing to swizzle for a format we do not describe. */
+   if (!supported_format)
+      return false;
 
    /* Check if we have to apply any swizzle */
    if (!supported_format->is_native) {
