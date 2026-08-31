@@ -721,6 +721,12 @@ kk_limina_counts_tick(const char *why)
               100.0 * kk_limina_heap_hiwater / kk_limina_heap_size);
    }
    fprintf(stderr,
+           "[LIMINA]   copies: buf->img=%llu img->buf=%llu img->img=%llu buf->buf=%llu\n",
+           (unsigned long long)kk_limina_counts.copy_buffer_to_image,
+           (unsigned long long)kk_limina_counts.copy_image_to_buffer,
+           (unsigned long long)kk_limina_counts.copy_image_to_image,
+           (unsigned long long)kk_limina_counts.copy_buffer_to_buffer);
+   fprintf(stderr,
            "[LIMINA]   unroll triggers: fan=%llu promote=%llu robust=%llu restart=%llu\n",
            (unsigned long long)kk_limina_counts.unroll_trig_fan,
            (unsigned long long)kk_limina_counts.unroll_trig_promote,

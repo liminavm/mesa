@@ -22,6 +22,7 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
                   const VkCopyBufferInfo2 *pCopyBufferInfo)
 {
+   p_atomic_inc(&kk_limina_counts.copy_buffer_to_buffer);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_buffer, src, pCopyBufferInfo->srcBuffer);
    VK_FROM_HANDLE(kk_buffer, dst, pCopyBufferInfo->dstBuffer);
@@ -86,6 +87,7 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
                          const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
 {
+   p_atomic_inc(&kk_limina_counts.copy_buffer_to_image);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_buffer, buffer, pCopyBufferToImageInfo->srcBuffer);
    VK_FROM_HANDLE(kk_image, image, pCopyBufferToImageInfo->dstImage);
@@ -116,6 +118,7 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                          const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
 {
+   p_atomic_inc(&kk_limina_counts.copy_image_to_buffer);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, image, pCopyImageToBufferInfo->srcImage);
    VK_FROM_HANDLE(kk_buffer, buffer, pCopyImageToBufferInfo->dstBuffer);
@@ -351,6 +354,7 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
                  const VkCopyImageInfo2 *pCopyImageInfo)
 {
+   p_atomic_inc(&kk_limina_counts.copy_image_to_image);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);

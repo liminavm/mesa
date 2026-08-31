@@ -163,6 +163,12 @@ struct kk_alloc_pool {
    /* Destroyed allocators, kept (not freed) so a stale pointer is detectable. */
    struct util_dynarray tombstones; /* struct kk_pooled_alloc * */
    uint32_t use_after_destroy;
+   /* Resets performed, and discharges that arrived with pending already 0. `pending` is the ONE
+    * guard standing between a reset and an allocator the GPU is still reading, so an unmatched
+    * discharge is how that guard fails silently. In a release build the assert() beside it is
+    * compiled out, which is exactly the build the dogfood crash came from. */
+   uint32_t resets[KK_ALLOC_CLASS_COUNT];
+   uint32_t unmatched_discharge;
    uint32_t releases; /* drives the periodic report; no cadence of its own to plumb */
 };
 

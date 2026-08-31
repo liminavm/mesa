@@ -105,9 +105,12 @@ kk_alloc_pool_report(struct kk_device *dev, const char *why)
               (unsigned long long)(pool->budget_bytes >> 10), pool->over_budget[k],
               pool->peak_ops[k]);
    }
-   fprintf(stderr, "[LIMINA-ALLOC-POOL] %s tombstones=%u use-after-destroy=%u\n", why,
-           (unsigned)util_dynarray_num_elements(&pool->tombstones, kk_pooled_alloc_ptr),
-           pool->use_after_destroy);
+   fprintf(stderr,
+           "[LIMINA-ALLOC-POOL] %s tombstones=%u use-after-destroy=%u | resets=%u/%u "
+           "(render/compute) unmatched-discharge=%u\n",
+           why, (unsigned)util_dynarray_num_elements(&pool->tombstones, kk_pooled_alloc_ptr),
+           pool->use_after_destroy, pool->resets[KK_ALLOC_CLASS_RENDER],
+           pool->resets[KK_ALLOC_CLASS_COMPUTE], pool->unmatched_discharge);
    fflush(stderr);
    simple_mtx_unlock(&pool->mtx);
 }
@@ -244,6 +247,7 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
          if (pa->in_use || pa->pending != 0)
             continue;
          assert(pa->draining);
+         pool->resets[klass]++;
          mtl_command_allocator_reset(pa->handle);
          pa->draining = false;
          pa->idle_since = 0;
@@ -390,8 +394,19 @@ kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa)
       return;
    }
    assert(pa->pending > 0);
-   if (pa->pending > 0)
+   if (pa->pending > 0) {
       pa->pending--;
+   } else {
+      /* An unmatched discharge means the charge ledger is broken, and the next acquire may reset
+       * this allocator while the GPU still reads it. Say so where it happens rather than leaving
+       * it to surface as a nil store inside AGX. */
+      dev->alloc_pool.unmatched_discharge++;
+      fprintf(stderr,
+              "[LIMINA-ALLOC-POOL] UNMATCHED DISCHARGE on allocator %p (class %u, %u begins) — "
+              "pending was already 0, so a reset can now land under live GPU work\n",
+              (void *)pa, pa->klass, pa->begins);
+      fflush(stderr);
+   }
    /* The GPU is done with everything begun here, so a retired allocator is now surplus-eligible
     * and its decay clock starts. Not eligible while borrowed — release() stamps that case. */
    if (pa->pending == 0 && pa->draining && !pa->in_use)

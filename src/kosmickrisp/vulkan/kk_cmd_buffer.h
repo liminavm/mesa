@@ -516,6 +516,14 @@ struct kk_limina_counts {
     * guest-side flush is exactly what moves where passes end. */
    uint64_t store_dontcare;
    uint64_t store_dontcare_small;
+   /* Which copy entry point the compute encoders are actually carrying. The 2026-08-31 crash was
+    * inside a buffer->image blit specifically (kk_CmdCopyBufferToImage2 -> blitCDMBufferToTexture),
+    * and "the compute encoder is busy" does not establish that: every KK copy is a compute
+    * dispatch, and so is every app dispatch. Attribute them rather than infer. */
+   uint64_t copy_buffer_to_image;
+   uint64_t copy_image_to_buffer;
+   uint64_t copy_image_to_image;
+   uint64_t copy_buffer_to_buffer;
 };
 extern struct kk_limina_counts kk_limina_counts;
 void kk_limina_counts_tick(const char *why);
