@@ -764,6 +764,13 @@ static bool virgl_is_video_format_supported(struct pipe_screen *screen,
                                             enum pipe_video_profile profile,
                                             enum pipe_video_entrypoint entrypoint)
 {
+    /* A decoder emits NV12 (or P010/P016); the generic helper only checks
+     * that the planes can be sampled, so it would also offer YV12/I420,
+     * which ffmpeg prefers by exact match for 8-bit 4:2:0 streams. */
+    if (entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM &&
+        (format == PIPE_FORMAT_YV12 || format == PIPE_FORMAT_IYUV))
+        return false;
+
     return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
 }
 
