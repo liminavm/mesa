@@ -1104,6 +1104,35 @@ bool virgl_resource_get_handle(struct pipe_screen *screen,
    else
       stride = res->metadata.stride[0];
 
+   /*
+    * Never hand out a dmabuf smaller than the image it claims to describe.
+    *
+    * A virgl resource whose storage lives on the host has a guest BO that is only a stub --
+    * one page, whatever the resolution -- so drmPrimeHandleToFD below happily returns an fd
+    * naming 4096 bytes for a multi-megabyte surface. Nothing in the descriptor says so:
+    * VADRMPRIMESurfaceDescriptor reports the layer geometry, which is correct, and an object
+    * size the winsys never fills in, which reads as 0. A consumer that trusts the geometry,
+    * maps the fd and copies the frame out -- GStreamer's dmabuf uploader does exactly that
+    * whenever no direct dmabuf-to-texture import is available -- walks off the end of the
+    * first page and dies with SIGBUS.
+    *
+    * Refusing the export is the honest answer: the caller then negotiates system memory,
+    * which costs a copy per frame and works. Exporting host-backed decode targets for real
+    * requires them to be host-mappable blobs, which is a larger change.
+    *
+    * The predicate is the one virgl_resource_from_handle already uses to decide a resource
+    * needs staging: the laid-out size exceeds the guest storage behind it. A resource in that
+    * state has no guest memory holding its pixels, so there is nothing an fd can usefully
+    * name. Only a definite, too-small size refuses -- an unknown (0) size on either side keeps
+    * the previous behaviour rather than breaking exports this cannot reason about.
+    */
+   if (whandle->type == WINSYS_HANDLE_TYPE_FD && vs->vws->resource_get_storage_size) {
+      uint32_t storage = vs->vws->resource_get_storage_size(vs->vws, res->hw_res);
+
+      if (storage && res->metadata.total_size && res->metadata.total_size > storage)
+         return false;
+   }
+
    return vs->vws->resource_get_handle(vs->vws, res->hw_res, stride, whandle);
 }
 
