@@ -211,7 +211,7 @@ kk_encoder_begin(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
    kk_pooled_alloc_ptr *slot =
       util_dynarray_grow(&cmd->charged_allocs, kk_pooled_alloc_ptr, 1);
    if (slot == NULL) {
-      kk_alloc_pool_release(dev, es->pa);
+      kk_alloc_pool_release(dev, es->pa, 0);
       es->pa = NULL;
       es->allocator = NULL;
       return false;
@@ -437,6 +437,7 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    }
    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
       cmd->gfx.cmd_buf, state->render_pass_descriptor);
+   cmd->gfx.ops = 0;
 
    /* limina: name the encoder when this pass is one the triggered capture is hunting, so the
     * working/failing pair is findable by name in Xcode rather than by scrubbing every encoder. */
@@ -482,6 +483,7 @@ cs_get_render(struct kk_cmd_buffer *cmd)
       cs_start_render(cmd);
    }
 
+   cmd->gfx.ops++;
    return cmd->gfx.encoder;
 }
 
@@ -498,6 +500,7 @@ kk_start_compute_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
       return;
    }
    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
+   es->ops = 0;
 
    /* Argument table won't ever change */
    mtl_compute_set_argument_table(es->encoder, argument_table);
@@ -527,12 +530,14 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
                                   cmd->argument_table);
       }
       encoder = cmd->pre_gfx->encoder;
+      cmd->pre_gfx->ops++;
    } else {
       if (!cmd->post_gfx->encoder) {
          kk_start_compute_encoder(cmd, cmd->post_gfx, dev->mtl_handle,
                                   cmd->argument_table);
       }
       encoder = cmd->post_gfx->encoder;
+      cmd->post_gfx->ops++;
    }
 
    return encoder;
@@ -560,7 +565,7 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
    /* limina: reuse is legal the moment the command buffer ends (Apple: "You can safely reuse
     * command allocators after ending the command buffer"); only *reset* needs GPU completion,
     * which the pool gates on the charge taken at begin. So the borrow goes back now. */
-   kk_alloc_pool_release(kk_cmd_buffer_device(cmd), es->pa);
+   kk_alloc_pool_release(kk_cmd_buffer_device(cmd), es->pa, es->ops);
    es->pa = NULL;
    es->allocator = NULL;
 

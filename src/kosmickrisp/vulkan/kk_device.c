@@ -45,6 +45,10 @@
  * the decay clock do the real work. */
 #define KK_ALLOC_FLOOR_DEFAULT 8
 
+/* Encoder closes between pool reports. Matches the KK counts block's own cadence so a log holds
+ * both halves of the picture at the same moments. */
+#define KK_ALLOC_REPORT_EVERY 2000u
+
 static uint64_t
 kk_env_u64(const char *name, uint64_t dflt)
 {
@@ -56,6 +60,58 @@ kk_env_u64(const char *name, uint64_t dflt)
    return (end != e && *end == '\0') ? (uint64_t)v : dflt;
 }
 
+/* limina: the use-after-destroy detector. A destroyed allocator keeps its struct, stamped DEAD,
+ * so every pool entry point can tell a stale pointer from a live one. Returns false when the
+ * pointer is stale, having already said so; the caller must then do nothing with it.
+ *
+ * Loud by design: this is hunting a fault that otherwise lands as a nil store deep inside AGX,
+ * where the stack names Apple's code and not ours. LIMINA_KK_ALLOC_GUARD=abort promotes the
+ * report to an abort() so a core dump is taken at the moment of misuse rather than later. */
+static bool
+kk_pa_live(struct kk_alloc_pool *pool, struct kk_pooled_alloc *pa, const char *where)
+{
+   if (likely(pa->magic == KK_PA_LIVE))
+      return true;
+
+   pool->use_after_destroy++;
+   fprintf(stderr,
+           "[LIMINA-ALLOC-POOL] USE AFTER DESTROY: %s() reached allocator %p with magic %08x "
+           "(class %u, %u begins) — this allocator was destroyed while something still held it\n",
+           where, (void *)pa, pa->magic, pa->klass, pa->begins);
+   fflush(stderr);
+
+   static int mode = -1;
+   if (mode < 0) {
+      const char *e = getenv("LIMINA_KK_ALLOC_GUARD");
+      mode = (e && !strcmp(e, "abort")) ? 1 : 0;
+   }
+   if (mode)
+      abort();
+   return false;
+}
+
+void
+kk_alloc_pool_report(struct kk_device *dev, const char *why)
+{
+   struct kk_alloc_pool *pool = &dev->alloc_pool;
+   simple_mtx_lock(&pool->mtx);
+   for (unsigned k = 0; k < KK_ALLOC_CLASS_COUNT; ++k) {
+      fprintf(stderr,
+              "[LIMINA-ALLOC-POOL] %s %s: live=%u peak=%u retired=%u | size hiwater=%llu KiB "
+              "(budget %llu KiB, %u retirements) | peak ops/cmdbuf=%u\n",
+              why, k == KK_ALLOC_CLASS_RENDER ? "render" : "compute", pool->live[k],
+              pool->peak_live[k], pool->destroyed[k],
+              (unsigned long long)(pool->hiwater_bytes[k] >> 10),
+              (unsigned long long)(pool->budget_bytes >> 10), pool->over_budget[k],
+              pool->peak_ops[k]);
+   }
+   fprintf(stderr, "[LIMINA-ALLOC-POOL] %s tombstones=%u use-after-destroy=%u\n", why,
+           (unsigned)util_dynarray_num_elements(&pool->tombstones, kk_pooled_alloc_ptr),
+           pool->use_after_destroy);
+   fflush(stderr);
+   simple_mtx_unlock(&pool->mtx);
+}
+
 void
 kk_alloc_pool_init(struct kk_device *dev)
 {
@@ -64,6 +120,7 @@ kk_alloc_pool_init(struct kk_device *dev)
    simple_mtx_init(&pool->mtx, mtx_plain);
    for (unsigned i = 0; i < KK_ALLOC_CLASS_COUNT; ++i)
       util_dynarray_init(&pool->allocs[i], NULL);
+   util_dynarray_init(&pool->tombstones, NULL);
 
    /* The budget is the whole knob: an allocator leaves service once it holds this much, so the
     * steady state is roughly (pool size) x (budget). Overridable for the A/B ladder. */
@@ -113,7 +170,16 @@ kk_alloc_pool_take_surplus(struct kk_alloc_pool *pool, enum kk_alloc_class klass
    util_dynarray_delete_unordered(&pool->allocs[klass], kk_pooled_alloc_ptr, victim);
    pool->live[klass]--;
    pool->destroyed[klass]++;
-   free(victim);
+   /* limina: stamp and keep rather than free. The struct is ~48 bytes and this is the whole
+    * detector — freeing it would turn a stale pointer back into unreadable heap. If the
+    * tombstone list cannot grow we fall back to freeing: losing detection beats leaking. */
+   victim->magic = KK_PA_DEAD;
+   victim->handle = NULL;
+   kk_pooled_alloc_ptr *grave = util_dynarray_grow(&pool->tombstones, kk_pooled_alloc_ptr, 1);
+   if (grave)
+      *grave = victim;
+   else
+      free(victim);
 
    /* Reclaim must not be invisible: growth already warns, so shrink gets the same treatment.
     * Off by default — during a post-workload drain this fires once per acquire. */
@@ -132,14 +198,7 @@ kk_alloc_pool_finish(struct kk_device *dev)
 {
    struct kk_alloc_pool *pool = &dev->alloc_pool;
 
-   if (pool->destroyed[0] || pool->destroyed[1]) {
-      fprintf(stderr,
-              "[LIMINA-ALLOC-POOL] teardown: render live=%u peak=%u retired=%u | "
-              "compute live=%u peak=%u retired=%u\n",
-              pool->live[KK_ALLOC_CLASS_RENDER], pool->peak_live[KK_ALLOC_CLASS_RENDER],
-              pool->destroyed[KK_ALLOC_CLASS_RENDER], pool->live[KK_ALLOC_CLASS_COMPUTE],
-              pool->peak_live[KK_ALLOC_CLASS_COMPUTE], pool->destroyed[KK_ALLOC_CLASS_COMPUTE]);
-   }
+   kk_alloc_pool_report(dev, "teardown");
 
    /* Device teardown frees whatever the reclaim policy did not: every context is gone. */
    for (unsigned i = 0; i < KK_ALLOC_CLASS_COUNT; ++i) {
@@ -150,6 +209,9 @@ kk_alloc_pool_finish(struct kk_device *dev)
       }
       util_dynarray_fini(&pool->allocs[i]);
    }
+   util_dynarray_foreach(&pool->tombstones, kk_pooled_alloc_ptr, pap)
+      free(*pap);
+   util_dynarray_fini(&pool->tombstones);
    simple_mtx_destroy(&pool->mtx);
 }
 
@@ -216,6 +278,7 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
          return NULL;
       }
       found->klass = klass;
+      found->magic = KK_PA_LIVE;
       kk_pooled_alloc_ptr *slot =
          util_dynarray_grow(&pool->allocs[klass], kk_pooled_alloc_ptr, 1);
       if (!slot) {
@@ -253,25 +316,54 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
 }
 
 void
-kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa)
+kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa, uint32_t ops)
 {
    struct kk_alloc_pool *pool = &dev->alloc_pool;
    if (!pa)
       return;
 
+   /* Check staleness BEFORE touching the handle: a destroyed allocator's handle is NULL, and
+    * this is the one entry point that dereferences it. The unlocked read is sound — magic is
+    * written once, under the lock, at destroy — and a false "live" here is caught a line later. */
+   if (unlikely(pa->magic != KK_PA_LIVE)) {
+      simple_mtx_lock(&pool->mtx);
+      kk_pa_live(pool, pa, "kk_alloc_pool_release");
+      simple_mtx_unlock(&pool->mtx);
+      return;
+   }
+
    /* Read the size OUTSIDE the lock: this is a Metal call on the encode hot path. */
    uint64_t size = mtl_command_allocator_allocated_size(pa->handle);
 
    simple_mtx_lock(&pool->mtx);
+   if (!kk_pa_live(pool, pa, "kk_alloc_pool_release")) {
+      simple_mtx_unlock(&pool->mtx);
+      return;
+   }
    pa->in_use = false;
+   if (size > pa->peak_bytes)
+      pa->peak_bytes = size;
+   if (size > pool->hiwater_bytes[pa->klass])
+      pool->hiwater_bytes[pa->klass] = size;
+   if (ops > pool->peak_ops[pa->klass])
+      pool->peak_ops[pa->klass] = ops;
    /* Retire on budget. Note this is checked at encoder end, not at reset time: allocatedSize
     * never shrinks, so by the time a reset-time check fires the growth is already permanent. */
-   if (pool->budget_bytes && size >= pool->budget_bytes)
+   if (pool->budget_bytes && size >= pool->budget_bytes) {
+      if (!pa->draining)
+         pool->over_budget[pa->klass]++;
       pa->draining = true;
+   }
    /* Start the decay clock if it is already drained; otherwise the last discharge does it. */
    if (pa->draining && pa->pending == 0)
       pa->idle_since = os_time_get_nano();
+   /* Report on the same cadence as the KK counts block so the two read together in one log.
+    * Riding the release path rather than the tick keeps the device pointer in hand. */
+   const bool due = (++pool->releases % KK_ALLOC_REPORT_EVERY) == 0;
    simple_mtx_unlock(&pool->mtx);
+
+   if (due)
+      kk_alloc_pool_report(dev, "periodic");
 }
 
 void
@@ -280,7 +372,10 @@ kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa)
    if (!pa)
       return;
    simple_mtx_lock(&dev->alloc_pool.mtx);
-   pa->pending++;
+   if (kk_pa_live(&dev->alloc_pool, pa, "kk_alloc_pool_charge")) {
+      pa->pending++;
+      pa->begins++;
+   }
    simple_mtx_unlock(&dev->alloc_pool.mtx);
 }
 
@@ -290,6 +385,10 @@ kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa)
    if (!pa)
       return;
    simple_mtx_lock(&dev->alloc_pool.mtx);
+   if (!kk_pa_live(&dev->alloc_pool, pa, "kk_alloc_pool_discharge")) {
+      simple_mtx_unlock(&dev->alloc_pool.mtx);
+      return;
+   }
    assert(pa->pending > 0);
    if (pa->pending > 0)
       pa->pending--;

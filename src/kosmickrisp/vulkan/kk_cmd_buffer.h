@@ -277,6 +277,12 @@ struct kk_encoder_state {
    mtl_command_buffer *cmd_buf;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;
+   /* limina: encoder-level operations recorded into the OPEN command buffer — one per handout of
+    * this encoder, so copies and dispatches for compute, draws for render. Reset when the
+    * encoder opens, folded into the pool's peak when it closes. Reads directly on the question
+    * "was this command buffer enormous?", which is one of the three candidate causes of the
+    * 2026-08-31 nil store inside AGX's data-buffer pool. */
+   uint32_t ops;
 };
 
 struct kk_cmd_buffer {

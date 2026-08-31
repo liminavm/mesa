@@ -94,7 +94,8 @@ struct kk_precompiled_cache {
  *
  * The pool bounds the product directly: allocators are shared, so the count follows concurrency,
  * and one is retired from service once it passes a byte budget, drained, and reset before reuse.
- * Nothing is destroyed until device teardown.
+ * A retired allocator that stays idle is eventually destroyed, which is the only lever that
+ * returns its heaps (reset returns none).
  *
  * Segregated by encoder kind because reuse does NOT cross types: a render pass encoded on a
  * compute-warmed allocator adds its own heaps rather than reusing them (measured +17.6 MiB), so
@@ -106,7 +107,18 @@ enum kk_alloc_class {
    KK_ALLOC_CLASS_COUNT,
 };
 
+/* limina: liveness stamp for the use-after-destroy detector below. */
+#define KK_PA_LIVE 0x6b6b414cu /* 'kkAL' */
+#define KK_PA_DEAD 0xdeadfa11u
+
 struct kk_pooled_alloc {
+   /* KK_PA_LIVE while pooled, KK_PA_DEAD once destroyed. A destroyed allocator's struct is NOT
+    * freed — it is stamped and kept — so a stale pointer still held by an encoder, a
+    * charged_allocs entry or a submit-discharge payload is caught at the next pool call, by
+    * name, instead of reading freed memory and dying somewhere unrelated. This exists because
+    * the fault we are hunting is a nil store inside AGX's own data-buffer pool, and an allocator
+    * destroyed out from under a live encoder is the leading candidate for it. */
+   uint32_t magic;
    mtl_command_allocator *handle;
    /* Command buffers begun on this allocator that have not yet completed on the GPU. Charged at
     * mtl_begin_command_buffer, NOT at commit: an allocator is returned to the pool at
@@ -118,6 +130,9 @@ struct kk_pooled_alloc {
    /* os_time_get_nano() when pending last hit 0 while draining — the decay clock. 0 = not idle. */
    uint64_t idle_since;
    enum kk_alloc_class klass;
+   /* Lifetime totals, reported at teardown and on demand. */
+   uint32_t begins;     /* command buffers begun on this allocator */
+   uint64_t peak_bytes; /* largest allocatedSize ever observed at release */
 };
 
 struct kk_alloc_pool {
@@ -137,6 +152,18 @@ struct kk_alloc_pool {
    uint32_t peak_live[KK_ALLOC_CLASS_COUNT];
    uint32_t destroyed[KK_ALLOC_CLASS_COUNT];
    uint32_t watermark_warned;
+   /* limina instrumentation. `hiwater_bytes` is the largest allocatedSize any one allocator of
+    * the class ever reached, and `over_budget` counts the retirements — together they say
+    * whether an allocator was anywhere near a size at which Metal might refuse to grow it.
+    * `peak_ops` is the most encoder-level operations (copies and dispatches) ever recorded into
+    * one command buffer of the class. */
+   uint64_t hiwater_bytes[KK_ALLOC_CLASS_COUNT];
+   uint32_t over_budget[KK_ALLOC_CLASS_COUNT];
+   uint32_t peak_ops[KK_ALLOC_CLASS_COUNT];
+   /* Destroyed allocators, kept (not freed) so a stale pointer is detectable. */
+   struct util_dynarray tombstones; /* struct kk_pooled_alloc * */
+   uint32_t use_after_destroy;
+   uint32_t releases; /* drives the periodic report; no cadence of its own to plumb */
 };
 
 /* util_dynarray's macros take a single type token, so give the pointer a name. */
@@ -144,10 +171,16 @@ typedef struct kk_pooled_alloc *kk_pooled_alloc_ptr;
 
 struct kk_pooled_alloc *kk_alloc_pool_acquire(struct kk_device *dev,
                                               enum kk_alloc_class klass);
-void kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa);
+/* `ops` is how many encoder-level operations the closing command buffer recorded; it is folded
+ * into the class peak here so the pool report can answer "how big did one command buffer get?"
+ * without a second Metal round trip. */
+void kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa, uint32_t ops);
 void kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa);
 void kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa);
 void kk_alloc_pool_init(struct kk_device *dev);
+/* One line per class: live/peak/retired counts, size hiwater, and the use-after-destroy tally.
+ * `why` names the caller so a periodic dump and a teardown dump are distinguishable. */
+void kk_alloc_pool_report(struct kk_device *dev, const char *why);
 void kk_alloc_pool_finish(struct kk_device *dev);
 
 struct kk_device {
