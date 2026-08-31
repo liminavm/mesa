@@ -187,6 +187,10 @@ void kk_alloc_pool_init(struct kk_device *dev);
 /* One line per class: live/peak/retired counts, size hiwater, and the use-after-destroy tally.
  * `why` names the caller so a periodic dump and a teardown dump are distinguishable. */
 void kk_alloc_pool_report(struct kk_device *dev, const char *why);
+/* The allocator the calling thread currently holds an open encoder on, or NULL. Not read by
+ * anything yet — kept because it is the one fact a post-mortem most wants and it costs a store
+ * per encoder. */
+extern __thread struct kk_pooled_alloc *kk_tls_open_alloc;
 void kk_alloc_pool_finish(struct kk_device *dev);
 
 struct kk_device {

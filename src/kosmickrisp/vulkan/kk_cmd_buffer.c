@@ -221,6 +221,8 @@ kk_encoder_begin(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
    mtl_begin_command_buffer(es->cmd_buf, es->allocator);
    kk_alloc_pool_charge(dev, es->pa);
    *slot = es->pa;
+   /* Name what this thread is encoding into, for the fault handler. */
+   kk_tls_open_alloc = es->pa;
    return true;
 }
 
@@ -566,6 +568,8 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
     * command allocators after ending the command buffer"); only *reset* needs GPU completion,
     * which the pool gates on the charge taken at begin. So the borrow goes back now. */
    kk_alloc_pool_release(kk_cmd_buffer_device(cmd), es->pa, es->ops);
+   if (kk_tls_open_alloc == es->pa)
+      kk_tls_open_alloc = NULL;
    es->pa = NULL;
    es->allocator = NULL;
 

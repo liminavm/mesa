@@ -7,6 +7,9 @@
 
 #include "kk_device.h"
 
+#include <signal.h>
+#include <string.h>
+
 #include "kk_cmd_buffer.h"
 #include "kk_entrypoints.h"
 #include "kk_instance.h"
@@ -48,6 +51,10 @@
 /* Encoder closes between pool reports. Matches the KK counts block's own cadence so a log holds
  * both halves of the picture at the same moments. */
 #define KK_ALLOC_REPORT_EVERY 2000u
+
+/* Encoder closes between on-disk snapshots. Two orders tighter than the log line: this one is
+ * read after a crash, so staleness is the only thing that matters about it. */
+#define KK_ALLOC_SNAPSHOT_EVERY 25u
 
 static uint64_t
 kk_env_u64(const char *name, uint64_t dflt)
@@ -113,6 +120,49 @@ kk_alloc_pool_report(struct kk_device *dev, const char *why)
            pool->resets[KK_ALLOC_CLASS_COMPUTE], pool->unmatched_discharge);
    fflush(stderr);
    simple_mtx_unlock(&pool->mtx);
+}
+
+__thread struct kk_pooled_alloc *kk_tls_open_alloc;
+
+/* limina: keep a current pool snapshot on disk, for reading AFTER a crash.
+ *
+ * The periodic stderr report can be thousands of encoder closes stale when a rare fault lands,
+ * and the obvious fix — a SIGSEGV handler — is wrong here: libkrun installs its own SIGSEGV and
+ * SIGBUS handler for the released-RAM sweep and legitimately RESUMES from those faults, so a hook
+ * ahead of it would fire on a hot VMM path rather than only on a real crash.
+ *
+ * So write the state to a file instead, truncated each time. Nothing to unwind, no signal-safety
+ * question, and the last snapshot survives whatever killed the process.
+ * LIMINA_KK_POOL_SNAPSHOT=<path> enables it; unset means no file is written. */
+static void
+kk_pool_snapshot(struct kk_alloc_pool *pool)
+{
+   static const char *path;
+   static bool looked_up;
+   if (!looked_up) {
+      path = getenv("LIMINA_KK_POOL_SNAPSHOT");
+      if (path && !path[0])
+         path = NULL;
+      looked_up = true;
+   }
+   if (!path)
+      return;
+
+   FILE *f = fopen(path, "w");
+   if (!f)
+      return;
+   for (unsigned k = 0; k < KK_ALLOC_CLASS_COUNT; ++k) {
+      fprintf(f,
+              "%s live=%u peak=%u destroyed=%u hiwater_kib=%llu retirements=%u resets=%u "
+              "peak_ops=%u\n",
+              k == KK_ALLOC_CLASS_RENDER ? "render" : "compute", pool->live[k], pool->peak_live[k],
+              pool->destroyed[k], (unsigned long long)(pool->hiwater_bytes[k] >> 10),
+              pool->over_budget[k], pool->resets[k], pool->peak_ops[k]);
+   }
+   fprintf(f, "tombstones=%u use_after_destroy=%u unmatched_discharge=%u releases=%u\n",
+           (unsigned)util_dynarray_num_elements(&pool->tombstones, kk_pooled_alloc_ptr),
+           pool->use_after_destroy, pool->unmatched_discharge, pool->releases);
+   fclose(f);
 }
 
 void
@@ -364,6 +414,10 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa, uint32_
    /* Report on the same cadence as the KK counts block so the two read together in one log.
     * Riding the release path rather than the tick keeps the device pointer in hand. */
    const bool due = (++pool->releases % KK_ALLOC_REPORT_EVERY) == 0;
+   /* The snapshot is a few hundred bytes over a truncating write, so it can run far more often
+    * than the log line — the point is that it is never stale when a crash reads it. */
+   if (pool->releases % KK_ALLOC_SNAPSHOT_EVERY == 0)
+      kk_pool_snapshot(pool);
    simple_mtx_unlock(&pool->mtx);
 
    if (due)
