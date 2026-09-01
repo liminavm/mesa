@@ -1210,10 +1210,12 @@ void virgl_resource_destroy(struct pipe_screen *screen,
       util_range_destroy(&res->valid_buffer_range);
 
    /* limina: a planar target's remaining planes hang off the head, gallium's convention
-    * for one allocation carrying several plane resources. Releasing the head releases
-    * the rest by recursion; each element holds its own reference on the shared hw_res,
-    * so teardown is symmetric whatever order the references are dropped in. */
-   pipe_resource_reference(&res->b.next, NULL);
+    * for one allocation carrying several plane resources — and releasing them is the
+    * core's job, not ours. pipe_resource_destroy() caches ->next before it calls this
+    * hook and then drops that reference itself, so a driver that also releases ->next
+    * releases it twice: the plane is freed while a frontend still holds a reference,
+    * and the next pipe_resource_reference() on it reads a dead refcount. Free only our
+    * own object here, exactly as radeonsi's si_resource_destroy does. */
 
    vs->vws->resource_reference(vs->vws, &res->hw_res, NULL);
    virgl_resource_free_gbm_layout(res);
