@@ -254,9 +254,11 @@ dri2_validate_usage(struct dri_image *image, unsigned int use);
 PUBLIC struct dri_image *
 dri2_from_planar(struct dri_image *image, int plane, void *loaderPrivate);
 #ifdef __APPLE__
-/* limina: DRIimage adopting an IOSurfaceRef (see dri2.c). */
+/* limina: DRIimage adopting an IOSurfaceRef (see dri2.c). PIPE_FORMAT_NONE
+ * means the whole surface, typed from its own pixel format. */
 PUBLIC struct dri_image *
 dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
+                           unsigned plane, enum pipe_format plane_format,
                            void *loaderPrivate);
 #endif
 PUBLIC struct dri_image *

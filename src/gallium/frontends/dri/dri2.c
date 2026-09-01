@@ -923,6 +923,7 @@ dri_create_image_from_winsys(struct dri_screen *screen,
  * scanout exporter allocates. */
 PUBLIC struct dri_image *
 dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
+                           unsigned plane, enum pipe_format plane_format,
                            void *loaderPrivate)
 {
    struct pipe_screen *pscreen = screen->base.screen;
@@ -930,24 +931,44 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
    struct pipe_resource templ;
    struct winsys_handle whandle;
    enum pipe_format pf;
+   unsigned width, height;
 
    if (!pscreen->resource_from_handle) {
       mesa_loge("dri2_from_iosurface_limina: driver has no resource_from_handle");
       return NULL;
    }
 
-   const uint32_t osfmt = IOSurfaceGetPixelFormat((IOSurfaceRef)iosurface);
-   switch (osfmt) {
-   case 0x42475241: /* 'BGRA' */
-      pf = PIPE_FORMAT_B8G8R8A8_UNORM;
-      break;
-   case 0x52474241: /* 'RGBA' */
-      pf = PIPE_FORMAT_R8G8B8A8_UNORM;
-      break;
-   default:
-      mesa_loge("dri2_from_iosurface_limina: unhandled IOSurface pixel format "
-                "0x%08x", osfmt);
-      return NULL;
+   if (plane_format != PIPE_FORMAT_NONE) {
+      /* Caller named the plane and its format. Do NOT consult the surface's
+       * own pixel format: a biplanar decode target reports '420v'/'420f',
+       * which describes the pair and matches neither plane's texture format.
+       * Geometry is per-plane for the same reason. */
+      if (plane >= IOSurfaceGetPlaneCount((IOSurfaceRef)iosurface)) {
+         mesa_loge("dri2_from_iosurface_limina: plane %u of a %zu-plane "
+                   "surface", plane,
+                   IOSurfaceGetPlaneCount((IOSurfaceRef)iosurface));
+         return NULL;
+      }
+      pf = plane_format;
+      width = IOSurfaceGetWidthOfPlane((IOSurfaceRef)iosurface, plane);
+      height = IOSurfaceGetHeightOfPlane((IOSurfaceRef)iosurface, plane);
+   } else {
+      const uint32_t osfmt = IOSurfaceGetPixelFormat((IOSurfaceRef)iosurface);
+      switch (osfmt) {
+      case 0x42475241: /* 'BGRA' */
+         pf = PIPE_FORMAT_B8G8R8A8_UNORM;
+         break;
+      case 0x52474241: /* 'RGBA' */
+         pf = PIPE_FORMAT_R8G8B8A8_UNORM;
+         break;
+      default:
+         mesa_loge("dri2_from_iosurface_limina: unhandled IOSurface pixel format "
+                   "0x%08x", osfmt);
+         return NULL;
+      }
+      plane = 0;
+      width = IOSurfaceGetWidth((IOSurfaceRef)iosurface);
+      height = IOSurfaceGetHeight((IOSurfaceRef)iosurface);
    }
 
    memset(&whandle, 0, sizeof(whandle));
@@ -955,6 +976,7 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
    whandle.com_obj = iosurface;
    whandle.modifier = DRM_FORMAT_MOD_INVALID;
    whandle.format = pf;
+   whandle.plane = plane;
 
    memset(&templ, 0, sizeof(templ));
    templ.target = screen->target;
@@ -963,8 +985,8 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
    templ.last_level = 0;
    templ.depth0 = 1;
    templ.array_size = 1;
-   templ.width0 = IOSurfaceGetWidth((IOSurfaceRef)iosurface);
-   templ.height0 = IOSurfaceGetHeight((IOSurfaceRef)iosurface);
+   templ.width0 = width;
+   templ.height0 = height;
 
    img = CALLOC_STRUCT(dri_image);
    if (!img)

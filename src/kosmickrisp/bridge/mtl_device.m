@@ -374,11 +374,17 @@ mtl_handle_is_iosurface(void *handle)
 /* limina: create a texture whose storage IS an IOSurface
  * (newTextureWithDescriptor:iosurface:plane:). Built from the adopting
  * image's own kk_image_layout so kk_image_plane_bind's verbatim-adoption
- * checks pass by construction. IOSurface-backed textures must be plain 2D. */
+ * checks pass by construction. IOSurface-backed textures must be plain 2D.
+ *
+ * `plane` selects the plane of a planar surface (NV12 decode targets bind
+ * luma as R8 and chroma as RG8 from the one surface); 0 for the single-plane
+ * scanout and shared-buffer imports. Metal validates the descriptor against
+ * that plane's own geometry, so a mismatched layout fails here rather than
+ * silently sampling the wrong bytes. */
 mtl_texture *
 mtl_new_texture_with_descriptor_iosurface(mtl_device *device,
                                           const struct kk_image_layout *layout,
-                                          void *iosurface)
+                                          void *iosurface, uint32_t plane)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
@@ -395,9 +401,17 @@ mtl_new_texture_with_descriptor_iosurface(mtl_device *device,
                  layout->sample_count_sa);
          return (mtl_texture *)limina_mtl_note_new(NULL);
       }
+      const size_t plane_count = IOSurfaceGetPlaneCount((IOSurfaceRef)iosurface);
+      if (plane > 0 && plane >= plane_count) {
+         fprintf(stderr,
+                 "[LIMINA-KK-IOSURF] refusing IOSurface texture: plane %u of a "
+                 "%zu-plane surface\n",
+                 plane, plane_count);
+         return (mtl_texture *)limina_mtl_note_new(NULL);
+      }
       id<MTLTexture> tex = [dev newTextureWithDescriptor:descriptor
                                               iosurface:(IOSurfaceRef)iosurface
-                                                  plane:0];
+                                                  plane:plane];
       if (tex) {
          limina_kk_sentinel_once();
          limina_kk_sentinel_attach(tex, false);
