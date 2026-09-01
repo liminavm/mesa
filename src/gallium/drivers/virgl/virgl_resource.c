@@ -725,14 +725,113 @@ static size_t virgl_resource_shared_tex_size(struct virgl_resource *res)
    return metadata.total_size;
 }
 
+/* limina: a composite planar decode target -- one host resource named by its planar
+ * format, with a chain of plane resources over the same allocation.
+ *
+ * The per-plane form (one resource each) cannot be backed by a single host surface:
+ * only a composite create names a planar format, and that is what a host-side planar
+ * allocation keys off. So build the shape gallium already has for this, the one
+ * radeonsi builds for NV12: each element carries the plane's own component format and
+ * subsampled size, and all of them share one hw_res.
+ *
+ * The parent's format is therefore the plane-0 component format, not the planar one --
+ * the wire and the pipe format part ways here, deliberately. A sampler view on the
+ * parent has to name R8, because the host tells a luma view from a composite consumer
+ * asking for the converted RGBA by exactly that mismatch against the resource's own
+ * format; keeping the parent planar would make the two indistinguishable and silently
+ * sample RGBA where the shader wants raw luma.
+ *
+ * The layout is tight and in plane order, which is what the host mirrors to place each
+ * plane inside this allocation -- nothing on the wire carries it.
+ */
+static struct pipe_resource *
+virgl_resource_create_planar(struct pipe_screen *screen,
+                             const struct pipe_resource *templ)
+{
+   struct virgl_screen *vs = virgl_screen(screen);
+   const unsigned num_planes = util_format_get_num_planes(templ->format);
+   struct virgl_resource *planes[VIRGL_MAX_PLANE_COUNT] = { NULL };
+   struct virgl_hw_res *hw_res = NULL;
+   uint32_t total_size = 0;
+   unsigned i;
+
+   if (num_planes < 2 || num_planes > VIRGL_MAX_PLANE_COUNT)
+      return NULL;
+
+   for (i = 0; i < num_planes; i++) {
+      planes[i] = CALLOC_STRUCT(virgl_resource);
+      if (!planes[i])
+         goto fail;
+
+      planes[i]->b = *templ;
+      planes[i]->b.next = NULL;
+      planes[i]->b.format = util_format_get_plane_format(templ->format, i);
+      planes[i]->b.width0 = util_format_get_plane_width(templ->format, i, templ->width0);
+      planes[i]->b.height0 = util_format_get_plane_height(templ->format, i, templ->height0);
+      planes[i]->b.screen = &vs->base;
+      pipe_reference_init(&planes[i]->b.reference, 1);
+      simple_mtx_init(&planes[i]->metadata.gbm.lock, mtx_plain);
+      virgl_resource_layout(&planes[i]->b, &planes[i]->metadata, i, 0, total_size, 0);
+      total_size += planes[i]->metadata.total_size;
+   }
+
+   /* One allocation, named by the planar format, sized for every plane. A short one
+    * would leave the host writing the last plane past the end of guest storage. */
+   hw_res = vs->vws->resource_create(vs->vws, templ->target, NULL, templ->format,
+                                     pipe_to_virgl_bind(vs, templ->bind),
+                                     templ->width0, templ->height0, templ->depth0,
+                                     templ->array_size, templ->last_level,
+                                     templ->nr_samples,
+                                     pipe_to_virgl_flags(vs, templ->flags),
+                                     total_size);
+   if (!hw_res)
+      goto fail;
+
+   for (i = 0; i < num_planes; i++) {
+      vs->vws->resource_reference(vs->vws, &planes[i]->hw_res, hw_res);
+      planes[i]->clean_mask = (1 << VR_MAX_TEXTURE_2D_LEVELS) - 1;
+      virgl_texture_init(planes[i]);
+      if (i)
+         planes[i - 1]->b.next = &planes[i]->b;
+   }
+   /* Every plane holds its own reference now; drop the one the create handed us. */
+   vs->vws->resource_reference(vs->vws, &hw_res, NULL);
+
+   return &planes[0]->b;
+
+fail:
+   for (i = 0; i < num_planes; i++) {
+      if (!planes[i])
+         continue;
+      if (planes[i]->hw_res)
+         vs->vws->resource_reference(vs->vws, &planes[i]->hw_res, NULL);
+      simple_mtx_destroy(&planes[i]->metadata.gbm.lock);
+      FREE(planes[i]);
+   }
+   if (hw_res)
+      vs->vws->resource_reference(vs->vws, &hw_res, NULL);
+   return NULL;
+}
+
 static struct pipe_resource *virgl_resource_create_front(struct pipe_screen *screen,
                                                          const struct pipe_resource *templ,
                                                          const void *map_front_private)
 {
    unsigned vbind, vflags;
    struct virgl_screen *vs = virgl_screen(screen);
-   struct virgl_resource *res = CALLOC_STRUCT(virgl_resource);
+   struct virgl_resource *res;
    uint32_t alloc_size;
+
+   /* A decode target the host will back with one planar surface takes the composite
+    * shape; everything else, and every host without the bit, takes the classic one. */
+   if ((templ->flags & VIRGL_RESOURCE_FLAG_VIDEO_TARGET) &&
+       (vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VIDEO_PLANAR_TARGET) &&
+       util_format_get_num_planes(templ->format) > 1)
+      return virgl_resource_create_planar(screen, templ);
+
+   res = CALLOC_STRUCT(virgl_resource);
+   if (!res)
+      return NULL;
 
    res->b = *templ;
    res->b.screen = &vs->base;
@@ -949,9 +1048,23 @@ virgl_resource_get_param(struct pipe_screen *screen,
                          unsigned handle_usage,
                          uint64_t *value)
 {
-   struct virgl_resource *res = virgl_resource(resource);
+   struct virgl_resource *res;
+
+   /* The plane argument indexes the chain, as it does in every driver that builds one:
+    * step to that element and answer from it. gst-va asks per plane this way. */
+   while (plane && resource->next) {
+      --plane;
+      resource = resource->next;
+   }
+   res = virgl_resource(resource);
 
    switch(param) {
+   case PIPE_RESOURCE_PARAM_STRIDE:
+      *value = res->metadata.stride[level];
+      return true;
+   case PIPE_RESOURCE_PARAM_OFFSET:
+      *value = res->metadata.plane_offset + res->metadata.level_offset[level];
+      return true;
    case PIPE_RESOURCE_PARAM_MODIFIER:
       virgl_resource_sync_gbm_layout(res);
 
@@ -1095,6 +1208,12 @@ void virgl_resource_destroy(struct pipe_screen *screen,
 
    if (res->b.target == PIPE_BUFFER)
       util_range_destroy(&res->valid_buffer_range);
+
+   /* limina: a planar target's remaining planes hang off the head, gallium's convention
+    * for one allocation carrying several plane resources. Releasing the head releases
+    * the rest by recursion; each element holds its own reference on the shared hw_res,
+    * so teardown is symmetric whatever order the references are dropped in. */
+   pipe_resource_reference(&res->b.next, NULL);
 
    vs->vws->resource_reference(vs->vws, &res->hw_res, NULL);
    virgl_resource_free_gbm_layout(res);

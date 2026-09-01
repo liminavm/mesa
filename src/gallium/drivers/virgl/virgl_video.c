@@ -1243,6 +1243,7 @@ virgl_video_create_buffer(struct pipe_context *ctx,
                           const struct pipe_video_buffer *tmpl)
 {
     struct virgl_context *vctx = virgl_context(ctx);
+    struct virgl_screen *vs = virgl_screen(ctx->screen);
     struct virgl_video_buffer *vbuf;
     struct pipe_video_buffer local_tmpl;
 
@@ -1258,7 +1259,24 @@ virgl_video_create_buffer(struct pipe_context *ctx,
     local_tmpl.flags |= VIRGL_RESOURCE_FLAG_VIDEO_TARGET;
     tmpl = &local_tmpl;
 
-    vbuf->buf = vl_video_buffer_create(ctx, tmpl);
+    /* limina: one composite resource with its planes chained behind it, when the host
+     * says it takes that shape. The per-plane form below allocates a resource per
+     * plane, so the host sees three unrelated R8/R8G8 textures and can never back the
+     * frame with one surface; only the composite create names a planar format, which
+     * is what a host-side planar allocation keys off.
+     *
+     * Falling back rather than failing is the rule for this whole feature, so a refused
+     * composite create retries as per-plane rather than losing the buffer: a guest that
+     * cannot get composite targets still decodes, just through the copy path.
+     *
+     * Interlaced is excluded outright. Its template is a 2D_ARRAY, and a planar create
+     * has to chain plane resources over one allocation -- a shape neither the guest
+     * layout nor the host's plane addressing takes for an array target. */
+    if ((vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VIDEO_PLANAR_TARGET) &&
+        !tmpl->interlaced)
+        vbuf->buf = vl_video_buffer_create_as_resource(ctx, tmpl, NULL, 0);
+    if (!vbuf->buf)
+        vbuf->buf = vl_video_buffer_create(ctx, tmpl);
     if (!vbuf->buf) {
         free(vbuf);
         return NULL;
