@@ -38,6 +38,7 @@
 #endif
 #ifdef __APPLE__
 #include "vulkan/vulkan_metal.h"
+#include "kosmickrisp/bridge/kk_limina_plane.h"
 #endif
 
 #include "vk_format.h"
@@ -1090,12 +1091,26 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
    VkImportMemoryMetalHandleInfoEXT immhi = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
    };
+   /* limina: which plane of the surface backs this image. The Metal-handle
+    * import struct has no field for it, so it rides alongside — see
+    * kk_limina_plane.h. Plane 0 is the single-plane scanout/shared case. */
+   VkImportIOSurfacePlaneLIMINA iospi = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_IOSURFACE_PLANE_LIMINA,
+   };
    if (alloc_info->whandle &&
        alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA) {
       immhi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
       immhi.handle = alloc_info->whandle->com_obj;
       immhi.pNext = mai.pNext;
       mai.pNext = &immhi;
+
+      iospi.plane = alloc_info->whandle->plane == 2
+                       ? VK_IMAGE_ASPECT_PLANE_2_BIT
+                       : alloc_info->whandle->plane == 1
+                            ? VK_IMAGE_ASPECT_PLANE_1_BIT
+                            : VK_IMAGE_ASPECT_PLANE_0_BIT;
+      iospi.pNext = mai.pNext;
+      mai.pNext = &iospi;
    }
 #endif
 

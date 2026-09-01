@@ -2652,27 +2652,87 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
 #endif
 
 #ifdef __APPLE__
-/* limina: EGLImage from an IOSurfaceRef (passed as the EGLClientBuffer, no
- * attribs — the surface self-describes). Consumed by virglrenderer's vrend to
- * composite venus clients' window buffers; the pipe resource adopts the
- * IOSurface via zink → KK's MTLTEXTURE metal-handle import.
- * The enum value must match virglrenderer's copy (vrend_winsys_egl.c). */
-#define EGL_IOSURFACE_LIMINA 0x3B9A
+/* limina: EGLImage from an IOSurfaceRef (passed as the EGLClientBuffer).
+ * Consumed by virglrenderer's vrend to composite venus clients' window buffers
+ * and to sample video decode targets; the pipe resource adopts the IOSurface
+ * via zink → KK's MTLTEXTURE metal-handle import.
+ * The enum values must match virglrenderer's copy (vrend_winsys_egl.c).
+ *
+ * With no attribs the surface self-describes: whole surface, typed from its
+ * own pixel format. That is the shipping scanout/shared-buffer import.
+ * PLANE + FOURCC together name one plane of a planar surface, which cannot
+ * self-describe — a biplanar NV12 surface reports '420v', a format neither of
+ * its two textures has. */
+#define EGL_IOSURFACE_LIMINA        0x3B9A
+#define EGL_IOSURFACE_PLANE_LIMINA  0x3B9B
+#define EGL_IOSURFACE_FOURCC_LIMINA 0x3B9C
+
+/* drm_fourcc.h rides HAVE_LIBDRM, which macOS does not have; the codes are
+ * just the standard four-byte constants, so spell out the ones a planar
+ * video target uses. */
+#define LIMINA_FOURCC(a, b, c, d)                                   \
+   ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) |  \
+    ((uint32_t)(d) << 24))
+#define LIMINA_DRM_FORMAT_R8     LIMINA_FOURCC('R', '8', ' ', ' ')
+#define LIMINA_DRM_FORMAT_GR88   LIMINA_FOURCC('G', 'R', '8', '8')
+#define LIMINA_DRM_FORMAT_R16    LIMINA_FOURCC('R', '1', '6', ' ')
+#define LIMINA_DRM_FORMAT_GR1616 LIMINA_FOURCC('G', 'R', '3', '2')
 
 static _EGLImage *
-dri2_create_image_iosurface_limina(_EGLDisplay *disp, EGLClientBuffer buffer)
+dri2_create_image_iosurface_limina(_EGLDisplay *disp, EGLClientBuffer buffer,
+                                   const EGLint *attr_list)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    struct dri_image *dri_image;
+   unsigned plane = 0;
+   enum pipe_format pf = PIPE_FORMAT_NONE;
 
    if (!buffer) {
       _eglError(EGL_BAD_PARAMETER, "dri2_create_image_iosurface_limina");
       return NULL;
    }
 
+   for (const EGLint *a = attr_list; a && a[0] != EGL_NONE; a += 2) {
+      switch (a[0]) {
+      case EGL_IOSURFACE_PLANE_LIMINA:
+         plane = a[1];
+         break;
+      case EGL_IOSURFACE_FOURCC_LIMINA:
+         switch (a[1]) {
+         case LIMINA_DRM_FORMAT_R8:
+            pf = PIPE_FORMAT_R8_UNORM;
+            break;
+         case LIMINA_DRM_FORMAT_GR88:
+            pf = PIPE_FORMAT_R8G8_UNORM;
+            break;
+         case LIMINA_DRM_FORMAT_R16:
+            pf = PIPE_FORMAT_R16_UNORM;
+            break;
+         case LIMINA_DRM_FORMAT_GR1616:
+            pf = PIPE_FORMAT_R16G16_UNORM;
+            break;
+         default:
+            _eglError(EGL_BAD_PARAMETER,
+                      "dri2_create_image_iosurface_limina: fourcc");
+            return NULL;
+         }
+         break;
+      default:
+         _eglError(EGL_BAD_PARAMETER,
+                   "dri2_create_image_iosurface_limina: attribute");
+         return NULL;
+      }
+   }
+
+   if (plane != 0 && pf == PIPE_FORMAT_NONE) {
+      _eglError(EGL_BAD_PARAMETER,
+                "dri2_create_image_iosurface_limina: plane needs a fourcc");
+      return NULL;
+   }
+
    dri_image =
       dri2_from_iosurface_limina(dri2_dpy->dri_screen_render_gpu,
-                                 (void *)buffer, NULL);
+                                 (void *)buffer, plane, pf, NULL);
    if (!dri_image) {
       _eglError(EGL_BAD_PARAMETER, "dri2_create_image_iosurface_limina");
       return NULL;
@@ -2709,7 +2769,7 @@ dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
 #endif
 #ifdef __APPLE__
    case EGL_IOSURFACE_LIMINA:
-      return dri2_create_image_iosurface_limina(disp, buffer);
+      return dri2_create_image_iosurface_limina(disp, buffer, attr_list);
 #endif
    default:
       _eglError(EGL_BAD_PARAMETER, "dri2_create_image_khr");

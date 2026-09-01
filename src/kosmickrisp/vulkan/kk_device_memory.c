@@ -12,6 +12,7 @@
 #include "kk_image.h"
 #include "kk_physical_device.h"
 
+#include "kosmickrisp/bridge/kk_limina_plane.h"
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
 #include "vulkan/vulkan_metal.h"
@@ -170,9 +171,21 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                FREE(mem->bo);
                goto fail_alloc;
             }
+            /* Hand-walked rather than vk_find_struct_const: the plane struct is
+             * limina-private and has no entry in the generated sType tables the
+             * macro resolves against. Absent, the import means plane 0. */
+            uint32_t io_plane = 0;
+            for (const VkBaseInStructure *s = pAllocateInfo->pNext; s;
+                 s = s->pNext) {
+               if (s->sType == VK_STRUCTURE_TYPE_IMPORT_IOSURFACE_PLANE_LIMINA) {
+                  io_plane = kk_limina_plane_index(
+                     ((const VkImportIOSurfacePlaneLIMINA *)s)->plane);
+                  break;
+               }
+            }
             mem->bo->texture = mtl_new_texture_with_descriptor_iosurface(
                dev->mtl_handle, &ded_image->planes[0].layout,
-               metal_info->handle);
+               metal_info->handle, io_plane);
             if (!mem->bo->texture) {
                result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                                   "IOSurface texture creation failed");

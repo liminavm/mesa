@@ -54,7 +54,8 @@ long mtl_limina_retain_count(void *obj);
 /* limina: texture whose storage IS an IOSurface (import path; see mtl_device.m) */
 bool mtl_handle_is_iosurface(void *handle);
 mtl_texture *mtl_new_texture_with_descriptor_iosurface(
-   mtl_device *device, const struct kk_image_layout *layout, void *iosurface);
+   mtl_device *device, const struct kk_image_layout *layout, void *iosurface,
+   uint32_t plane);
 
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,
