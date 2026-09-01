@@ -8,6 +8,7 @@
 #include "kk_device.h"
 
 #include <signal.h>
+#include <unistd.h>
 #include <string.h>
 
 #include "kk_cmd_buffer.h"
@@ -279,6 +280,15 @@ kk_alloc_pool_finish(struct kk_device *dev)
    util_dynarray_foreach(&pool->tombstones, kk_pooled_alloc_ptr, pap)
       free(*pap);
    util_dynarray_fini(&pool->tombstones);
+
+   /* Drop this pool's snapshot. The file exists so a crash leaves the pool's last state on
+    * disk; a pool that reached its own destructor did not crash and has nothing to say. Which
+    * makes the leftovers the useful signal — after a crash, the files still present name the
+    * pools that were live when it happened. Without this the directory only ever grows: one
+    * file per VkDevice per run, and a desktop session creates dozens. */
+   if (pool->snapshot_path[0])
+      unlink(pool->snapshot_path);
+
    simple_mtx_destroy(&pool->mtx);
 }
 
