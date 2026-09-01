@@ -174,6 +174,14 @@ static inline unsigned pipe_to_virgl_bind(const struct virgl_screen *vs,
    return outbind;
 }
 
+/* limina: this resource is a plane of a video decode target.
+ *
+ * Guest-private, and deliberately built on PIPE_RESOURCE_FLAG_DRV_PRIV: it must never
+ * reach the host, and pipe_to_virgl_flags below forwards an allowlist, so it cannot.
+ * Its only job is to reach virgl_resource_create_front, which gives such a plane real
+ * guest memory instead of the one-page staging stub. */
+#define VIRGL_RESOURCE_FLAG_VIDEO_TARGET (PIPE_RESOURCE_FLAG_DRV_PRIV << 0)
+
 static inline unsigned pipe_to_virgl_flags(const struct virgl_screen *vs,
                                            unsigned pflags)
 {

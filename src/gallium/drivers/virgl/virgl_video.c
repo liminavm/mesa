@@ -1244,10 +1244,19 @@ virgl_video_create_buffer(struct pipe_context *ctx,
 {
     struct virgl_context *vctx = virgl_context(ctx);
     struct virgl_video_buffer *vbuf;
+    struct pipe_video_buffer local_tmpl;
 
     vbuf = CALLOC_STRUCT(virgl_video_buffer);
     if (!vbuf)
         return NULL;
+
+    /* limina: mark the planes so they get real guest memory rather than the staging
+     * stub -- vl_video_buffer_template copies these flags into every plane's resource
+     * template, which is the only way to reach virgl_resource_create_front from here.
+     * The flag is driver-private and never reaches the host. */
+    local_tmpl = *tmpl;
+    local_tmpl.flags |= VIRGL_RESOURCE_FLAG_VIDEO_TARGET;
+    tmpl = &local_tmpl;
 
     vbuf->buf = vl_video_buffer_create(ctx, tmpl);
     if (!vbuf->buf) {
