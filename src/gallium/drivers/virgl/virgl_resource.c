@@ -1269,6 +1269,12 @@ bool virgl_resource_get_handle(struct pipe_screen *screen,
          return false;
    }
 
+   /* limina: where this plane starts inside the exported allocation. Zero for every
+    * resource that is its own allocation, which is all of them but a chained plane of
+    * a composite target -- and for that one the winsys cannot know it, so an unset
+    * offset would export chroma as if it began at the luma. */
+   whandle->offset = res->metadata.plane_offset;
+
    return vs->vws->resource_get_handle(vs->vws, res->hw_res, stride, whandle);
 }
 
