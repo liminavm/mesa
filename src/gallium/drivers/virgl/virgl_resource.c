@@ -858,16 +858,15 @@ static struct pipe_resource *virgl_resource_create_front(struct pipe_screen *scr
    /* limina: a video decode target's plane needs storage that actually holds the
     * frame, not the one-page staging stub.
     *
-    * The stub is why virgl_resource_get_handle has to refuse exporting these: an fd
-    * naming 4096 bytes for a multi-megabyte picture, with a descriptor that reports
-    * the real geometry, SIGBUSes any consumer that trusts it. Given real guest pages
-    * the host writes each decoded frame into them, the export describes storage that
-    * genuinely holds the picture, and the refusal stops applying on its own.
+    * Its consumers mmap the exported dmabuf: VADRMPRIMESurfaceDescriptor reports the
+    * real geometry, and GStreamer's dmabuf uploader maps the fd and copies the frame
+    * out whenever no direct dmabuf-to-texture import is available, so a stub SIGBUSes
+    * it. Given real guest pages the host writes each decoded frame into them and the
+    * export describes storage that genuinely holds the picture.
     *
-    * Gated on the host actually doing that writeback. Against a host without the bit
-    * this would allocate the memory and export an honest-looking fd naming a frame
-    * nothing ever wrote -- worse than the refusal, which at least falls back to a
-    * path that works. */
+    * Gated on the host actually doing that writeback: without the bit this would
+    * allocate the memory and export an honest-looking fd naming a frame nothing ever
+    * wrote. The enhanced tier requires a host that has it. */
    if ((templ->flags & VIRGL_RESOURCE_FLAG_VIDEO_TARGET) &&
        (vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VIDEO_GUEST_PLANES))
       res->use_staging = false;
@@ -1241,35 +1240,6 @@ bool virgl_resource_get_handle(struct pipe_screen *screen,
       stride = res->metadata.gbm.layout.planes[0].stride;
    else
       stride = res->metadata.stride[0];
-
-   /*
-    * Never hand out a dmabuf smaller than the image it claims to describe.
-    *
-    * A virgl resource whose storage lives on the host has a guest BO that is only a stub --
-    * one page, whatever the resolution -- so drmPrimeHandleToFD below happily returns an fd
-    * naming 4096 bytes for a multi-megabyte surface. Nothing in the descriptor says so:
-    * VADRMPRIMESurfaceDescriptor reports the layer geometry, which is correct, and an object
-    * size the winsys never fills in, which reads as 0. A consumer that trusts the geometry,
-    * maps the fd and copies the frame out -- GStreamer's dmabuf uploader does exactly that
-    * whenever no direct dmabuf-to-texture import is available -- walks off the end of the
-    * first page and dies with SIGBUS.
-    *
-    * Refusing the export is the honest answer: the caller then negotiates system memory,
-    * which costs a copy per frame and works. Exporting host-backed decode targets for real
-    * requires them to be host-mappable blobs, which is a larger change.
-    *
-    * The predicate is the one virgl_resource_from_handle already uses to decide a resource
-    * needs staging: the laid-out size exceeds the guest storage behind it. A resource in that
-    * state has no guest memory holding its pixels, so there is nothing an fd can usefully
-    * name. Only a definite, too-small size refuses -- an unknown (0) size on either side keeps
-    * the previous behaviour rather than breaking exports this cannot reason about.
-    */
-   if (whandle->type == WINSYS_HANDLE_TYPE_FD && vs->vws->resource_get_storage_size) {
-      uint32_t storage = vs->vws->resource_get_storage_size(vs->vws, res->hw_res);
-
-      if (storage && res->metadata.total_size && res->metadata.total_size > storage)
-         return false;
-   }
 
    /* limina: where this plane starts inside the exported allocation. Zero for every
     * resource that is its own allocation, which is all of them but a chained plane of
