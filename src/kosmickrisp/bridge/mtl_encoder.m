@@ -21,6 +21,8 @@
 /* limina: atomics for the attachment-less clamp warning counter, execinfo for
  * its one-shot backtrace. */
 #include <execinfo.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 /* limina: LIMINA_KK_STATS=1 — once-per-second aggregate counters to stderr.
@@ -148,6 +150,136 @@ mtl_wait_for_fence(void *encoder, mtl_fence *fence,
    }
 }
 
+/* limina: crash-survivable dispatch breadcrumbs.
+ *
+ * The AGX fault we are chasing kills the process INSIDE copyFromBuffer:toTexture: — an
+ * unchecked next-segment pointer when a data-buffer request straddles the end of AGX's 1 MiB
+ * segment. Anything buffered in stdio dies with the process, and the fault leaves no trace of
+ * WHICH dispatch asked for the allocation that did not fit.
+ *
+ * So the record has to be on disk before the call is made. A MAP_SHARED file written with plain
+ * stores does that: the kernel writes back dirty pages of a shared mapping even when the process
+ * dies on SIGSEGV, and there is no syscall per entry, which is what lets this stay on by default
+ * rather than being an option nobody has armed when the rare thing finally happens.
+ *
+ * `done` is the whole trick. It is stored 0 before the call and 1 after, so after a crash the
+ * entry still holding 0 is the dispatch that was in flight — the culprit names itself, instead of
+ * being inferred from whatever happened to be logged nearby.
+ */
+#define LIMINA_DT_ENTRIES 4096u
+#define LIMINA_DT_MAGIC 0x4c444d54u /* 'LDMT' */
+
+enum limina_dt_kind {
+   LIMINA_DT_BUF_TO_IMG = 1,
+   LIMINA_DT_IMG_TO_BUF = 2,
+   LIMINA_DT_BUF_TO_BUF = 3,
+};
+
+struct limina_dt_entry {
+   uint64_t seq; /* 0 = never written */
+   uint64_t done; /* 0 while IN FLIGHT — a crash lands on one of these */
+   uint64_t thread;
+   uint64_t encoder;
+   uint64_t buffer;
+   uint64_t texture;
+   uint64_t offset_B;
+   uint64_t stride_B;
+   uint64_t image_2d_B;
+   uint32_t w, h, d;
+   uint32_t x, y, z;
+   uint32_t slice, level, options, kind;
+};
+
+struct limina_dt_hdr {
+   uint32_t magic;
+   uint32_t entry_size;
+   uint32_t entries;
+   uint32_t pad;
+   _Atomic uint64_t next;
+   struct limina_dt_entry e[];
+};
+
+static struct limina_dt_hdr *limina_dt_map;
+
+static void
+limina_dt_init(void)
+{
+   static bool tried;
+   if (tried)
+      return;
+   tried = true;
+
+   /* Explicit path wins; otherwise ride the pool snapshot's directory, which the supervisor
+    * already points at the VM bundle's logs/ — so a managed VM gets this with no extra wiring. */
+   const char *path = getenv("LIMINA_KK_DISPATCH_TRACE");
+   char derived[1024];
+   if (!path || !path[0]) {
+      const char *base = getenv("LIMINA_KK_POOL_SNAPSHOT");
+      if (!base || !base[0])
+         return;
+      snprintf(derived, sizeof(derived), "%s.dispatch.%d", base, (int)getpid());
+      path = derived;
+   }
+
+   const size_t size =
+      sizeof(struct limina_dt_hdr) + (size_t)LIMINA_DT_ENTRIES * sizeof(struct limina_dt_entry);
+   int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+   if (fd < 0)
+      return;
+   if (ftruncate(fd, (off_t)size) != 0) {
+      close(fd);
+      return;
+   }
+   void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   close(fd);
+   if (m == MAP_FAILED)
+      return;
+
+   struct limina_dt_hdr *h = m;
+   h->magic = LIMINA_DT_MAGIC;
+   h->entry_size = (uint32_t)sizeof(struct limina_dt_entry);
+   h->entries = LIMINA_DT_ENTRIES;
+   atomic_store(&h->next, 0);
+   limina_dt_map = h;
+}
+
+/* Claim a slot and fill it. Returns the entry so the caller can mark it done, or NULL when the
+ * trace is off — in which case every call here is one predictable branch. */
+static struct limina_dt_entry *
+limina_dt_begin(enum limina_dt_kind kind, void *encoder, void *buffer, void *texture,
+                const struct mtl_buffer_image_copy *d)
+{
+   limina_dt_init();
+   struct limina_dt_hdr *h = limina_dt_map;
+   if (!h)
+      return NULL;
+
+   const uint64_t seq = atomic_fetch_add(&h->next, 1) + 1;
+   struct limina_dt_entry *e = &h->e[seq % h->entries];
+   e->done = 0;
+   e->seq = seq;
+   e->thread = (uint64_t)(uintptr_t)pthread_self();
+   e->encoder = (uint64_t)(uintptr_t)encoder;
+   e->buffer = (uint64_t)(uintptr_t)buffer;
+   e->texture = (uint64_t)(uintptr_t)texture;
+   e->kind = (uint32_t)kind;
+   if (d) {
+      e->offset_B = d->buffer_offset_B;
+      e->stride_B = d->buffer_stride_B;
+      e->image_2d_B = d->buffer_2d_image_size_B;
+      e->w = (uint32_t)d->image_size.x;
+      e->h = (uint32_t)d->image_size.y;
+      e->d = (uint32_t)d->image_size.z;
+      e->x = (uint32_t)d->image_origin.x;
+      e->y = (uint32_t)d->image_origin.y;
+      e->z = (uint32_t)d->image_origin.z;
+      e->slice = (uint32_t)d->image_slice;
+      e->level = (uint32_t)d->image_level;
+      e->options = (uint32_t)d->options;
+   }
+   return e;
+}
+
 /* MTLComputeEncoder */
 mtl_compute_encoder *
 mtl_new_compute_command_encoder(mtl_command_buffer *cmd_buffer)
@@ -182,6 +314,8 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
       id<MTLTexture> image = (id<MTLTexture>)data->image;
+      struct limina_dt_entry *bc =
+         limina_dt_begin(LIMINA_DT_BUF_TO_IMG, encoder, data->buffer, data->image, data);
       [enc copyFromBuffer:buffer
              sourceOffset:data->buffer_offset_B
         sourceBytesPerRow:data->buffer_stride_B
@@ -192,6 +326,8 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
          destinationLevel:data->image_level
         destinationOrigin:origin
                   options:(MTLBlitOption)data->options];
+      if (bc)
+         bc->done = 1;
    }
 }
 
