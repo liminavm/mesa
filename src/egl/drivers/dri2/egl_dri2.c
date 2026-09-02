@@ -2628,9 +2628,21 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
           *    "If the number of fds is less than the number of planes, then
           *    subsequent fd slots should contain -1."
           */
-         if (i == 0 || is_disjoint)
-            dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD, &fds[i]);
-         else
+         if (i == 0 || is_disjoint) {
+            if (!dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD, &fds[i])) {
+               /* The driver cannot export an fd for this image. */
+               if (i)
+                  dri2_destroy_image(image);
+               for (int j = 0; j < i; j++) {
+                  if (fds[j] >= 0)
+                     close(fds[j]);
+                  fds[j] = -1;
+               }
+               fds[i] = -1;
+               mtx_unlock(&dri2_dpy->lock);
+               return EGL_FALSE;
+            }
+         } else
             fds[i] = -1;
       }
 
