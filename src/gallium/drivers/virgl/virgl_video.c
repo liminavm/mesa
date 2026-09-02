@@ -1265,15 +1265,28 @@ virgl_video_create_buffer(struct pipe_context *ctx,
      * frame with one surface; only the composite create names a planar format, which
      * is what a host-side planar allocation keys off.
      *
-     * Falling back rather than failing is the rule for this whole feature, so a refused
-     * composite create retries as per-plane rather than losing the buffer: a guest that
-     * cannot get composite targets still decodes, just through the copy path.
+     * The decision has to be made here, from the caps, and not by trying: a create the
+     * host refuses is invisible to the guest. The kernel has already handed out the
+     * handle, so the driver goes on to attach backing and build sampler views on a
+     * resource the host never made, and the host answers with "Illegal resource" and
+     * puts the context in error for the rest of its life -- every later submission,
+     * the decode included, is dropped without a word. gst-va provokes exactly that
+     * during plugin registration, when it creates a 64x64 surface of every fourcc it
+     * knows to learn the layout each one derives to. So the composite shape is taken
+     * only for a format the host's sampler bitmask lists, which is the same lookup
+     * virgl_is_format_supported does for a planar layout; today that is NV12 alone.
+     * Everything else, single-plane formats included (Y800 would otherwise go out under
+     * its own name rather than as R8), takes the per-plane form the host has always
+     * accepted, and decodes through the copy path.
      *
      * Interlaced is excluded outright. Its template is a 2D_ARRAY, and a planar create
      * has to chain plane resources over one allocation -- a shape neither the guest
      * layout nor the host's plane addressing takes for an array target. */
     if ((vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VIDEO_PLANAR_TARGET) &&
-        !tmpl->interlaced)
+        !tmpl->interlaced &&
+        util_format_get_num_planes(tmpl->buffer_format) > 1 &&
+        vs->base.is_format_supported(&vs->base, tmpl->buffer_format, PIPE_TEXTURE_2D,
+                                     0, 0, PIPE_BIND_SAMPLER_VIEW))
         vbuf->buf = vl_video_buffer_create_as_resource(ctx, tmpl, NULL, 0);
     if (!vbuf->buf)
         vbuf->buf = vl_video_buffer_create(ctx, tmpl);
