@@ -1798,7 +1798,16 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
    };
 
    /* figure out aux plane count */
-   if (whandle && whandle->plane >= util_format_get_num_planes(whandle->format))
+   /* limina: an IOSurface import is never an aux plane. Its plane index selects a
+    * plane OF THE SURFACE, and the resource is a complete single-plane image over
+    * it (the whandle format is that plane's own component format, so the generic
+    * test below fires for every plane past the first). An aux object skips
+    * DestroyImage, which for this import leaks the VkImage, the KK texture retain
+    * behind it, and the IOSurface itself: every decode target's chroma plane
+    * stayed alive after its resource was gone, ~16.4k surfaces in, IOSurfaceCreate
+    * refused, and every hardware decode from then on poisoned its context. */
+   if (whandle && whandle->plane >= util_format_get_num_planes(whandle->format) &&
+       whandle->type != WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
       obj->is_aux = true;
    struct pipe_resource *pnext = templ->next;
    for (obj->plane_count = 1; pnext; obj->plane_count++, pnext = pnext->next) {
