@@ -202,10 +202,6 @@ kk_pool_snapshot(struct kk_alloc_pool *pool)
                  pa->mib_seen, (unsigned long long)(pa->peak_bytes >> 10));
       }
    }
-   /* And the allocator THIS thread has an open encoder on. It is the single fact a post-mortem
-    * most wants, it is already tracked in TLS, and it has never been written down anywhere. */
-   if (kk_tls_open_alloc)
-      fprintf(f, "open_on_this_thread %p\n", (void *)kk_tls_open_alloc);
    fclose(f);
 }
 
@@ -476,8 +472,14 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa, uint32_
        * retires them by the thousand, so a line per crossing is a flood — and a flood is how the
        * last two diagnostics here went wrong. One line a second is for the human; the snapshot
        * below carries the full per-allocator detail for the post-mortem. */
+      /* A growth on an allocator that has ALREADY been reset is the event the hypothesis is
+       * about — a reset leaving the segment chain short — and it is rare, because mib_seen is a
+       * lifetime maximum, so an allocator only ever grows past its own high-water. The startup
+       * burst is all resets=0, so exempting this case costs nothing and never loses the one
+       * crossing worth having. */
+      const bool after_reset = pa->resets > 0;
       const uint64_t now = os_time_get_nano();
-      if (now - pool->growth_log_last_ns >= 1000000000ull) {
+      if (after_reset || now - pool->growth_log_last_ns >= 1000000000ull) {
          pool->growth_log_last_ns = now;
          fprintf(stderr,
                  "[LIMINA-ALLOC-POOL] GROWTH alloc=%p class=%u %u->%u MiB | ops=%u "
