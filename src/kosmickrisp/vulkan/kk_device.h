@@ -133,6 +133,14 @@ struct kk_pooled_alloc {
    /* Lifetime totals, reported at teardown and on demand. */
    uint32_t begins;     /* command buffers begun on this allocator */
    uint64_t peak_bytes; /* largest allocatedSize ever observed at release */
+   /* limina (growth trace). AGX grows its own data-buffer pool in 1 MiB segments, and the fault
+    * we are hunting is a NULL next-segment at the FIRST of those boundaries — the register state
+    * says the cursor was 31 bytes past 1 MiB, not near the 4 MiB budget. So the moment an
+    * allocator crosses a whole MiB is the event worth recording, together with how much work had
+    * gone into it since it was last reset. */
+   uint32_t mib_seen;        /* largest whole MiB of allocatedSize seen at release */
+   uint32_t resets;          /* resets performed on THIS allocator */
+   uint32_t ops_since_reset; /* encoder ops recorded since its last reset */
 };
 
 struct kk_alloc_pool {
@@ -160,6 +168,13 @@ struct kk_alloc_pool {
    uint64_t hiwater_bytes[KK_ALLOC_CLASS_COUNT];
    uint32_t over_budget[KK_ALLOC_CLASS_COUNT];
    uint32_t peak_ops[KK_ALLOC_CLASS_COUNT];
+   /* limina (growth trace): 1 MiB boundary crossings observed, and the most ops ever recorded
+    * into one allocator between two of its resets. `peak_ops` above is per command buffer, which
+    * is not the same question — an allocator serves many command buffers before it is reset, and
+    * it is the total since the reset that decides how far AGX's pool has had to grow. */
+   uint32_t growths[KK_ALLOC_CLASS_COUNT];
+   uint32_t peak_ops_since_reset[KK_ALLOC_CLASS_COUNT];
+   uint64_t growth_log_last_ns;
    /* Destroyed allocators, kept (not freed) so a stale pointer is detectable. */
    struct util_dynarray tombstones; /* struct kk_pooled_alloc * */
    uint32_t use_after_destroy;

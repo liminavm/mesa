@@ -113,6 +113,10 @@ kk_alloc_pool_report(struct kk_device *dev, const char *why)
               (unsigned long long)(pool->hiwater_bytes[k] >> 10),
               (unsigned long long)(pool->budget_bytes >> 10), pool->over_budget[k],
               pool->peak_ops[k]);
+      fprintf(stderr,
+              "[LIMINA-ALLOC-POOL] %s %s growth: %u MiB crossings | peak ops between resets=%u\n",
+              why, k == KK_ALLOC_CLASS_RENDER ? "render" : "compute", pool->growths[k],
+              pool->peak_ops_since_reset[k]);
    }
    fprintf(stderr,
            "[LIMINA-ALLOC-POOL] %s tombstones=%u use-after-destroy=%u | resets=%u/%u "
@@ -169,14 +173,39 @@ kk_pool_snapshot(struct kk_alloc_pool *pool)
    for (unsigned k = 0; k < KK_ALLOC_CLASS_COUNT; ++k) {
       fprintf(f,
               "%s live=%u peak=%u destroyed=%u hiwater_kib=%llu retirements=%u resets=%u "
-              "peak_ops=%u\n",
+              "peak_ops=%u growths=%u peak_ops_since_reset=%u\n",
               k == KK_ALLOC_CLASS_RENDER ? "render" : "compute", pool->live[k], pool->peak_live[k],
               pool->destroyed[k], (unsigned long long)(pool->hiwater_bytes[k] >> 10),
-              pool->over_budget[k], pool->resets[k], pool->peak_ops[k]);
+              pool->over_budget[k], pool->resets[k], pool->peak_ops[k], pool->growths[k],
+              pool->peak_ops_since_reset[k]);
    }
    fprintf(f, "tombstones=%u use_after_destroy=%u unmatched_discharge=%u releases=%u\n",
            (unsigned)util_dynarray_num_elements(&pool->tombstones, kk_pooled_alloc_ptr),
            pool->use_after_destroy, pool->unmatched_discharge, pool->releases);
+
+   /* One line per LIVE allocator. The class aggregates above are lifetime maxima, which is the
+    * wrong tense for a post-mortem: the four snapshots left by the 2026-09-02 crash said nothing
+    * the periodic stderr report had not, because "the largest any allocator ever got" cannot
+    * identify the one that was in trouble. These lines can — above all `ops_since_reset` and
+    * `mib_seen` for the allocator an encoder was holding when the process died.
+    *
+    * Bounded by the pool's floor and peak (low hundreds of lines), and written at most once a
+    * second by the rate limit above. */
+   for (unsigned k = 0; k < KK_ALLOC_CLASS_COUNT; ++k) {
+      util_dynarray_foreach(&pool->allocs[k], kk_pooled_alloc_ptr, pap) {
+         const struct kk_pooled_alloc *pa = *pap;
+         fprintf(f,
+                 "alloc %p class=%u magic=%08x in_use=%d draining=%d pending=%u begins=%u "
+                 "resets=%u ops_since_reset=%u mib=%u peak_kib=%llu\n",
+                 (const void *)pa, (unsigned)pa->klass, pa->magic, (int)pa->in_use,
+                 (int)pa->draining, pa->pending, pa->begins, pa->resets, pa->ops_since_reset,
+                 pa->mib_seen, (unsigned long long)(pa->peak_bytes >> 10));
+      }
+   }
+   /* And the allocator THIS thread has an open encoder on. It is the single fact a post-mortem
+    * most wants, it is already tracked in TLS, and it has never been written down anywhere. */
+   if (kk_tls_open_alloc)
+      fprintf(f, "open_on_this_thread %p\n", (void *)kk_tls_open_alloc);
    fclose(f);
 }
 
@@ -322,6 +351,10 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
             continue;
          assert(pa->draining);
          pool->resets[klass]++;
+         pa->resets++;
+         /* A reset is where AGX's own pool goes back to one segment, so the ops counter that
+          * matters for the next growth starts here. */
+         pa->ops_since_reset = 0;
          mtl_command_allocator_reset(pa->handle);
          pa->draining = false;
          pa->idle_since = 0;
@@ -425,6 +458,35 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa, uint32_
       pool->hiwater_bytes[pa->klass] = size;
    if (ops > pool->peak_ops[pa->klass])
       pool->peak_ops[pa->klass] = ops;
+
+   /* limina (growth trace): the work this allocator has taken on since its last reset, and the
+    * whole-MiB boundaries it has crossed. The fault under investigation is AGX failing to chain
+    * a second 1 MiB segment, so "how far past a boundary, after how much work, how many resets
+    * in" is the shape of the evidence wanted at the next crash. */
+   pa->ops_since_reset += ops;
+   if (pa->ops_since_reset > pool->peak_ops_since_reset[pa->klass])
+      pool->peak_ops_since_reset[pa->klass] = pa->ops_since_reset;
+
+   const uint32_t mib = (uint32_t)(size >> 20);
+   if (mib > pa->mib_seen) {
+      const uint32_t from = pa->mib_seen;
+      pa->mib_seen = mib;
+      pool->growths[pa->klass]++;
+      /* Counted always, logged rarely. Every allocator crosses several boundaries and the pool
+       * retires them by the thousand, so a line per crossing is a flood — and a flood is how the
+       * last two diagnostics here went wrong. One line a second is for the human; the snapshot
+       * below carries the full per-allocator detail for the post-mortem. */
+      const uint64_t now = os_time_get_nano();
+      if (now - pool->growth_log_last_ns >= 1000000000ull) {
+         pool->growth_log_last_ns = now;
+         fprintf(stderr,
+                 "[LIMINA-ALLOC-POOL] GROWTH alloc=%p class=%u %u->%u MiB | ops=%u "
+                 "ops_since_reset=%u begins=%u resets=%u pending=%u (%u crossings this class)\n",
+                 (void *)pa, pa->klass, from, mib, ops, pa->ops_since_reset, pa->begins,
+                 pa->resets, pa->pending, pool->growths[pa->klass]);
+         fflush(stderr);
+      }
+   }
    /* Retire on budget. Note this is checked at encoder end, not at reset time: allocatedSize
     * never shrinks, so by the time a reset-time check fires the growth is already permanent. */
    if (pool->budget_bytes && size >= pool->budget_bytes) {
