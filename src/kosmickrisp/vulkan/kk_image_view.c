@@ -245,6 +245,21 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
 void
 kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
 {
+   /* limina: bisection knob. A descriptor set caches a view's MTLResourceID, not
+    * the view; if a set outlives the VkImageView it named, the ID can be reissued
+    * to an unrelated texture. Leaking every view makes that unrepresentable. */
+   {
+      static int leak = -1;
+      if (leak < 0) {
+         const char *e = getenv("LIMINA_KK_VIEW_LEAK");
+         leak = e && strcmp(e, "0") != 0;
+         if (leak)
+            fprintf(stderr, "[LIMINA] KK image views LEAKING (LIMINA_KK_VIEW_LEAK)\n");
+      }
+      if (leak)
+         return;
+   }
+
    for (uint8_t plane = 0; plane < view->plane_count; plane++) {
       if (view->planes[plane].mtl_handle_sampled) {
          kk_device_remove_texture_from_residency_set(

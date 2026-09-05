@@ -17,6 +17,8 @@
 #include "kk_physical_device.h"
 #include "kk_sampler.h"
 
+#include "kosmickrisp/bridge/mtl_bridge.h"
+
 #include "util/format/u_format.h"
 
 static inline uint32_t
@@ -52,6 +54,49 @@ write_desc(struct kk_descriptor_set *set, uint32_t binding, uint32_t elem,
    memcpy(dst, desc_data, desc_size);
 }
 
+/* limina: LIMINA_KK_DESCLOG -- report each distinct (descriptor type, Vulkan view
+ * type, Metal texture type) tuple once. Metal's shader validator says which type it
+ * expected and which was bound; this says which of the two sides invented the
+ * mismatch, without guessing from the source. */
+static void
+kk_limina_desclog(VkDescriptorType type, const struct kk_image_view *view,
+                  uint8_t plane, bool is_input_attachment)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("LIMINA_KK_DESCLOG") != NULL;
+   if (!on)
+      return;
+
+   mtl_texture *tex = is_input_attachment ? view->planes[plane].mtl_handle_input
+                                          : view->planes[plane].mtl_handle_sampled;
+   if (tex == NULL)
+      return;
+
+   struct mtl_texture_props props = {0};
+   mtl_texture_get_props(tex, &props);
+
+   uint64_t key = ((uint64_t)type << 40) | ((uint64_t)view->vk.view_type << 32) |
+                  ((uint64_t)props.texture_type << 16) |
+                  ((uint64_t)props.sample_count << 8) | (uint64_t)is_input_attachment;
+
+   static uint64_t seen[64];
+   static unsigned seen_n;
+   for (unsigned i = 0; i < seen_n; i++)
+      if (seen[i] == key)
+         return;
+   if (seen_n < ARRAY_SIZE(seen))
+      seen[seen_n++] = key;
+
+   fprintf(stderr,
+           "[LIMINA-KK-DESC] desc_type=%u vk_view_type=%u input=%d -> "
+           "mtl_texture_type=%u samples=%u layers=%u %llux%llu\n",
+           (unsigned)type, (unsigned)view->vk.view_type, (int)is_input_attachment,
+           props.texture_type, props.sample_count, props.array_length,
+           (unsigned long long)props.width, (unsigned long long)props.height);
+   fflush(stderr);
+}
+
 static void
 get_sampled_image_view_desc(VkDescriptorType descriptor_type,
                             const VkDescriptorImageInfo *const info, void *dst,
@@ -75,6 +120,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
             desc[plane].image_gpu_resource_id =
                view->planes[plane].sampled_gpu_resource_id;
          }
+         kk_limina_desclog(descriptor_type, view, plane, is_input_attachment);
       }
    }
 
