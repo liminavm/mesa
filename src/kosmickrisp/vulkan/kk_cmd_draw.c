@@ -2575,6 +2575,45 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    cmd->limina_draws += data->draw_count;
 
+   /* limina: LIMINA_KK_ADDR_CHECK=1 -- does every address this draw hands the GPU still lie
+    * inside a live BO? Serialising submits to one command buffer at a time does not stop the
+    * device loss, so the bad address is put there by the CPU before the pass is even committed,
+    * and the encode is the last place it can be caught while the culprit is still nameable.
+    * The registry drops a BO's entry when it is destroyed, so a freed range reads as unknown. */
+   {
+      static int check = -1;
+      if (unlikely(check < 0)) {
+         const char *e = getenv("LIMINA_KK_ADDR_CHECK");
+         check = e && e[0] && e[0] != '0';
+         if (check)
+            fprintf(stderr, "[LIMINA] KK draw address checking ON (LIMINA_KK_ADDR_CHECK)\n");
+      }
+      if (unlikely(check)) {
+         static unsigned reported;
+         const struct kk_graphics_state *g = &cmd->state.gfx;
+         struct {
+            const char *what;
+            uint64_t addr;
+         } probes[] = {
+            {"root", g->descriptors.root.addr},
+            {"index", data->indexed ? data->index_buffer.addr : 0ull},
+            {"vb0", g->vb.addr_range[0].addr},
+            {"vb1", g->vb.addr_range[1].addr},
+         };
+         for (unsigned i = 0; i < ARRAY_SIZE(probes); i++) {
+            if (probes[i].addr == 0ull || kk_limina_addr_to_cpu(probes[i].addr) != NULL)
+               continue;
+            if (reported++ < 40u)
+               fprintf(stderr,
+                       "[LIMINA-BADADDR] %s = 0x%llx is in no live BO (pass %ux%u s%u, "
+                       "draws so far %u)\n",
+                       probes[i].what, (unsigned long long)probes[i].addr,
+                       g->render.area.extent.width, g->render.area.extent.height,
+                       g->render.samples, cmd->limina_draws);
+         }
+      }
+   }
+
    bool xfb_track =
       unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);
 

@@ -296,6 +296,11 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
       return;
    }
 
+   for (unsigned i = 0; i < KK_LIMINA_BO_MAX; i++) {
+      if (kk_limina_bos[i].cpu && kk_limina_bos[i].gpu == bo->gpu)
+         kk_limina_bos[i].cpu = NULL;
+   }
+
    kk_limina_addr_log("bo- heap=%p gpu=0x%llx..0x%llx size=%llu", (void *)bo->mtl_handle,
                       (unsigned long long)bo->gpu,
                       (unsigned long long)(bo->gpu + bo->size_B),
