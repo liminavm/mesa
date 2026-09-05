@@ -35,6 +35,8 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
                .user_data = data,
                .error_message =
                   error ? error.localizedDescription.UTF8String : NULL,
+               .error_details =
+                  error ? error.userInfo.description.UTF8String : NULL,
                .gpu_start = feedback.GPUStartTime,
                .gpu_end = feedback.GPUEndTime,
                .error = error
