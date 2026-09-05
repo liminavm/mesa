@@ -293,6 +293,54 @@ kk_limina_work_record(const char *fmt, ...)
    return seq;
 }
 
+#define KK_LIMINA_RID_DEAD 8192u
+static simple_mtx_t kk_limina_rid_lock = SIMPLE_MTX_INITIALIZER;
+static uint64_t kk_limina_rid_dead[KK_LIMINA_RID_DEAD];
+
+void
+kk_limina_rid_died(uint64_t id)
+{
+   if (id == 0ull)
+      return;
+
+   simple_mtx_lock(&kk_limina_rid_lock);
+   unsigned slot = (unsigned)((id * 2654435761u) % KK_LIMINA_RID_DEAD);
+   for (unsigned i = 0; i < 8u; i++) {
+      unsigned s = (slot + i) % KK_LIMINA_RID_DEAD;
+      if (kk_limina_rid_dead[s] == 0ull || kk_limina_rid_dead[s] == id) {
+         kk_limina_rid_dead[s] = id;
+         break;
+      }
+      /* Probe run full: overwrite the first slot rather than lose the newest death, which is
+       * the one a live descriptor is most likely to still be naming. */
+      if (i == 7u)
+         kk_limina_rid_dead[slot] = id;
+   }
+   simple_mtx_unlock(&kk_limina_rid_lock);
+}
+
+bool
+kk_limina_rid_is_dead(uint64_t id)
+{
+   if (id == 0ull)
+      return false;
+
+   bool dead = false;
+   simple_mtx_lock(&kk_limina_rid_lock);
+   unsigned slot = (unsigned)((id * 2654435761u) % KK_LIMINA_RID_DEAD);
+   for (unsigned i = 0; i < 8u; i++) {
+      uint64_t v = kk_limina_rid_dead[(slot + i) % KK_LIMINA_RID_DEAD];
+      if (v == id) {
+         dead = true;
+         break;
+      }
+      if (v == 0ull)
+         break;
+   }
+   simple_mtx_unlock(&kk_limina_rid_lock);
+   return dead;
+}
+
 bool
 kk_limina_addr_log_enabled(void)
 {

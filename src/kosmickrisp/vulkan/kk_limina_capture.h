@@ -84,6 +84,15 @@ void kk_limina_work_dump(FILE *f, unsigned max, uint64_t lo, uint64_t hi);
  * and its position against the failing commit's sequence range says whether it died under
  * work already in flight. */
 bool kk_limina_addr_log_enabled(void);
+
+/* limina: dead Metal resource IDs. A descriptor set caches a texture's MTLResourceID, not the
+ * texture; a set that outlives the view it named keeps dereferencing an ID Metal may have
+ * reissued. Addresses can be checked against the BO registry, but an ID is not an address and
+ * has no such home -- so remember the IDs that die, and look for them in the memory of the
+ * descriptor sets a draw actually binds. Only values that were once resource IDs are ever
+ * flagged, so a scan of raw memory cannot invent a hit. */
+void kk_limina_rid_died(uint64_t id);
+bool kk_limina_rid_is_dead(uint64_t id);
 void kk_limina_addr_log(const char *fmt, ...) PRINTFLIKE(1, 2);
 
 #endif /* KK_LIMINA_CAPTURE_H */

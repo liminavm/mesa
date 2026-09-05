@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kk_limina_capture.h"
 #include "kk_image_view.h"
 
 #include "kk_device.h"
@@ -261,6 +262,10 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
    }
 
    for (uint8_t plane = 0; plane < view->plane_count; plane++) {
+      kk_limina_rid_died(view->planes[plane].sampled_gpu_resource_id);
+      kk_limina_rid_died(view->planes[plane].storage_gpu_resource_id);
+      kk_limina_rid_died(view->planes[plane].input_gpu_resource_id);
+
       if (view->planes[plane].mtl_handle_sampled) {
          kk_device_remove_texture_from_residency_set(
             dev, view->planes[plane].mtl_handle_sampled);

@@ -12,6 +12,7 @@
 
 #include "kk_buffer.h"
 #include "kk_bo.h"
+#include "kk_limina_capture.h"
 #include "kk_cmd_buffer.h"
 #include "kk_format.h"
 #include "kk_image_view.h"
@@ -2610,6 +2611,44 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                        probes[i].what, (unsigned long long)probes[i].addr,
                        g->render.area.extent.width, g->render.area.extent.height,
                        g->render.samples, cmd->limina_draws);
+         }
+
+         /* The root table is one dereference away from the descriptor sets it names, and the
+          * kernel reports these faults at page-table level 1 and 2 -- a nested read. Check the
+          * addresses inside it too, and then the sets' own contents for a resource ID that has
+          * died: an ID is not an address, so the BO registry cannot speak for it. Multisampled
+          * passes only -- those are the ones that fault, and this walks memory per draw. */
+         if (g->render.samples > 1u) {
+            for (unsigned s_i = 0; s_i < KK_MAX_SETS; s_i++) {
+               uint64_t set_addr = g->descriptors.root.sets[s_i];
+               if (set_addr == 0ull)
+                  continue;
+
+               const uint64_t *set_cpu = kk_limina_addr_to_cpu(set_addr);
+               if (set_cpu == NULL) {
+                  if (reported++ < 40u)
+                     fprintf(stderr,
+                             "[LIMINA-BADADDR] set%u = 0x%llx is in no live BO (pass %ux%u s%u)\n",
+                             s_i, (unsigned long long)set_addr, g->render.area.extent.width,
+                             g->render.area.extent.height, g->render.samples);
+                  continue;
+               }
+
+               uint32_t size = g->descriptors.set_sizes[s_i];
+               if (size > 4096u)
+                  size = 4096u;
+               for (uint32_t off = 0; off + 8u <= size; off += 8u) {
+                  if (!kk_limina_rid_is_dead(set_cpu[off / 8u]))
+                     continue;
+                  if (reported++ < 40u)
+                     fprintf(stderr,
+                             "[LIMINA-DEADRID] set%u+%u = 0x%llx names a destroyed view "
+                             "(pass %ux%u s%u)\n",
+                             s_i, off, (unsigned long long)set_cpu[off / 8u],
+                             g->render.area.extent.width, g->render.area.extent.height,
+                             g->render.samples);
+               }
+            }
          }
       }
    }
