@@ -5,6 +5,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <pthread.h>
+#include <errno.h>
+#include <time.h>
 #include "kk_limina_capture.h"
 #include "kk_queue.h"
 #include "kk_bo.h"
@@ -30,6 +33,69 @@ struct kk_commit_note {
     * actually executed instead of inferring it. */
    uint64_t out_draws;
 };
+
+/* limina A/B lever, LIMINA_KK_SERIALIZE_SUBMIT=1: after committing a batch, block until that
+ * batch's completion callback has fired, so at most one command buffer is ever on the GPU.
+ *
+ * Every remaining suspect in the WebGL MSAA device loss is a race BETWEEN commits -- the shared
+ * poly heap's reset, the pre_gfx/gfx split, upload-pool and allocator reuse, a residency removal
+ * or a released texture landing under work already in flight. One arm collapses all of them: if
+ * the loss survives full serialisation, the corruption is made inside a single commit or on the
+ * CPU, and nothing else can have touched the memory in between. Ruinous for throughput; a
+ * bisection arm, never a shipping mode.
+ *
+ * The wait is bounded. A completion that never arrives would otherwise hang the guest and turn a
+ * reading into a void arm, and the timeout is itself a finding worth printing. */
+static bool
+kk_limina_serialize_submit(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("LIMINA_KK_SERIALIZE_SUBMIT");
+      on = e && e[0] && e[0] != '0';
+      if (on)
+         fprintf(stderr,
+                 "[LIMINA] KK submits SERIALIZED (LIMINA_KK_SERIALIZE_SUBMIT) -- one command "
+                 "buffer on the GPU at a time\n");
+   }
+   return on != 0;
+}
+
+static pthread_mutex_t kk_limina_serial_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t kk_limina_serial_cnd = PTHREAD_COND_INITIALIZER;
+static unsigned kk_limina_serial_pending;
+
+static void
+kk_limina_serial_done(void)
+{
+   pthread_mutex_lock(&kk_limina_serial_mtx);
+   if (kk_limina_serial_pending > 0u)
+      kk_limina_serial_pending--;
+   pthread_cond_broadcast(&kk_limina_serial_cnd);
+   pthread_mutex_unlock(&kk_limina_serial_mtx);
+}
+
+static void
+kk_limina_serial_wait(void)
+{
+   struct timespec deadline;
+   clock_gettime(CLOCK_REALTIME, &deadline);
+   deadline.tv_sec += 2;
+
+   pthread_mutex_lock(&kk_limina_serial_mtx);
+   while (kk_limina_serial_pending > 0u) {
+      if (pthread_cond_timedwait(&kk_limina_serial_cnd, &kk_limina_serial_mtx, &deadline) ==
+          ETIMEDOUT) {
+         fprintf(stderr,
+                 "[LIMINA] KK serialized submit: %u commit(s) did not complete within 2 s\n",
+                 kk_limina_serial_pending);
+         fflush(stderr);
+         kk_limina_serial_pending = 0u;
+         break;
+      }
+   }
+   pthread_mutex_unlock(&kk_limina_serial_mtx);
+}
 
 static void
 commit_callback(struct mtl_feedback_data *data)
@@ -79,6 +145,9 @@ commit_callback(struct mtl_feedback_data *data)
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);
    }
+
+   if (kk_limina_serialize_submit())
+      kk_limina_serial_done();
 
    free(note);
 }
@@ -229,17 +298,55 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          note->seq_hi = cmd_buffer->work_seq_hi;
          note->out_draws = cmd_buffer->limina_out_draws;
 
-         mtl_commit_options_add_feedback_handler(queue->commit_options,
-                                                 commit_callback, note);
-         if (d) {
-            util_dynarray_clear(&cmd_buffer->charged_allocs);
+         if (!kk_limina_serialize_submit()) {
             mtl_commit_options_add_feedback_handler(queue->commit_options,
-                                                    discharge_callback, d);
+                                                    commit_callback, note);
+            if (d) {
+               util_dynarray_clear(&cmd_buffer->charged_allocs);
+               mtl_commit_options_add_feedback_handler(queue->commit_options,
+                                                       discharge_callback, d);
+            }
+         }
+
+         if (kk_limina_serialize_submit()) {
+            /* One Metal command buffer per commit, each waited to completion. Committing the
+             * batch together is not enough: the three 4-sample passes that lose the device
+             * arrive in ONE batch, all rendering into the same attachment, and Metal is free to
+             * overlap them. This is the arm that leaves nothing concurrent at all.
+             *
+             * The note is per commit (the callback frees it) and the discharge payload rides the
+             * last one, which is the commit whose completion releases the whole command
+             * buffer's borrows. */
+            for (uint32_t k = 0; k < count; ++k) {
+               struct kk_commit_note *n = malloc(sizeof(*n));
+               if (n != NULL) {
+                  *n = *note;
+                  mtl_commit_options_add_feedback_handler(queue->commit_options,
+                                                          commit_callback, n);
+                  pthread_mutex_lock(&kk_limina_serial_mtx);
+                  kk_limina_serial_pending++;
+                  pthread_mutex_unlock(&kk_limina_serial_mtx);
+               }
+               if (k + 1u == count && d) {
+                  util_dynarray_clear(&cmd_buffer->charged_allocs);
+                  mtl_commit_options_add_feedback_handler(queue->commit_options,
+                                                          discharge_callback, d);
+               }
+
+               mtl_command_queue_commit(queue->mtl_handle, cmds + k, 1u,
+                                        queue->commit_options);
+               if (n != NULL)
+                  kk_limina_serial_wait();
+            }
+
+            free(note);
+            goto committed;
          }
 
          mtl_command_queue_commit(queue->mtl_handle, cmds, count,
                                   queue->commit_options);
 
+      committed:
          /* limina: a triggered GPU capture closes here, after the commit, never mid-encode --
           * stopping with an encoded-but-uncommitted command buffer truncates the trace. */
          kk_limina_capture_after_commit();
