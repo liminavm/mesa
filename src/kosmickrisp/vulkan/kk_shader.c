@@ -346,8 +346,9 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
    }
    bool robustness2 =
       !kk_limina_norobust() &&
-      rs->vertex_inputs ==
-      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
+      (kk_limina_force_robust() ||
+       rs->vertex_inputs ==
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2);
    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
 }
 

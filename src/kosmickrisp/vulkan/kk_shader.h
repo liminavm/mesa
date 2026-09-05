@@ -8,6 +8,7 @@
 #ifndef KK_SHADER_H
 #define KK_SHADER_H 1
 
+#include <stdio.h>
 #include "kk_device_memory.h"
 #include "kk_private.h"
 
@@ -161,6 +162,26 @@ kk_limina_norobust(void)
    if (v < 0)
       v = getenv("LIMINA_KK_NOROBUST") != NULL;
    return v;
+}
+
+/* limina A/B lever, LIMINA_KK_FORCE_ROBUST=1: clamp every vertex-attribute fetch to its bound
+ * buffer range whatever the pipeline asked for. The device-loss faults on this stack are scattered
+ * *read* faults across the whole GPU address space, which is what an out-of-range fetch looks
+ * like -- an index scaling into an arbitrary address -- rather than a stale pointer. Clamping
+ * discriminates "an out-of-range fetch" from "a bad pointer" without needing to know what
+ * produced the index. It is a diagnostic: it hides the symptom rather than fixing the cause, and
+ * it costs a bounds check per attribute read. */
+static inline bool
+kk_limina_force_robust(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_FORCE_ROBUST");
+      v = e && e[0] && e[0] != '0';
+      if (v)
+         fprintf(stderr, "[LIMINA] KK vertex fetch FORCED ROBUST (LIMINA_KK_FORCE_ROBUST)\n");
+   }
+   return v != 0;
 }
 
 static inline nir_address_format
