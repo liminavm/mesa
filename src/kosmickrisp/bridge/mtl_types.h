@@ -369,6 +369,9 @@ struct mtl_texture_memory_copy {
 struct mtl_feedback_data {
    void *user_data;
    const char *error_message;
+   /* limina: NSError.userInfo, where Metal puts the fault class and the faulting
+    * encoder. localizedDescription alone says only "the GPU was lost". */
+   const char *error_details;
    double gpu_start;
    double gpu_end;
    enum mtl_command_queue_error error;

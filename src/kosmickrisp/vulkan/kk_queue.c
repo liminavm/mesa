@@ -23,6 +23,25 @@ commit_callback(struct mtl_feedback_data *data)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
       struct kk_device *dev = (struct kk_device *)data->user_data;
+
+      /* limina: vk_device_set_lost's report reaches nothing the worker log captures,
+       * so a device loss arrives as an unexplained abort several layers downstream.
+       * Metal names the fault here; say it. The first few in full — a loss cascades. */
+      static uint32_t reported = 0u;
+      if (reported < 3u) {
+         ++reported;
+         fprintf(stderr,
+                 "[LIMINA-DEVICE-LOST] %s (code %u) gpu=%.6f..%.6f (%.3f ms)\n"
+                 "  message: %s\n"
+                 "  details: %s\n",
+                 mtl_command_queue_error_to_string(data->error),
+                 (unsigned)data->error, data->gpu_start, data->gpu_end,
+                 (data->gpu_end - data->gpu_start) * 1000.0,
+                 data->error_message ? data->error_message : "(none)",
+                 data->error_details ? data->error_details : "(none)");
+         fflush(stderr);
+      }
+
       vk_device_set_lost(
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);
