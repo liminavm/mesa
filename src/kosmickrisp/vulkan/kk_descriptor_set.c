@@ -54,13 +54,17 @@ write_desc(struct kk_descriptor_set *set, uint32_t binding, uint32_t elem,
    memcpy(dst, desc_data, desc_size);
 }
 
-/* limina: LIMINA_KK_DESCLOG -- report each distinct (descriptor type, Vulkan view
- * type, Metal texture type) tuple once. Metal's shader validator says which type it
- * expected and which was bound; this says which of the two sides invented the
- * mismatch, without guessing from the source. */
+/* limina: LIMINA_KK_DESCLOG -- report each distinct descriptor SLOT, not each
+ * distinct type tuple. Metal's validator says a 2D-array texture reached a shader
+ * that declared a 2D one; deduping by (descriptor type, view type, Metal type) can
+ * only say whether some write was internally consistent, which every write is. The
+ * question is which slot a given resource id landed in, so the key is the slot plus
+ * the texture's identity, and the line carries the id the shader will dereference. */
 static void
-kk_limina_desclog(VkDescriptorType type, const struct kk_image_view *view,
-                  uint8_t plane, bool is_input_attachment)
+kk_limina_desclog(const struct kk_descriptor_set *set, uint32_t binding,
+                  uint32_t elem, VkDescriptorType type,
+                  const struct kk_image_view *view, uint8_t plane,
+                  bool is_input_attachment, uint64_t res_id)
 {
    static int on = -1;
    if (on < 0)
@@ -76,11 +80,18 @@ kk_limina_desclog(VkDescriptorType type, const struct kk_image_view *view,
    struct mtl_texture_props props = {0};
    mtl_texture_get_props(tex, &props);
 
-   uint64_t key = ((uint64_t)type << 40) | ((uint64_t)view->vk.view_type << 32) |
-                  ((uint64_t)props.texture_type << 16) |
-                  ((uint64_t)props.sample_count << 8) | (uint64_t)is_input_attachment;
+   uint64_t key = (uint64_t)binding * 0x9e3779b97f4a7c15ull;
+   key ^= (uint64_t)elem * 0xc2b2ae3d27d4eb4full;
+   key ^= (uint64_t)type << 3;
+   key ^= (uint64_t)view->vk.view_type << 11;
+   key ^= (uint64_t)props.texture_type << 17;
+   key ^= (uint64_t)props.sample_count << 23;
+   key ^= (uint64_t)props.array_length << 29;
+   key ^= (uint64_t)props.width << 37;
+   key ^= (uint64_t)props.height << 45;
+   key ^= (uint64_t)is_input_attachment << 61;
 
-   static uint64_t seen[64];
+   static uint64_t seen[1024];
    static unsigned seen_n;
    for (unsigned i = 0; i < seen_n; i++)
       if (seen[i] == key)
@@ -89,16 +100,22 @@ kk_limina_desclog(VkDescriptorType type, const struct kk_image_view *view,
       seen[seen_n++] = key;
 
    fprintf(stderr,
-           "[LIMINA-KK-DESC] desc_type=%u vk_view_type=%u input=%d -> "
-           "mtl_texture_type=%u samples=%u layers=%u %llux%llu\n",
-           (unsigned)type, (unsigned)view->vk.view_type, (int)is_input_attachment,
-           props.texture_type, props.sample_count, props.array_length,
-           (unsigned long long)props.width, (unsigned long long)props.height);
+           "[LIMINA-KK-DESC] set=%p binding=%u elem=%u desc_type=%u input=%d "
+           "view=%p vk_view_type=%u layers=%u-%u -> id=0x%llx mtl_type=%u "
+           "samples=%u tex_layers=%u %llux%llu\n",
+           (void *)set, binding, elem, (unsigned)type, (int)is_input_attachment,
+           (void *)view, (unsigned)view->vk.view_type,
+           (unsigned)view->vk.base_array_layer, (unsigned)view->vk.layer_count,
+           (unsigned long long)res_id, props.texture_type, props.sample_count,
+           props.array_length, (unsigned long long)props.width,
+           (unsigned long long)props.height);
    fflush(stderr);
 }
 
 static void
-get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+get_sampled_image_view_desc(const struct kk_descriptor_set *set,
+                            uint32_t binding, uint32_t elem,
+                            VkDescriptorType descriptor_type,
                             const VkDescriptorImageInfo *const info, void *dst,
                             size_t dst_size, bool is_input_attachment)
 {
@@ -120,7 +137,9 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
             desc[plane].image_gpu_resource_id =
                view->planes[plane].sampled_gpu_resource_id;
          }
-         kk_limina_desclog(descriptor_type, view, plane, is_input_attachment);
+         kk_limina_desclog(set, binding, elem, descriptor_type, view, plane,
+                           is_input_attachment,
+                           desc[plane].image_gpu_resource_id);
       }
    }
 
@@ -188,7 +207,7 @@ write_sampled_image_view_desc(struct kk_descriptor_set *set,
    uint32_t dst_size;
    void *dst = desc_ubo_data(set, binding, elem, &dst_size);
    get_sampled_image_view_desc(
-      descriptor_type, &info, dst, dst_size,
+      set, binding, elem, descriptor_type, &info, dst, dst_size,
       descriptor_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT);
 }
 

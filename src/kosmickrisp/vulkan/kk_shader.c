@@ -1379,6 +1379,15 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
 
    mtl_render_pipeline_descriptor *pipeline_descriptor =
       mtl_new_render_pipeline_descriptor();
+
+   /* limina: label the pipeline with the kk_shader pointer KK_LIMINA_SHADER_DUMP
+    * names its files by, so a Metal shader-validation report identifies the shader
+    * pair directly instead of a UID we cannot map back. */
+   {
+      char label[64];
+      snprintf(label, sizeof(label), "kk=%p", (void *)vs);
+      mtl_render_pipeline_descriptor_set_label(pipeline_descriptor, label);
+   }
    mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
                                                     vertex_function);
    mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,

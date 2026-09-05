@@ -65,6 +65,12 @@ void mtl_render_pipeline_descriptor_set_rasterization_enabled(
 void mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
    mtl_render_pipeline_descriptor *descriptor, uint32_t count);
 
+/* limina: name the pipeline. Metal's shader validator reports every fault as
+ * pipeline: "(null)", UID: "<hash>" -- a hash we cannot compute on our side, so a
+ * report cannot be tied back to a shader. A label makes each report self-identifying. */
+void mtl_render_pipeline_descriptor_set_label(
+   mtl_render_pipeline_descriptor *descriptor, const char *label);
+
 /* Render pipeline */
 mtl_render_pipeline_state *
 mtl_new_render_pipeline(mtl_compiler *compiler,

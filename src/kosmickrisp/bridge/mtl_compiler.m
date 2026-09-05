@@ -208,6 +208,16 @@ mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(mtl_render_pip
    }
 }
 
+void
+mtl_render_pipeline_descriptor_set_label(mtl_render_pipeline_descriptor *descriptor,
+                                         const char *label)
+{
+   @autoreleasepool {
+      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+      desc.label = [NSString stringWithUTF8String:label];
+   }
+}
+
 /* Render pipeline */
 mtl_render_pipeline_state *
 mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *descriptor)

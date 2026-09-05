@@ -110,3 +110,10 @@ mtl_new_render_pipeline(mtl_compiler *compiler,
 {
    return NULL;
 }
+
+void
+mtl_render_pipeline_descriptor_set_label(mtl_render_pipeline_descriptor *descriptor,
+                                         const char *label)
+{
+   UNREACHABLE("Stub");
+}
