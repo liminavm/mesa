@@ -107,10 +107,15 @@ mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *lay
                                                                         mtl_texture_swizzle(layout->swizzle.blue),
                                                                         mtl_texture_swizzle(layout->swizzle.alpha));
       id<MTLTexture> v = [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices swizzle:swizzle];
-      if (limina_kk_rtlog_cached() && (!v || tex.buffer))
-         fprintf(stderr, "[LIMINA-KK-VIEW] %s parent=%p(linear=%d %lux%lu) type=%lu fmt=%lu -> %p\n",
+      /* limina: a nil view is always a bug -- Metal refuses some views of a
+       * multisample parent, and the caller goes on to ask nil for a resource ID,
+       * getting a zeroed one that the shader then dereferences. Report it
+       * unconditionally; the buffer-backed case stays behind RTLOG. */
+      if (!v || (limina_kk_rtlog_cached() && tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s parent=%p(linear=%d %lux%lu s=%lu) type=%lu fmt=%lu -> %p\n",
                  v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
                  (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.sampleCount,
                  (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
       return (mtl_texture *)limina_mtl_note_new(v);
    }
@@ -125,10 +130,11 @@ mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_
       NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
       NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
       id<MTLTexture> v = [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
-      if (limina_kk_rtlog_cached() && (!v || tex.buffer))
-         fprintf(stderr, "[LIMINA-KK-VIEW] %s(nosw) parent=%p(linear=%d %lux%lu) type=%lu fmt=%lu -> %p\n",
+      if (!v || (limina_kk_rtlog_cached() && tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s(nosw) parent=%p(linear=%d %lux%lu s=%lu) type=%lu fmt=%lu -> %p\n",
                  v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
                  (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.sampleCount,
                  (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
       return (mtl_texture *)limina_mtl_note_new(v);
    }
