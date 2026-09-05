@@ -208,4 +208,6 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
 void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
                                 struct kk_shader *shader);
 
+uint64_t kk_limina_msl_hash(const struct kk_shader *sh);
+
 #endif /* KK_SHADER_H */

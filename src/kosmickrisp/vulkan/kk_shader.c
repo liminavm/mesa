@@ -1329,6 +1329,24 @@ gather_graphics_pipeline_create_info(
    }
 }
 
+/* limina: a content hash over every stage's generated MSL. Stable across runs, so a
+ * validation report, a shader dump and a second run's report all name the same thing. */
+uint64_t
+kk_limina_msl_hash(const struct kk_shader *sh)
+{
+   uint64_t h = 0xcbf29ce484222325ull;
+   for (unsigned st = 0; st < MESA_SHADER_STAGES; st++) {
+      const char *code = sh->msl_data[st].code;
+      if (code == NULL)
+         continue;
+      for (const unsigned char *p = (const unsigned char *)code; *p; p++) {
+         h ^= *p;
+         h *= 0x100000001b3ull;
+      }
+   }
+   return h;
+}
+
 static VkResult
 kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
 {
@@ -1380,12 +1398,16 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    mtl_render_pipeline_descriptor *pipeline_descriptor =
       mtl_new_render_pipeline_descriptor();
 
-   /* limina: label the pipeline with the kk_shader pointer KK_LIMINA_SHADER_DUMP
-    * names its files by, so a Metal shader-validation report identifies the shader
-    * pair directly instead of a UID we cannot map back. */
+   /* limina: label the pipeline so a Metal shader-validation report identifies the
+    * shader pair instead of a UID we cannot map back. The label must be a hash of
+    * the generated MSL, not the kk_shader pointer: the label is hashed INTO the
+    * pipeline UID, so a per-run pointer makes every UID per-run too, and two runs
+    * of the same workload cannot be joined. KK_LIMINA_SHADER_DUMP names its files
+    * by the same hash. */
    {
       char label[64];
-      snprintf(label, sizeof(label), "kk=%p", (void *)vs);
+      snprintf(label, sizeof(label), "msl=%016llx",
+               (unsigned long long)kk_limina_msl_hash(vs));
       mtl_render_pipeline_descriptor_set_label(pipeline_descriptor, label);
    }
    mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,

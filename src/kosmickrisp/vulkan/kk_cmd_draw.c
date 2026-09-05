@@ -887,7 +887,7 @@ kk_limina_dump_shader(struct kk_shader *sh, const char *tag)
 {
    static const char *dir;
    static int checked;
-   static const void *dumped[64];
+   static const void *dumped[512];
    static unsigned dumped_n;
 
    if (!checked) {
@@ -900,11 +900,12 @@ kk_limina_dump_shader(struct kk_shader *sh, const char *tag)
    for (unsigned i = 0; i < dumped_n; i++)
       if (dumped[i] == sh)
          return;
-   if (dumped_n < 64)
+   if (dumped_n < ARRAY_SIZE(dumped))
       dumped[dumped_n++] = sh;
 
    char path[512];
-   snprintf(path, sizeof(path), "%s/%s-%p.msl", dir, tag, (void *)sh);
+   snprintf(path, sizeof(path), "%s/%s-msl%016llx.msl", dir, tag,
+            (unsigned long long)kk_limina_msl_hash(sh));
    FILE *f = fopen(path, "w");
    if (f == NULL)
       return;
