@@ -53,4 +53,8 @@ void mtl_texture_get_bytes(mtl_texture *texture, void *host_ptr,
 void mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                                 struct mtl_texture_memory_copy *data);
 
+
+/* limina DIAGNOSTIC: name a Metal object for the debug layer's reports. */
+void mtl_limina_set_label(void *obj, const char *label);
+
 #endif /* MTL_TEXTURE_H */

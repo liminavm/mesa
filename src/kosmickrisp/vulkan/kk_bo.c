@@ -272,6 +272,23 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
    if (bo->mtl_handle)
       kk_bo_census_credit(bo->size_B);
 
+   /* limina DIAGNOSTIC (LIMINA_KK_BO_LEAK=1): leak every heap-backed BO rather than
+    * dropping it out of the residency set and releasing it. Nothing the GPU has ever
+    * been shown can then become non-resident or unmapped underneath an in-flight
+    * command buffer. A GPU address fault that survives this is not a BO-lifetime fault.
+    * Costs memory without bound -- a bisection arm, never a shipping mode. */
+   static int leak = -1;
+   if (leak < 0) {
+      const char *e = getenv("LIMINA_KK_BO_LEAK");
+      leak = e && strcmp(e, "0") != 0;
+      if (leak)
+         fprintf(stderr, "[LIMINA] KK BO teardown LEAKING (LIMINA_KK_BO_LEAK)\n");
+   }
+   if (leak) {
+      FREE(bo);
+      return;
+   }
+
    /* We may only have a mapped buffer, for example if the memory was imported
     * from a host pointer */
    if (bo->mtl_handle)
