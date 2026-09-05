@@ -181,6 +181,12 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].sampled_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_sampled);
+         /* limina: a texture VIEW is its own Metal allocation, and it is the view's
+          * MTLResourceID -- not the parent's -- that shaders dereference out of an
+          * argument table. Registering the parent image's texture (and the heap it sits
+          * on) says nothing about the view. */
+         kk_device_add_texture_to_residency_set(
+            dev, view->planes[view_plane].mtl_handle_sampled);
       }
 
       if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
@@ -194,6 +200,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].storage_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_storage);
+         kk_device_add_texture_to_residency_set(
+            dev, view->planes[view_plane].mtl_handle_storage);
       }
 
       if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -238,11 +246,17 @@ void
 kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
 {
    for (uint8_t plane = 0; plane < view->plane_count; plane++) {
-      if (view->planes[plane].mtl_handle_sampled)
+      if (view->planes[plane].mtl_handle_sampled) {
+         kk_device_remove_texture_from_residency_set(
+            dev, view->planes[plane].mtl_handle_sampled);
          mtl_release(view->planes[plane].mtl_handle_sampled);
+      }
 
-      if (view->planes[plane].mtl_handle_storage)
+      if (view->planes[plane].mtl_handle_storage) {
+         kk_device_remove_texture_from_residency_set(
+            dev, view->planes[plane].mtl_handle_storage);
          mtl_release(view->planes[plane].mtl_handle_storage);
+      }
 
       if (view->planes[plane].mtl_handle_input)
          mtl_release(view->planes[plane].mtl_handle_input);

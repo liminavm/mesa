@@ -697,10 +697,12 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
 {
    if (plane->mtl_handle != NULL) {
       KK_TEX_CENSUS_RELEASE(); /* limina census */
+      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle);
       mtl_release(plane->mtl_handle);
    }
    if (plane->mtl_handle_array != NULL) {
       KK_TEX_CENSUS_RELEASE(); /* limina census */
+      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle_array);
       mtl_release(plane->mtl_handle_array);
    }
    /* limina: free the private heap-backed bo, if this plane got one (heap-less backing). */
@@ -1111,6 +1113,34 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
    plane->mem_offset_B = *offset_B;
    plane->mtl_handle = kk_image_plane_create_texture(plane, &plane->layout, 0u);
    KK_TEX_CENSUS_ACQUIRE(); /* limina census: freshly created plane texture */
+
+   /* limina DIAGNOSTIC: name the texture so Metal's debug layer identifies it. Its
+    * reports otherwise say "(Label: (null))", which cannot be acted on -- naming them is
+    * what turned "some attachment is not resident" into "the 4-sample one is". Only worth
+    * the snprintf and the NSString when something is reading labels. */
+   static int label = -1;
+   if (label < 0) {
+      const char *dbg = getenv("MTL_DEBUG_LAYER");
+      label = (dbg && strcmp(dbg, "0") != 0) || getenv("LIMINA_KK_LABELS") != NULL;
+   }
+   if (label) {
+      char lbl[128];
+      snprintf(lbl, sizeof(lbl),
+               "kkimg %ux%u s=%u fmt=%u ty=%u lv=%u ly=%u use=0x%x %s%s",
+               plane->layout.width_px, plane->layout.height_px,
+               (unsigned)plane->layout.sample_count_sa, (unsigned)plane->layout.format.mtl,
+               (unsigned)plane->layout.type, (unsigned)plane->layout.levels,
+               (unsigned)plane->layout.layers, (unsigned)plane->layout.usage,
+               plane->layout.linear ? "linear" : "tiled",
+               plane->private_bo ? " privbo" : "");
+      mtl_limina_set_label(plane->mtl_handle, lbl);
+   }
+
+   /* limina: put the texture itself in the residency set, not just the heap it was
+    * placed on. Metal's validation reports these textures as "not added to any
+    * residency set on the command buffer or command queue" even though their heap is
+    * in it, and an MSAA attachment used that way takes a GPU address fault. */
+   kk_device_add_texture_to_residency_set(dev, plane->mtl_handle);
    plane->addr = mem->bo->gpu + *offset_B;
 
    /* Create auxiliary 2D array texture for 3D images so we can use 2D views of
@@ -1128,6 +1158,7 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
          plane->private_bo ? plane->private_bo->mtl_handle : mem->bo->mtl_handle,
          &array_layout, plane->private_bo ? 0u : *offset_B);
       KK_TEX_CENSUS_ACQUIRE(); /* limina census: 3D array aux texture */
+      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle_array);
    }
 
    *offset_B += plane_size_B;
