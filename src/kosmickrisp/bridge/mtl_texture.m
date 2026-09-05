@@ -187,3 +187,16 @@ mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                   bytesPerImage:data->buffer_2d_image_size_B];
    }
 }
+
+/* limina DIAGNOSTIC: name a Metal object so the debug layer's reports identify it.
+ * Metal's validation says things like "Attachment texture (Label: (null)) ... is not
+ * added to any residency set", which is useless without this. */
+void
+mtl_limina_set_label(void *obj, const char *label)
+{
+   @autoreleasepool {
+      if (obj == NULL || label == NULL)
+         return;
+      [(id<MTLResource>)obj setLabel:[NSString stringWithUTF8String:label]];
+   }
+}
