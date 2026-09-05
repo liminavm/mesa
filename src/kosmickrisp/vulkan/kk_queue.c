@@ -18,11 +18,20 @@
 
 #include "vk_cmd_queue.h"
 
+/* limina: what one commit submitted, so the device-loss report can mark the GPU's last work.
+ * Allocated per commit and freed by the callback, which Metal invokes exactly once. */
+struct kk_commit_note {
+   struct kk_device *dev;
+   uint64_t seq_lo, seq_hi;
+};
+
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
+   struct kk_commit_note *note = (struct kk_commit_note *)data->user_data;
+
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
-      struct kk_device *dev = (struct kk_device *)data->user_data;
+      struct kk_device *dev = note->dev;
 
       /* limina: vk_device_set_lost's report reaches nothing the worker log captures,
        * so a device loss arrives as an unexplained abort several layers downstream.
@@ -39,6 +48,7 @@ commit_callback(struct mtl_feedback_data *data)
                  (data->gpu_end - data->gpu_start) * 1000.0,
                  data->error_message ? data->error_message : "(none)",
                  data->error_details ? data->error_details : "(none)");
+         kk_limina_work_dump(stderr, 24u, note->seq_lo, note->seq_hi);
          fflush(stderr);
       }
 
@@ -46,6 +56,8 @@ commit_callback(struct mtl_feedback_data *data)
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);
    }
+
+   free(note);
 }
 
 /* limina: GPU completion for one submitted batch — discharge the allocator borrows it charged,
@@ -181,8 +193,20 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                    ncharged * sizeof(kk_pooled_alloc_ptr));
          }
 
+         /* limina: a failing commit has to say which command buffers it carried. The note is
+          * allocated with the discharge payload's care -- before anything is committed -- so a
+          * failure here cannot leave work on the GPU with its charges unreleased. */
+         struct kk_commit_note *note = malloc(sizeof(*note));
+         if (note == NULL) {
+            free(d);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         note->dev = dev;
+         note->seq_lo = cmd_buffer->work_seq_lo;
+         note->seq_hi = cmd_buffer->work_seq_hi;
+
          mtl_commit_options_add_feedback_handler(queue->commit_options,
-                                                 commit_callback, dev);
+                                                 commit_callback, note);
          if (d) {
             util_dynarray_clear(&cmd_buffer->charged_allocs);
             mtl_commit_options_add_feedback_handler(queue->commit_options,

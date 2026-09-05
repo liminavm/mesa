@@ -441,6 +441,17 @@ cs_start_render(struct kk_cmd_buffer *cmd)
       cmd->gfx.cmd_buf, state->render_pass_descriptor);
    cmd->gfx.ops = 0;
 
+   /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
+    * target resolving into a single-sample one is the WebGL MSAA resolve under investigation,
+    * and the compositor's own passes look nothing like it. */
+   snprintf(cmd->gfx.what, sizeof(cmd->gfx.what), "render %ux%u s%u rts%u fmt%u%s",
+            state->render.area.extent.width, state->render.area.extent.height,
+            state->render.samples, state->render.color_att_count,
+            state->render.color_att_count ? (unsigned)state->render.color_att[0].vk_format : 0u,
+            state->render.color_att_count && state->render.color_att[0].resolve_iview
+               ? " +resolve"
+               : "");
+
    /* limina: name the encoder when this pass is one the triggered capture is hunting, so the
     * working/failing pair is findable by name in Xcode rather than by scrubbing every encoder. */
    if (unlikely(kk_limina_capture_pending_label[0] != '\0')) {
@@ -503,6 +514,7 @@ kk_start_compute_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
    }
    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
    es->ops = 0;
+   snprintf(es->what, sizeof(es->what), "compute");
 
    /* Argument table won't ever change */
    mtl_compute_set_argument_table(es->encoder, argument_table);
@@ -572,6 +584,12 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
       kk_tls_open_alloc = NULL;
    es->pa = NULL;
    es->allocator = NULL;
+
+   uint64_t seq =
+      kk_limina_work_record("%s ops=%u", es->what[0] ? es->what : "(unnamed)", es->ops);
+   if (util_dynarray_num_elements(&cmd->submit_cmd_bufs, mtl_command_buffer *) == 0u)
+      cmd->work_seq_lo = seq;
+   cmd->work_seq_hi = seq + 1u;
 
    util_dynarray_append(&cmd->submit_cmd_bufs, es->cmd_buf);
    es->cmd_buf = NULL;

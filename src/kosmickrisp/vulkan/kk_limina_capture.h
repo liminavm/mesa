@@ -8,6 +8,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+
+#include "util/macros.h"
 
 struct kk_device;
 
@@ -55,5 +58,24 @@ extern char kk_limina_capture_pending_label[64];
 
 /* Called immediately after mtl_command_queue_commit. May close the capture. */
 void kk_limina_capture_after_commit(void);
+
+/* limina: the last command buffers handed to the GPU, so a device loss can name the work it
+ * killed rather than only its Metal error code.
+ *
+ * Metal's MTL4 error says "Caused GPU Address Fault Error" and nothing else -- no encoder, no
+ * label, no resource -- so on its own it cannot distinguish a fault in a WebGL multisample
+ * resolve from one in the compositor's own blit. Each command buffer records a one-line
+ * description as it is closed; a failing commit knows the sequence range it submitted, so the
+ * report can mark exactly which of those lines were the GPU's last work.
+ *
+ * The ring is small and the record is one snprintf per command buffer, i.e. per encoder close,
+ * not per draw. */
+uint64_t kk_limina_work_record(const char *fmt, ...) PRINTFLIKE(1, 2);
+
+/* Sequence the next record will take. Bracket a commit with two of these. */
+uint64_t kk_limina_work_seq(void);
+
+/* Most recent `max` entries, oldest first, marking those in [lo, hi). */
+void kk_limina_work_dump(FILE *f, unsigned max, uint64_t lo, uint64_t hi);
 
 #endif /* KK_LIMINA_CAPTURE_H */

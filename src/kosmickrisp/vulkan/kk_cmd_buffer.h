@@ -283,6 +283,9 @@ struct kk_encoder_state {
     * "was this command buffer enormous?", which is one of the three candidate causes of the
     * 2026-08-31 nil store inside AGX's data-buffer pool. */
    uint32_t ops;
+   /* limina: one line describing what this command buffer contains, recorded into the work ring
+    * as the buffer closes so a device loss can name the work. Written at encoder open. */
+   char what[56];
 };
 
 struct kk_cmd_buffer {
@@ -318,6 +321,11 @@ struct kk_cmd_buffer {
    struct kk_uploader uploader;
 
    struct util_dynarray submit_cmd_bufs;
+
+   /* limina: work-ring sequence range covering submit_cmd_bufs, so a failing commit marks
+    * exactly its own command buffers rather than "the last N recorded", which another thread's
+    * encoding can interleave with. */
+   uint64_t work_seq_lo, work_seq_hi;
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
