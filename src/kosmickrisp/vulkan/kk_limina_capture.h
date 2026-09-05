@@ -78,4 +78,12 @@ uint64_t kk_limina_work_seq(void);
 /* Most recent `max` entries, oldest first, marking those in [lo, hi). */
 void kk_limina_work_dump(FILE *f, unsigned max, uint64_t lo, uint64_t hi);
 
+/* limina: LIMINA_KK_ADDR_LOG=1 -- every GPU allocation's address range at create and at
+ * destroy, stamped with the work sequence. A GPU address fault reports the faulting VA in
+ * the kernel's gpuEvent report; matching that VA against these lines names the resource,
+ * and its position against the failing commit's sequence range says whether it died under
+ * work already in flight. */
+bool kk_limina_addr_log_enabled(void);
+void kk_limina_addr_log(const char *fmt, ...) PRINTFLIKE(1, 2);
+
 #endif /* KK_LIMINA_CAPTURE_H */

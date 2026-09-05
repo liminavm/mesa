@@ -14,6 +14,7 @@
 #include "kk_cmd_pool.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_entrypoints.h"
+#include "kk_image.h"
 #include "kk_image_view.h"
 #include "kk_limina_capture.h"
 
@@ -338,6 +339,24 @@ kk_limina_seen_texture(const void *tex)
    return true;
 }
 
+/* limina: the GPU address a view's first plane actually renders into. The kernel's gpuEvent
+ * report names a faulting VA, so a pass has to carry the address of what it wrote for the two
+ * to be matched. */
+static uint64_t
+kk_limina_view_addr(const struct kk_image_view *view)
+{
+   if (view == NULL || view->vk.image == NULL)
+      return 0ull;
+
+   const struct kk_image *image =
+      container_of(view->vk.image, const struct kk_image, vk);
+   uint8_t plane = view->planes[0].image_plane;
+   if (plane >= image->plane_count)
+      return 0ull;
+
+   return image->planes[plane].addr;
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
@@ -444,10 +463,18 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
     * target resolving into a single-sample one is the WebGL MSAA resolve under investigation,
     * and the compositor's own passes look nothing like it. */
-   snprintf(cmd->gfx.what, sizeof(cmd->gfx.what), "render %ux%u s%u rts%u fmt%u%s",
+   const struct kk_image_view *civ =
+      state->render.color_att_count ? state->render.color_att[0].iview : NULL;
+   const struct kk_image_view *div = state->render.depth_att.iview;
+   snprintf(cmd->gfx.what, sizeof(cmd->gfx.what),
+            "render %ux%u s%u rts%u fmt%u c=%p a=0x%llx d=%u%s%s",
             state->render.area.extent.width, state->render.area.extent.height,
             state->render.samples, state->render.color_att_count,
             state->render.color_att_count ? (unsigned)state->render.color_att[0].vk_format : 0u,
+            civ ? (void *)civ->planes[0].mtl_handle_render : NULL,
+            (unsigned long long)kk_limina_view_addr(civ),
+            div ? (unsigned)state->render.depth_att.vk_format : 0u,
+            div && civ && kk_limina_view_addr(div) == kk_limina_view_addr(civ) ? "!same" : "",
             state->render.color_att_count && state->render.color_att[0].resolve_iview
                ? " +resolve"
                : "");
@@ -587,6 +614,9 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
 
    uint64_t seq =
       kk_limina_work_record("%s ops=%u", es->what[0] ? es->what : "(unnamed)", es->ops);
+   /* An encoder opened by any path that does not set a label would otherwise inherit this
+    * one's and lie about what it held. */
+   es->what[0] = '\0';
    if (util_dynarray_num_elements(&cmd->submit_cmd_bufs, mtl_command_buffer *) == 0u)
       cmd->work_seq_lo = seq;
    cmd->work_seq_hi = seq + 1u;

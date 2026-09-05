@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kk_limina_capture.h"
 #include "kk_image.h"
 
 #include "kk_cmd_buffer.h"
@@ -696,6 +697,12 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
                       const VkAllocationCallbacks *pAllocator)
 {
    if (plane->mtl_handle != NULL) {
+      kk_limina_addr_log("img- tex=%p gpu=0x%llx..0x%llx %ux%u s%u fmt%u",
+                         (void *)plane->mtl_handle, (unsigned long long)plane->addr,
+                         (unsigned long long)(plane->addr + plane->layout.size_B),
+                         plane->layout.width_px, plane->layout.height_px,
+                         (unsigned)plane->layout.sample_count_sa,
+                         (unsigned)plane->layout.format.mtl);
       KK_TEX_CENSUS_RELEASE(); /* limina census */
       kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle);
       mtl_release(plane->mtl_handle);
@@ -1142,6 +1149,13 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
     * in it, and an MSAA attachment used that way takes a GPU address fault. */
    kk_device_add_texture_to_residency_set(dev, plane->mtl_handle);
    plane->addr = mem->bo->gpu + *offset_B;
+
+   kk_limina_addr_log("img+ tex=%p gpu=0x%llx..0x%llx %ux%u s%u fmt%u", (void *)plane->mtl_handle,
+                      (unsigned long long)plane->addr,
+                      (unsigned long long)(plane->addr + plane->layout.size_B),
+                      plane->layout.width_px, plane->layout.height_px,
+                      (unsigned)plane->layout.sample_count_sa,
+                      (unsigned)plane->layout.format.mtl);
 
    /* Create auxiliary 2D array texture for 3D images so we can use 2D views of
     * it */

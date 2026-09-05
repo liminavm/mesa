@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kk_limina_capture.h"
 #include "kk_bo.h"
 
 #include "kk_device.h"
@@ -200,6 +201,10 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
       kk_limina_bos[slot].cpu = bo->cpu;
    }
 
+   kk_limina_addr_log("bo+ heap=%p gpu=0x%llx..0x%llx size=%llu", (void *)handle,
+                      (unsigned long long)bo->gpu,
+                      (unsigned long long)(bo->gpu + size_B), (unsigned long long)size_B);
+
    kk_device_add_heap_to_residency_set(dev, handle);
 
    kk_bo_census_charge(size_B);
@@ -288,6 +293,11 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
       FREE(bo);
       return;
    }
+
+   kk_limina_addr_log("bo- heap=%p gpu=0x%llx..0x%llx size=%llu", (void *)bo->mtl_handle,
+                      (unsigned long long)bo->gpu,
+                      (unsigned long long)(bo->gpu + bo->size_B),
+                      (unsigned long long)bo->size_B);
 
    /* We may only have a mapped buffer, for example if the memory was imported
     * from a host pointer */

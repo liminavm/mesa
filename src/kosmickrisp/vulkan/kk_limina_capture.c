@@ -269,12 +269,12 @@ kk_limina_capture_after_commit(void)
 /* limina: see kk_limina_capture.h. A ring of the last command buffers submitted, so a device
  * loss names its work. Guarded by its own lock: command buffers close on whatever thread the
  * guest's rings run on, and the dump happens on Metal's feedback thread. */
-#define KK_LIMINA_WORK_RING 64u
+#define KK_LIMINA_WORK_RING 128u
 
 static simple_mtx_t kk_limina_work_lock = SIMPLE_MTX_INITIALIZER;
 static struct {
    uint64_t seq;
-   char what[72];
+   char what[120];
 } kk_limina_work_ring[KK_LIMINA_WORK_RING];
 static uint64_t kk_limina_work_next = 1u;
 
@@ -291,6 +291,38 @@ kk_limina_work_record(const char *fmt, ...)
    va_end(ap);
    simple_mtx_unlock(&kk_limina_work_lock);
    return seq;
+}
+
+bool
+kk_limina_addr_log_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("LIMINA_KK_ADDR_LOG");
+      on = e && e[0] && e[0] != '0';
+      if (on)
+         fprintf(stderr, "[LIMINA] KK GPU-address log ON (LIMINA_KK_ADDR_LOG)\n");
+   }
+   return on != 0;
+}
+
+void
+kk_limina_addr_log(const char *fmt, ...)
+{
+   if (!kk_limina_addr_log_enabled())
+      return;
+
+   char line[192];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+
+   /* The work sequence ties an allocation event to the command-buffer timeline the
+    * device-loss report prints, so "freed while seq 912..915 was in flight" is readable
+    * without correlating timestamps. */
+   fprintf(stderr, "[LIMINA-ADDR] seq=%llu %s\n",
+           (unsigned long long)kk_limina_work_seq(), line);
 }
 
 uint64_t

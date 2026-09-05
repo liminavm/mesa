@@ -285,7 +285,7 @@ struct kk_encoder_state {
    uint32_t ops;
    /* limina: one line describing what this command buffer contains, recorded into the work ring
     * as the buffer closes so a device loss can name the work. Written at encoder open. */
-   char what[56];
+   char what[112];
 };
 
 struct kk_cmd_buffer {
