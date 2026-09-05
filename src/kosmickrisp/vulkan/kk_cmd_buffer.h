@@ -327,6 +327,13 @@ struct kk_cmd_buffer {
     * encoding can interleave with. */
    uint64_t work_seq_lo, work_seq_hi;
 
+   /* limina: what the open render pass has encoded so far, so a device-loss report can say
+    * whether the failing work drew at all and whether its geometry was unrolled. Cleared at
+    * pass start; `limina_out_draws` is deliberately NOT cleared, so the note taken at submit
+    * still points at the indirect draw arguments the GPU executed. */
+   uint32_t limina_draws, limina_unrolls;
+   uint64_t limina_out_draws;
+
    /* Owned large BOs */
    struct util_dynarray large_bos;
 

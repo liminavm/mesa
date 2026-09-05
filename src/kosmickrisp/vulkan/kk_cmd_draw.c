@@ -1684,6 +1684,9 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
                                 info);
 
+   cmd->limina_unrolls++;
+   cmd->limina_out_draws = out_draws.gpu;
+
    data->prim = u_decomposed_prim(data->prim);
    /* TODO_KOSMICKRISP Self-contained until we have rodata at the device. */
    data->index_buffer.addr = dev->heap->gpu + sizeof(struct poly_heap);
@@ -2569,6 +2572,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
          fprintf(stderr, "[LIMINA-KK-KKDRAW] BAIL unroll\n");
       return;
    }
+
+   cmd->limina_draws += data->draw_count;
 
    bool xfb_track =
       unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);

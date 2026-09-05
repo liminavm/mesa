@@ -696,6 +696,23 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
                       VkImageCreateFlags create_flags,
                       const VkAllocationCallbacks *pAllocator)
 {
+   /* limina: bisection knob, LIMINA_KK_TEX_LEAK=1. The counterpart of LIMINA_KK_VIEW_LEAK for
+    * the image's own textures: a descriptor caches a MTLResourceID, and a released texture can
+    * have its ID reissued to an unrelated one, which is what a scattered read fault in a draw
+    * whose attachments are alive would look like. Leaking makes that unrepresentable. Costs
+    * memory without bound -- a bisection arm, never a shipping mode. */
+   {
+      static int leak = -1;
+      if (leak < 0) {
+         const char *e = getenv("LIMINA_KK_TEX_LEAK");
+         leak = e && e[0] && e[0] != '0';
+         if (leak)
+            fprintf(stderr, "[LIMINA] KK image textures LEAKING (LIMINA_KK_TEX_LEAK)\n");
+      }
+      if (leak)
+         return;
+   }
+
    if (plane->mtl_handle != NULL) {
       kk_limina_addr_log("img- tex=%p gpu=0x%llx..0x%llx %ux%u s%u fmt%u",
                          (void *)plane->mtl_handle, (unsigned long long)plane->addr,

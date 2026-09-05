@@ -7,6 +7,7 @@
 
 #include "kk_limina_capture.h"
 #include "kk_queue.h"
+#include "kk_bo.h"
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
@@ -23,6 +24,11 @@
 struct kk_commit_note {
    struct kk_device *dev;
    uint64_t seq_lo, seq_hi;
+   /* GPU address of the indirect draw arguments the last unrolled draw in this commit wrote,
+    * and the poly heap the unroll allocated them from. Both are CPU-visible on UMA, and after a
+    * loss nothing reuses them -- no fence ever signals -- so the report can print what the GPU
+    * actually executed instead of inferring it. */
+   uint64_t out_draws;
 };
 
 static void
@@ -49,6 +55,23 @@ commit_callback(struct mtl_feedback_data *data)
                  data->error_message ? data->error_message : "(none)",
                  data->error_details ? data->error_details : "(none)");
          kk_limina_work_dump(stderr, 24u, note->seq_lo, note->seq_hi);
+
+         if (dev->limina_heap_bottom != NULL)
+            fprintf(stderr, "  poly heap bottom = %u B of %llu\n",
+                    *dev->limina_heap_bottom,
+                    (unsigned long long)kk_limina_heap_size);
+
+         const uint32_t *args =
+            note->out_draws ? kk_limina_addr_to_cpu(note->out_draws) : NULL;
+         if (args != NULL)
+            fprintf(stderr,
+                    "  last unrolled draw args at 0x%llx: indexCount=%u instanceCount=%u "
+                    "firstIndex=%u vertexOffset=%d firstInstance=%u\n",
+                    (unsigned long long)note->out_draws, args[0], args[1], args[2],
+                    (int32_t)args[3], args[4]);
+         else if (note->out_draws)
+            fprintf(stderr, "  last unrolled draw args at 0x%llx: not CPU-mapped\n",
+                    (unsigned long long)note->out_draws);
          fflush(stderr);
       }
 
@@ -204,6 +227,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          note->dev = dev;
          note->seq_lo = cmd_buffer->work_seq_lo;
          note->seq_hi = cmd_buffer->work_seq_hi;
+         note->out_draws = cmd_buffer->limina_out_draws;
 
          mtl_commit_options_add_feedback_handler(queue->commit_options,
                                                  commit_callback, note);

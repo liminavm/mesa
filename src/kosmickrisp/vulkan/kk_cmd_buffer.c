@@ -459,6 +459,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
       cmd->gfx.cmd_buf, state->render_pass_descriptor);
    cmd->gfx.ops = 0;
+   cmd->limina_draws = 0u;
+   cmd->limina_unrolls = 0u;
 
    /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
     * target resolving into a single-sample one is the WebGL MSAA resolve under investigation,
@@ -612,8 +614,15 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
    es->pa = NULL;
    es->allocator = NULL;
 
+   /* Draw and unroll counts belong to the render encoder alone: the compute encoders close
+    * around it and would otherwise claim its pass's draws. */
    uint64_t seq =
-      kk_limina_work_record("%s ops=%u", es->what[0] ? es->what : "(unnamed)", es->ops);
+      es == &cmd->gfx
+         ? kk_limina_work_record("%s ops=%u draws=%u unroll=%u out=0x%llx",
+                                 es->what[0] ? es->what : "(unnamed)", es->ops,
+                                 cmd->limina_draws, cmd->limina_unrolls,
+                                 (unsigned long long)cmd->limina_out_draws)
+         : kk_limina_work_record("%s ops=%u", es->what[0] ? es->what : "(unnamed)", es->ops);
    /* An encoder opened by any path that does not set a label would otherwise inherit this
     * one's and lie about what it held. */
    es->what[0] = '\0';

@@ -54,9 +54,9 @@ unsigned kk_limina_bo_n;
 void *
 kk_limina_addr_to_cpu(uint64_t addr)
 {
-   unsigned n = kk_limina_bo_n;
+   unsigned n = kk_limina_bo_n < KK_LIMINA_BO_MAX ? kk_limina_bo_n : KK_LIMINA_BO_MAX;
 
-   for (unsigned i = 0; i < n && i < KK_LIMINA_BO_MAX; i++) {
+   for (unsigned i = 0; i < n; i++) {
       if (kk_limina_bos[i].cpu && addr >= kk_limina_bos[i].gpu &&
           addr < kk_limina_bos[i].gpu + kk_limina_bos[i].size)
          return (char *)kk_limina_bos[i].cpu + (addr - kk_limina_bos[i].gpu);
@@ -193,8 +193,10 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
    bo->gpu = mtl_buffer_get_gpu_address(map);
    bo->cpu = mtl_get_contents(map);
 
-   if (bo->cpu && kk_limina_bo_n < KK_LIMINA_BO_MAX) {
-      unsigned slot = kk_limina_bo_n++;
+   /* Wrap rather than stop: this workload allocates tens of thousands of BOs, and the entries
+    * that matter to a post-mortem are the recent ones, not the first ones ever made. */
+   if (bo->cpu) {
+      unsigned slot = kk_limina_bo_n++ % KK_LIMINA_BO_MAX;
 
       kk_limina_bos[slot].gpu = bo->gpu;
       kk_limina_bos[slot].size = size_B;
