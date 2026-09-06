@@ -1075,6 +1075,9 @@ uint32_t kk_limina_resident_heaps, kk_limina_resident_buffers,
 void
 kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
 {
+   if (unlikely(heap == NULL))
+      return;
+
    p_atomic_inc(&kk_limina_resident_heaps);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_add_allocation(dev->residency_set.handle, heap);
@@ -1084,6 +1087,9 @@ kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
 void
 kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
 {
+   if (unlikely(heap == NULL))
+      return;
+
    p_atomic_dec(&kk_limina_resident_heaps);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_remove_allocation(dev->residency_set.handle, heap);
@@ -1116,6 +1122,21 @@ void
 kk_device_add_texture_to_residency_set(struct kk_device *dev,
                                        mtl_texture *texture)
 {
+   /* limina: a NULL allocation is accepted here and then dereferenced by
+    * -[AGXG13XFamilyResidencySet _commitAddedAllocations:count:], which segfaults at 0x18 --
+    * inside Apple's driver, on a queue submit, far from whoever added it. Refuse it here and
+    * name the caller, so the same mistake is a log line instead of a crash. */
+   if (unlikely(texture == NULL)) {
+      static uint32_t warned = 0u;
+      if (warned < 4u) {
+         ++warned;
+         fprintf(stderr, "[LIMINA-RESIDENCY] refused a NULL texture, called from %p\n",
+                 __builtin_return_address(0));
+         fflush(stderr);
+      }
+      return;
+   }
+
    p_atomic_inc(&kk_limina_resident_textures);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_add_allocation(dev->residency_set.handle, texture);
@@ -1126,6 +1147,9 @@ void
 kk_device_remove_texture_from_residency_set(struct kk_device *dev,
                                             mtl_texture *texture)
 {
+   if (unlikely(texture == NULL))
+      return;
+
    p_atomic_dec(&kk_limina_resident_textures);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_remove_allocation(dev->residency_set.handle, texture);
