@@ -69,6 +69,13 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data,
                  data->error_message ? data->error_message : "(none)",
                  data->error_details ? data->error_details : "(none)");
          kk_limina_work_dump(stderr, 24u, seq_lo, seq_hi);
+
+         fprintf(stderr, "  residency set: %u heaps, %u buffers, %u textures\n",
+                 p_atomic_read(&kk_limina_resident_heaps),
+                 p_atomic_read(&kk_limina_resident_buffers),
+                 p_atomic_read(&kk_limina_resident_textures));
+         fprintf(stderr, "  sampler table: %u slots retired\n",
+                 p_atomic_read(&kk_limina_sampler_retires));
          fflush(stderr);
       }
 
