@@ -36,6 +36,9 @@ struct kk_image_view {
        * render */
       mtl_texture *mtl_handle_render;
       bool render_is_view;
+      /* limina: true when mtl_handle_input is a view we minted (and therefore
+       * registered in the residency set) rather than a retain of the parent. */
+      bool input_is_view;
 
       /* Input attachment handle. Required since input attachments needs to be
        * arrays, and sampled may not be */
