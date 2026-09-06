@@ -2628,6 +2628,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
           * uploaded stale, or bound from a different draw, is invisible to a check that reads
           * the struct the upload was made from. */
          if (g->render.samples > 1u) {
+            p_atomic_inc(&kk_limina_msaa_draws_checked);
             const uint8_t *root_cpu = kk_limina_addr_to_cpu(g->descriptors.root.addr);
             for (unsigned s_i = 0; s_i < KK_MAX_SETS; s_i++) {
                uint64_t set_addr = g->descriptors.root.sets[s_i];
@@ -2712,6 +2713,23 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                                 (unsigned long long)d.image_gpu_resource_id,
                                 g->render.area.extent.width, g->render.area.extent.height,
                                 g->render.samples, cmd->limina_draws);
+
+                     /* A shader declaring texture2d<float> handed a multisampled texture's
+                      * resource ID reads with the wrong layout. The descriptor bytes cannot
+                      * show it -- the ID is valid, minted and live -- so check the type behind
+                      * the ID, which is the one thing the encode-time walk can still see. */
+                     uint32_t nsamp = kk_limina_rid_samples(d.image_gpu_resource_id);
+                     if (nsamp > 1u) {
+                        p_atomic_inc(&kk_limina_ms_binds_seen);
+                        if (reported++ < 40u)
+                           fprintf(stderr,
+                                   "[LIMINA-MSBIND] set%u type%u[%u] id=0x%llx names a %u-sample "
+                                   "texture (pass %ux%u s%u, draws so far %u)\n",
+                                   s_i, bl->type, e,
+                                   (unsigned long long)d.image_gpu_resource_id, nsamp,
+                                   g->render.area.extent.width, g->render.area.extent.height,
+                                   g->render.samples, cmd->limina_draws);
+                     }
 
                      if (d.sampler_index >= MSL_MAX_SAMPLERS && reported++ < 40u)
                         fprintf(stderr,

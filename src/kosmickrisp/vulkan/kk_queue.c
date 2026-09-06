@@ -135,6 +135,11 @@ commit_callback(struct mtl_feedback_data *data)
            p_atomic_read(&kk_limina_sampled_slots_seen),
            p_atomic_read(&kk_limina_slots_skipped),
            p_atomic_read(&kk_limina_max_slot_offset));
+   fprintf(stderr,
+           "  chain check: %u multisampled draws walked, %u multisampled textures bound as "
+           "sampled images\n",
+           p_atomic_read(&kk_limina_msaa_draws_checked),
+           p_atomic_read(&kk_limina_ms_binds_seen));
 
          if (dev->limina_heap_bottom != NULL)
             fprintf(stderr, "  poly heap bottom = %u B of %llu\n",

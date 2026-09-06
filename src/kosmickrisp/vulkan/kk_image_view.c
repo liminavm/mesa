@@ -182,7 +182,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].sampled_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_sampled);
-         kk_limina_rid_born(view->planes[view_plane].sampled_gpu_resource_id);
+         kk_limina_rid_born(view->planes[view_plane].sampled_gpu_resource_id,
+                            plane->layout.sample_count_sa);
          /* limina: a texture VIEW is its own Metal allocation, and it is the view's
           * MTLResourceID -- not the parent's -- that shaders dereference out of an
           * argument table. Registering the parent image's texture (and the heap it sits
@@ -202,7 +203,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].storage_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_storage);
-         kk_limina_rid_born(view->planes[view_plane].storage_gpu_resource_id);
+         kk_limina_rid_born(view->planes[view_plane].storage_gpu_resource_id,
+                            plane->layout.sample_count_sa);
          kk_device_add_texture_to_residency_set(
             dev, view->planes[view_plane].mtl_handle_storage);
       }
@@ -230,7 +232,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].input_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_input);
-         kk_limina_rid_born(view->planes[view_plane].input_gpu_resource_id);
+         kk_limina_rid_born(view->planes[view_plane].input_gpu_resource_id,
+                            plane->layout.sample_count_sa);
 
          /* Handle mutable formats */
          view->planes[view_plane].render_is_view = requires_format_change;

@@ -303,9 +303,10 @@ kk_limina_work_record(const char *fmt, ...)
 static simple_mtx_t kk_limina_rid_lock = SIMPLE_MTX_INITIALIZER;
 static uint64_t kk_limina_rid_dead[KK_LIMINA_RID_DEAD];
 static uint64_t kk_limina_rid_live_ids[KK_LIMINA_RID_DEAD];
+static uint8_t kk_limina_rid_live_samples[KK_LIMINA_RID_DEAD];
 
 void
-kk_limina_rid_born(uint64_t id)
+kk_limina_rid_born(uint64_t id, uint32_t samples)
 {
    if (id == 0ull)
       return;
@@ -316,10 +317,12 @@ kk_limina_rid_born(uint64_t id)
       unsigned s = (slot + i) % KK_LIMINA_RID_DEAD;
       if (kk_limina_rid_live_ids[s] == 0ull || kk_limina_rid_live_ids[s] == id) {
          kk_limina_rid_live_ids[s] = id;
+         kk_limina_rid_live_samples[s] = (uint8_t)samples;
          break;
       }
       if (i == 7u)
          kk_limina_rid_live_ids[slot] = id;
+         kk_limina_rid_live_samples[slot] = (uint8_t)samples;
    }
    simple_mtx_unlock(&kk_limina_rid_lock);
 }
@@ -346,6 +349,30 @@ kk_limina_rid_is_known(uint64_t id)
    }
    simple_mtx_unlock(&kk_limina_rid_lock);
    return known;
+}
+
+/* limina: how many samples the texture behind a resource ID has. A shader that declares
+ * texture2d<float> and is handed a Type2DMultisample resource ID reads with the wrong layout,
+ * which is a misaddress by construction -- and one the descriptor bytes cannot show, because
+ * the ID itself is perfectly valid. Returns 0 for an ID this table has never seen. */
+uint32_t
+kk_limina_rid_samples(uint64_t id)
+{
+   if (id == 0ull)
+      return 0u;
+
+   uint32_t out = 0u;
+   simple_mtx_lock(&kk_limina_rid_lock);
+   unsigned slot = (unsigned)((id * 2654435761u) % KK_LIMINA_RID_DEAD);
+   for (unsigned i = 0; i < 8u; i++) {
+      unsigned s = (slot + i) % KK_LIMINA_RID_DEAD;
+      if (kk_limina_rid_live_ids[s] == id) {
+         out = kk_limina_rid_live_samples[s];
+         break;
+      }
+   }
+   simple_mtx_unlock(&kk_limina_rid_lock);
+   return out;
 }
 
 void
