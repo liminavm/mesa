@@ -16,6 +16,7 @@
 #include "kk_cmd_buffer.h"
 #include "kk_entrypoints.h"
 #include "kk_instance.h"
+#include "kk_limina_capture.h"
 #include "kk_physical_device.h"
 #include "kk_shader.h"
 
@@ -679,6 +680,26 @@ kk_init_sampler_heap(struct kk_device *dev, struct kk_sampler_heap *h)
    if (result != VK_SUCCESS) {
       ralloc_free(h->ht);
       return result;
+   }
+
+   /* limina: the sampler table is dereferenced by raw GPU address out of argument-table slot 1,
+    * and only ever by a shader that samples -- which is precisely the workload differential in
+    * the WebGL MSAA device loss. kk_alloc_bo puts the heap in the residency set but never the
+    * buffer placed on it, and kk_image.c already carries the finding that heap residency is not
+    * enough for a texture on this driver. LIMINA_KK_SAMPTAB_RESIDENT makes the buffer itself
+    * resident so that reading can be tested; the address is logged either way, so a kernel fault
+    * VA can be checked against it. */
+   kk_limina_addr_log("samplertab gpu=0x%llx..0x%llx",
+                      (unsigned long long)h->table.bo->gpu,
+                      (unsigned long long)(h->table.bo->gpu +
+                                           (uint64_t)MSL_MAX_SAMPLERS * 8ull));
+   {
+      const char *e = getenv("LIMINA_KK_SAMPTAB_RESIDENT");
+      if (e && strcmp(e, "0") != 0) {
+         fprintf(stderr, "[LIMINA] KK sampler table pinned resident "
+                         "(LIMINA_KK_SAMPTAB_RESIDENT)\n");
+         kk_device_add_buffer_to_residency_set(dev, h->table.bo->map);
+      }
    }
 
    simple_mtx_init(&h->lock, mtx_plain);
