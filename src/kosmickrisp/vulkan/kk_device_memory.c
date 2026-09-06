@@ -10,6 +10,7 @@
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
+#include "kk_limina_capture.h"
 #include "kk_physical_device.h"
 
 #include "kosmickrisp/bridge/kk_limina_plane.h"
@@ -197,6 +198,14 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          }
          mem->bo->size_B = mem->vk.size;
          kk_device_add_texture_to_residency_set(dev, mem->bo->texture);
+         /* limina: imported memory is a population the address log never covered,
+          * so "the fault is outside every range we logged" could not speak for it.
+          * A texture import has no GPU address to print -- the handle and the size
+          * are what there is. */
+         kk_limina_addr_log("import-tex+ tex=%p size=%llu iosurface=%d",
+                            (void *)mem->bo->texture,
+                            (unsigned long long)mem->bo->size_B,
+                            mtl_handle_is_iosurface(metal_info->handle) ? 1 : 0);
       } else if (import_metal) {
          /* We only support heaps since that's the backing for all our memory
           * and simplifies implementation */
@@ -205,6 +214,12 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             mtl_new_buffer_with_length(mem->bo->mtl_handle, mem->vk.size, 0u);
          mem->bo->size_B = mtl_heap_get_size(mem->bo->mtl_handle);
          kk_device_add_heap_to_residency_set(dev, mem->bo->mtl_handle);
+         kk_limina_addr_log("import-heap+ heap=%p gpu=0x%llx..0x%llx size=%llu",
+                            (void *)mem->bo->mtl_handle,
+                            (unsigned long long)mtl_buffer_get_gpu_address(mem->bo->map),
+                            (unsigned long long)(mtl_buffer_get_gpu_address(mem->bo->map) +
+                                                 mem->bo->size_B),
+                            (unsigned long long)mem->bo->size_B);
       } else if (import_host) {
          /* We can't create a heap from a host pointer. The imported memory will
           * only be usable for buffers */
@@ -225,6 +240,12 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          }
          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
+         kk_limina_addr_log("import-host+ buf=%p host=%p gpu=0x%llx..0x%llx size=%llu",
+                            (void *)mem->bo->map, host_info->pHostPointer,
+                            (unsigned long long)mtl_buffer_get_gpu_address(mem->bo->map),
+                            (unsigned long long)(mtl_buffer_get_gpu_address(mem->bo->map) +
+                                                 mem->bo->size_B),
+                            (unsigned long long)mem->bo->size_B);
       }
 
       /* A texture import has no buffer to take an address or contents from. */
