@@ -648,6 +648,13 @@ kk_release_compiler(struct kk_device *dev)
 
 uint32_t kk_limina_sampler_retires = 0u;
 
+/* limina: how much of the descriptor chain LIMINA_KK_ADDR_CHECK actually reached. A silent
+ * check is only evidence if it visited the slots -- these say it did. */
+uint32_t kk_limina_sets_with_layout = 0u;
+uint32_t kk_limina_sampled_slots_seen = 0u;
+uint32_t kk_limina_slots_skipped = 0u;
+uint32_t kk_limina_max_slot_offset = 0u;
+
 /* limina: keep every sampler slot alive for the process lifetime. The hash table dedupes on
  * the packed descriptor, so the leak is bounded by the number of distinct sampler states. */
 static bool

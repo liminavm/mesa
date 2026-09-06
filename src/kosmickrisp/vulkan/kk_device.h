@@ -291,6 +291,10 @@ extern uint32_t kk_limina_resident_heaps, kk_limina_resident_buffers,
 
 /* limina: how many device sampler-table slots have been zeroed and returned to the free list. */
 extern uint32_t kk_limina_sampler_retires;
+extern uint32_t kk_limina_sets_with_layout;
+extern uint32_t kk_limina_sampled_slots_seen;
+extern uint32_t kk_limina_slots_skipped;
+extern uint32_t kk_limina_max_slot_offset;
 
 void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
 void kk_device_remove_heap_from_residency_set(struct kk_device *dev,

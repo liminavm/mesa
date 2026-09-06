@@ -2661,10 +2661,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                   continue;
                }
 
-               uint32_t size = g->descriptors.set_sizes[s_i];
-               if (size > 4096u)
-                  size = 4096u;
-               for (uint32_t off = 0; off + 8u <= size; off += 8u) {
+               const uint32_t size = g->descriptors.set_sizes[s_i];
+               uint32_t scan = size > 4096u ? 4096u : size;
+               for (uint32_t off = 0; off + 8u <= scan; off += 8u) {
                   if (!kk_limina_rid_is_dead(set_cpu[off / 8u]))
                      continue;
                   if (reported++ < 40u)
@@ -2684,6 +2683,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                const struct kk_descriptor_set *set = g->descriptors.sets[s_i];
                if (set == NULL || set->layout == NULL)
                   continue;
+               p_atomic_inc(&kk_limina_sets_with_layout);
 
                for (uint32_t b = 0; b < set->layout->binding_count; b++) {
                   const struct kk_descriptor_set_binding_layout *bl = &set->layout->binding[b];
@@ -2693,11 +2693,16 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
                   for (uint32_t e = 0; e < bl->array_size; e++) {
                      uint32_t off = bl->offset + e * bl->stride;
-                     if (off + sizeof(struct kk_sampled_image_descriptor) > size)
+                     if (off + sizeof(struct kk_sampled_image_descriptor) > size) {
+                        p_atomic_inc(&kk_limina_slots_skipped);
                         break;
+                     }
 
                      struct kk_sampled_image_descriptor d;
                      memcpy(&d, (const uint8_t *)set_cpu + off, sizeof(d));
+                     p_atomic_inc(&kk_limina_sampled_slots_seen);
+                     if (off > p_atomic_read(&kk_limina_max_slot_offset))
+                        kk_limina_max_slot_offset = off;
 
                      if (!kk_limina_rid_is_known(d.image_gpu_resource_id) && reported++ < 40u)
                         fprintf(stderr,

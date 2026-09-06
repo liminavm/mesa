@@ -128,6 +128,13 @@ commit_callback(struct mtl_feedback_data *data)
                  p_atomic_read(&kk_limina_resident_textures));
          fprintf(stderr, "  sampler table: %u slots retired\n",
                  p_atomic_read(&kk_limina_sampler_retires));
+   fprintf(stderr,
+           "  chain check: %u sets walked by layout, %u sampled slots inspected, "
+           "%u slots past set size, max slot offset %u\n",
+           p_atomic_read(&kk_limina_sets_with_layout),
+           p_atomic_read(&kk_limina_sampled_slots_seen),
+           p_atomic_read(&kk_limina_slots_skipped),
+           p_atomic_read(&kk_limina_max_slot_offset));
 
          if (dev->limina_heap_bottom != NULL)
             fprintf(stderr, "  poly heap bottom = %u B of %llu\n",
