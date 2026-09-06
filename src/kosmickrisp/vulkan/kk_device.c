@@ -372,6 +372,23 @@ kk_alloc_pool_acquire(struct kk_device *dev, enum kk_alloc_class klass)
    if (found)
       doomed = kk_alloc_pool_take_surplus(pool, klass, found, now);
 
+   /* limina: a lost device completes nothing, so an allocator minted after the loss can never
+    * be returned, and the "bounded by the client's own fencing" reasoning below stops holding.
+    * Measured on the WebGL {antialias:true} device loss: 0 growth warnings before the loss and
+    * 3608 after, class 1 going 65 -> 3672 allocators with 13070 further BO allocations behind
+    * them, costing the host ~100k compressor pages that only a reboot returned. Refuse instead;
+    * the one caller already handles NULL. */
+   if (!found && vk_device_is_lost_no_report(&dev->vk)) {
+      if (!pool->lost_refused) {
+         pool->lost_refused = true;
+         fprintf(stderr, "[LIMINA-ALLOC-POOL] device is lost — refusing to mint allocators "
+                         "(live class %u: %u)\n", klass, pool->live[klass]);
+         fflush(stderr);
+      }
+      simple_mtx_unlock(&pool->mtx);
+      return NULL;
+   }
+
    if (!found) {
       /* Never block waiting for a drain: stalling cs_start_render on GPU progress invites jank
        * and priority inversion, and the in-flight depth that drives this is already bounded by

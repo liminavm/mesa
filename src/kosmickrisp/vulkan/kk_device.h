@@ -191,6 +191,8 @@ struct kk_alloc_pool {
    /* Snapshot file, one per pool (a worker has many VkDevices), written at most once a second. */
    char snapshot_path[1024];
    uint64_t snapshot_last_ns;
+   /* limina: one-shot, so the containment message is not printed per acquire. */
+   bool lost_refused;
 };
 
 /* util_dynarray's macros take a single type token, so give the pointer a name. */

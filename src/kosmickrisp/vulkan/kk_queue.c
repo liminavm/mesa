@@ -283,7 +283,9 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
    struct kk_device *dev = kk_queue_device(queue);
 
-   if (vk_queue_is_lost(&queue->vk))
+   /* limina: the device is marked lost from the commit feedback handler, which does not mark
+    * the queue. Without this the queue keeps accepting submissions that can never complete. */
+   if (vk_queue_is_lost(&queue->vk) || vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
    for (struct vk_sync_wait *wait = submit->waits,

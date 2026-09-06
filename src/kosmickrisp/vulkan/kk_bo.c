@@ -153,6 +153,13 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
 {
    VkResult result = VK_SUCCESS;
 
+   /* limina: nothing allocated after a device loss can ever be used, and the client above keeps
+    * asking -- 13070 further BOs in one measured loss. Returning the loss here is what the spec
+    * expects of an allocation on a lost device, and it is what stops the host bleeding memory a
+    * reboot has to return. */
+   if (vk_device_is_lost_no_report(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
+
    // TODO_KOSMICKRISP: Probably requires handling the buffer maximum 256MB
    uint64_t minimum_alignment = 0u;
    mtl_heap_buffer_size_and_align_with_length(dev->mtl_handle, &size_B,
