@@ -91,6 +91,8 @@ bool kk_limina_addr_log_enabled(void);
  * has no such home -- so remember the IDs that die, and look for them in the memory of the
  * descriptor sets a draw actually binds. Only values that were once resource IDs are ever
  * flagged, so a scan of raw memory cannot invent a hit. */
+void kk_limina_rid_born(uint64_t id);
+bool kk_limina_rid_is_known(uint64_t id);
 void kk_limina_rid_died(uint64_t id);
 bool kk_limina_rid_is_dead(uint64_t id);
 void kk_limina_addr_log(const char *fmt, ...) PRINTFLIKE(1, 2);

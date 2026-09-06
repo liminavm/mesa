@@ -293,9 +293,60 @@ kk_limina_work_record(const char *fmt, ...)
    return seq;
 }
 
+/* limina: every texture resource ID KK has ever minted, and whether it is still alive. The dead
+ * half answers "does this descriptor name something we destroyed"; the live half answers the
+ * question that actually distinguishes garbage from staleness -- "is this 8-byte value a resource
+ * ID KK ever minted at all". The kernel's fault addresses sit far outside the process's whole GPU
+ * address band, so the value the shader consumed was never anything we allocated, and only the
+ * live check can catch that at encode time. */
 #define KK_LIMINA_RID_DEAD 8192u
 static simple_mtx_t kk_limina_rid_lock = SIMPLE_MTX_INITIALIZER;
 static uint64_t kk_limina_rid_dead[KK_LIMINA_RID_DEAD];
+static uint64_t kk_limina_rid_live_ids[KK_LIMINA_RID_DEAD];
+
+void
+kk_limina_rid_born(uint64_t id)
+{
+   if (id == 0ull)
+      return;
+
+   simple_mtx_lock(&kk_limina_rid_lock);
+   unsigned slot = (unsigned)((id * 2654435761u) % KK_LIMINA_RID_DEAD);
+   for (unsigned i = 0; i < 8u; i++) {
+      unsigned s = (slot + i) % KK_LIMINA_RID_DEAD;
+      if (kk_limina_rid_live_ids[s] == 0ull || kk_limina_rid_live_ids[s] == id) {
+         kk_limina_rid_live_ids[s] = id;
+         break;
+      }
+      if (i == 7u)
+         kk_limina_rid_live_ids[slot] = id;
+   }
+   simple_mtx_unlock(&kk_limina_rid_lock);
+}
+
+/* Known: minted by KK at some point. A full table can forget an old ID, so an unknown value is a
+ * lead, not a verdict -- but a run whose descriptors are all known has no garbage in them. */
+bool
+kk_limina_rid_is_known(uint64_t id)
+{
+   if (id == 0ull)
+      return true;
+
+   bool known = false;
+   simple_mtx_lock(&kk_limina_rid_lock);
+   unsigned slot = (unsigned)((id * 2654435761u) % KK_LIMINA_RID_DEAD);
+   for (unsigned i = 0; i < 8u; i++) {
+      uint64_t v = kk_limina_rid_live_ids[(slot + i) % KK_LIMINA_RID_DEAD];
+      if (v == id) {
+         known = true;
+         break;
+      }
+      if (v == 0ull)
+         break;
+   }
+   simple_mtx_unlock(&kk_limina_rid_lock);
+   return known;
+}
 
 void
 kk_limina_rid_died(uint64_t id)

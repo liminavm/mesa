@@ -15,10 +15,14 @@
 #include "kk_limina_capture.h"
 #include "kk_cmd_buffer.h"
 #include "kk_format.h"
+#include "kk_descriptor_set.h"
+#include "kk_descriptor_set_layout.h"
+#include "kk_descriptor_types.h"
 #include "kk_image_view.h"
 #include "kk_physical_device.h"
 #include "kk_query_pool.h"
 
+#include "kosmickrisp/compiler/nir_to_msl.h"
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
@@ -2617,10 +2621,33 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
           * kernel reports these faults at page-table level 1 and 2 -- a nested read. Check the
           * addresses inside it too, and then the sets' own contents for a resource ID that has
           * died: an ID is not an address, so the BO registry cannot speak for it. Multisampled
-          * passes only -- those are the ones that fault, and this walks memory per draw. */
+          * passes only -- those are the ones that fault, and this walks memory per draw.
+          *
+          * The set addresses are read out of the UPLOADED root buffer, not out of the CPU-side
+          * struct: the shader loads them from `root + offsetof(sets) + i*8`, and a root that was
+          * uploaded stale, or bound from a different draw, is invisible to a check that reads
+          * the struct the upload was made from. */
          if (g->render.samples > 1u) {
+            const uint8_t *root_cpu = kk_limina_addr_to_cpu(g->descriptors.root.addr);
             for (unsigned s_i = 0; s_i < KK_MAX_SETS; s_i++) {
                uint64_t set_addr = g->descriptors.root.sets[s_i];
+
+               if (root_cpu != NULL) {
+                  uint64_t on_gpu;
+                  memcpy(&on_gpu,
+                         root_cpu + offsetof(struct kk_root_descriptor_table, sets) +
+                            s_i * sizeof(uint64_t),
+                         sizeof(on_gpu));
+                  if (on_gpu != set_addr && reported++ < 40u)
+                     fprintf(stderr,
+                             "[LIMINA-ROOTSKEW] set%u: root buffer says 0x%llx, bound set is "
+                             "0x%llx (pass %ux%u s%u, draws so far %u)\n",
+                             s_i, (unsigned long long)on_gpu, (unsigned long long)set_addr,
+                             g->render.area.extent.width, g->render.area.extent.height,
+                             g->render.samples, cmd->limina_draws);
+                  set_addr = on_gpu;
+               }
+
                if (set_addr == 0ull)
                   continue;
 
@@ -2647,6 +2674,48 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                              s_i, off, (unsigned long long)set_cpu[off / 8u],
                              g->render.area.extent.width, g->render.area.extent.height,
                              g->render.samples);
+               }
+
+               /* Walk the sampled-image slots the way the shader does, by layout rather than by
+                * scanning: the value at the slot is the resource ID the GPU will dereference, and
+                * the ushort beside it indexes the device sampler table with no bounds check in
+                * the generated MSL. Anything here that KK never minted is the garbage the kernel
+                * reports faulting on. */
+               const struct kk_descriptor_set *set = g->descriptors.sets[s_i];
+               if (set == NULL || set->layout == NULL)
+                  continue;
+
+               for (uint32_t b = 0; b < set->layout->binding_count; b++) {
+                  const struct kk_descriptor_set_binding_layout *bl = &set->layout->binding[b];
+                  if (bl->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                      bl->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+                     continue;
+
+                  for (uint32_t e = 0; e < bl->array_size; e++) {
+                     uint32_t off = bl->offset + e * bl->stride;
+                     if (off + sizeof(struct kk_sampled_image_descriptor) > size)
+                        break;
+
+                     struct kk_sampled_image_descriptor d;
+                     memcpy(&d, (const uint8_t *)set_cpu + off, sizeof(d));
+
+                     if (!kk_limina_rid_is_known(d.image_gpu_resource_id) && reported++ < 40u)
+                        fprintf(stderr,
+                                "[LIMINA-ALIENRID] set%u binding%u[%u] id=0x%llx was never "
+                                "minted by KK (pass %ux%u s%u, draws so far %u)\n",
+                                s_i, bl->type, e,
+                                (unsigned long long)d.image_gpu_resource_id,
+                                g->render.area.extent.width, g->render.area.extent.height,
+                                g->render.samples, cmd->limina_draws);
+
+                     if (d.sampler_index >= MSL_MAX_SAMPLERS && reported++ < 40u)
+                        fprintf(stderr,
+                                "[LIMINA-BADSAMPIDX] set%u binding%u[%u] sampler_index=%u >= %u "
+                                "(pass %ux%u s%u)\n",
+                                s_i, bl->type, e, (unsigned)d.sampler_index,
+                                (unsigned)MSL_MAX_SAMPLERS, g->render.area.extent.width,
+                                g->render.area.extent.height, g->render.samples);
+                  }
                }
             }
          }
