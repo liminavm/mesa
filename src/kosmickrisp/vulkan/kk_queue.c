@@ -122,6 +122,13 @@ commit_callback(struct mtl_feedback_data *data)
                  data->error_details ? data->error_details : "(none)");
          kk_limina_work_dump(stderr, 24u, note->seq_lo, note->seq_hi);
 
+         fprintf(stderr, "  residency set: %u heaps, %u buffers, %u textures\n",
+                 p_atomic_read(&kk_limina_resident_heaps),
+                 p_atomic_read(&kk_limina_resident_buffers),
+                 p_atomic_read(&kk_limina_resident_textures));
+         fprintf(stderr, "  sampler table: %u slots retired\n",
+                 p_atomic_read(&kk_limina_sampler_retires));
+
          if (dev->limina_heap_bottom != NULL)
             fprintf(stderr, "  poly heap bottom = %u B of %llu\n",
                     *dev->limina_heap_bottom,

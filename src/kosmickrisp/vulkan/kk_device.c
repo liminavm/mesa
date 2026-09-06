@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <string.h>
 
+#include "util/u_atomic.h"
+
 #include "kk_cmd_buffer.h"
 #include "kk_entrypoints.h"
 #include "kk_instance.h"
@@ -643,6 +645,23 @@ kk_release_compiler(struct kk_device *dev)
    simple_mtx_unlock(&compilers_ht_lock);
 }
 
+uint32_t kk_limina_sampler_retires = 0u;
+
+/* limina: keep every sampler slot alive for the process lifetime. The hash table dedupes on
+ * the packed descriptor, so the leak is bounded by the number of distinct sampler states. */
+static bool
+kk_limina_sampler_leak(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("LIMINA_KK_SAMPLER_LEAK");
+      cached = (e && strcmp(e, "0") != 0) ? 1 : 0;
+      if (cached)
+         fprintf(stderr, "[LIMINA] KK sampler slots LEAKING (LIMINA_KK_SAMPLER_LEAK)\n");
+   }
+   return cached == 1;
+}
+
 DERIVE_HASH_TABLE(mtl_sampler_packed);
 
 static VkResult
@@ -750,6 +769,17 @@ kk_sampler_heap_remove_locked(struct kk_device *dev, struct kk_sampler_heap *h,
    rc->refcount--;
 
    if (rc->refcount == 0) {
+      /* limina: the descriptor a shader samples through holds a 16-bit INDEX into this
+       * device-wide table, not the sampler's resource ID. Retiring the slot zeroes the
+       * GPU-visible entry and hands the index straight back to the allocator, with nothing
+       * waiting on the command buffers still executing against it. Counted (and, with
+       * LIMINA_KK_SAMPLER_LEAK, suppressed) so an arm can say whether that ever happens. */
+      uint32_t n = p_atomic_inc_return(&kk_limina_sampler_retires);
+      if ((n & 0xffu) == 1u)
+         fprintf(stderr, "[LIMINA] KK sampler slot retired (#%u, index %u)\n", n,
+                 rc->index);
+      if (kk_limina_sampler_leak())
+         return;
       mtl_release(rc->handle);
       kk_query_table_remove(dev, &h->table, rc->index);
       _mesa_hash_table_remove_key(h->ht, &rc->key);
@@ -990,9 +1020,13 @@ kk_GetDeviceProcAddr(VkDevice _device, const char *pName)
    return kk_device_get_proc_addr(device, pName);
 }
 
+uint32_t kk_limina_resident_heaps, kk_limina_resident_buffers,
+   kk_limina_resident_textures;
+
 void
 kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
 {
+   p_atomic_inc(&kk_limina_resident_heaps);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_add_allocation(dev->residency_set.handle, heap);
    simple_mtx_unlock(&dev->residency_set.mutex);
@@ -1001,6 +1035,7 @@ kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
 void
 kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
 {
+   p_atomic_dec(&kk_limina_resident_heaps);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_remove_allocation(dev->residency_set.handle, heap);
    simple_mtx_unlock(&dev->residency_set.mutex);
@@ -1009,6 +1044,7 @@ kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
 void
 kk_device_add_buffer_to_residency_set(struct kk_device *dev, mtl_buffer *buffer)
 {
+   p_atomic_inc(&kk_limina_resident_buffers);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_add_allocation(dev->residency_set.handle, buffer);
    simple_mtx_unlock(&dev->residency_set.mutex);
@@ -1018,6 +1054,7 @@ void
 kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
                                            mtl_buffer *buffer)
 {
+   p_atomic_dec(&kk_limina_resident_buffers);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_remove_allocation(dev->residency_set.handle, buffer);
    simple_mtx_unlock(&dev->residency_set.mutex);
@@ -1030,6 +1067,7 @@ void
 kk_device_add_texture_to_residency_set(struct kk_device *dev,
                                        mtl_texture *texture)
 {
+   p_atomic_inc(&kk_limina_resident_textures);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_add_allocation(dev->residency_set.handle, texture);
    simple_mtx_unlock(&dev->residency_set.mutex);
@@ -1039,6 +1077,7 @@ void
 kk_device_remove_texture_from_residency_set(struct kk_device *dev,
                                             mtl_texture *texture)
 {
+   p_atomic_dec(&kk_limina_resident_textures);
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_remove_allocation(dev->residency_set.handle, texture);
    simple_mtx_unlock(&dev->residency_set.mutex);

@@ -10,6 +10,8 @@
 
 #include "kk_private.h"
 
+#include "util/u_atomic.h"
+
 #include "kk_query_table.h"
 #include "kk_queue.h"
 
@@ -279,6 +281,17 @@ VkResult kk_device_init_meta(struct kk_device *dev);
 void kk_device_finish_meta(struct kk_device *dev);
 VkResult kk_device_init_lib(struct kk_device *dev);
 void kk_device_finish_lib(struct kk_device *dev);
+/* limina: how many allocations the queue-attached residency set is carrying. A bindless read
+ * dereferences a texture's MTLResourceID, and a resource that is not resident faults exactly as a
+ * stale pointer would -- so the size of this set is a suspect in its own right once every
+ * lifetime explanation is spent. Counted by kind because a view, a heap and a placed texture are
+ * three different costs. */
+extern uint32_t kk_limina_resident_heaps, kk_limina_resident_buffers,
+   kk_limina_resident_textures;
+
+/* limina: how many device sampler-table slots have been zeroed and returned to the free list. */
+extern uint32_t kk_limina_sampler_retires;
+
 void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
 void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
                                               mtl_heap *heap);
