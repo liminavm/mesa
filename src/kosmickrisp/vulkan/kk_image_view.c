@@ -167,6 +167,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          mtl_handle = kk_image_plane_create_texture(plane, &subres_layout,
                                                     subres_offset_B);
          view->planes[view_plane].mtl_handle_subres = mtl_handle;
+         kk_device_add_texture_to_residency_set(dev, mtl_handle);
 
          /* Adjust for new base texture pointing to subresource */
          view_layout.base_level = 0u;
@@ -227,6 +228,13 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                                        : original_type;
             view->planes[view_plane].mtl_handle_input =
                mtl_new_texture_view_with(mtl_handle, &view_layout);
+            /* limina: every view minted here is its own Metal allocation, and it
+             * is the view's MTLResourceID -- not the parent's -- that a shader
+             * dereferences. Only the sampled and storage views were registered;
+             * these were left resident by luck. */
+            view->planes[view_plane].input_is_view = true;
+            kk_device_add_texture_to_residency_set(
+               dev, view->planes[view_plane].mtl_handle_input);
          } else
             view->planes[view_plane].mtl_handle_input = mtl_retain(mtl_handle);
          view->planes[view_plane].input_gpu_resource_id =
@@ -241,6 +249,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
             view_layout.view_type = original_type;
             view->planes[view_plane].mtl_handle_render =
                mtl_new_texture_view_with_no_swizzle(mtl_handle, &view_layout);
+            kk_device_add_texture_to_residency_set(
+               dev, view->planes[view_plane].mtl_handle_render);
          } else /* Subresource indices will be set in attachment descriptor */
             view->planes[view_plane].mtl_handle_render = mtl_retain(mtl_handle);
       }
@@ -284,14 +294,27 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
          mtl_release(view->planes[plane].mtl_handle_storage);
       }
 
-      if (view->planes[plane].mtl_handle_input)
+      /* Only the handles we minted are ours to unregister; the others are
+       * retains of the parent image's texture, which stays resident with it. */
+      if (view->planes[plane].mtl_handle_input) {
+         if (view->planes[plane].input_is_view)
+            kk_device_remove_texture_from_residency_set(
+               dev, view->planes[plane].mtl_handle_input);
          mtl_release(view->planes[plane].mtl_handle_input);
+      }
 
-      if (view->planes[plane].mtl_handle_render)
+      if (view->planes[plane].mtl_handle_render) {
+         if (view->planes[plane].render_is_view)
+            kk_device_remove_texture_from_residency_set(
+               dev, view->planes[plane].mtl_handle_render);
          mtl_release(view->planes[plane].mtl_handle_render);
+      }
 
-      if (view->planes[plane].mtl_handle_subres)
+      if (view->planes[plane].mtl_handle_subres) {
+         kk_device_remove_texture_from_residency_set(
+            dev, view->planes[plane].mtl_handle_subres);
          mtl_release(view->planes[plane].mtl_handle_subres);
+      }
    }
 
    vk_image_view_finish(&view->vk);
