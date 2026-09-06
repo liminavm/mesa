@@ -2591,7 +2591,11 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
          const char *e = getenv("LIMINA_KK_ADDR_CHECK");
          check = e && e[0] && e[0] != '0';
          if (check)
-            fprintf(stderr, "[LIMINA] KK draw address checking ON (LIMINA_KK_ADDR_CHECK)\n");
+            fprintf(stderr,
+                    "[LIMINA] KK draw address checking ON (LIMINA_KK_ADDR_CHECK); "
+                    "root.sets at +%u, so the MSL's `root + N` names set (N-%u)/8\n",
+                    (unsigned)offsetof(struct kk_root_descriptor_table, sets),
+                    (unsigned)offsetof(struct kk_root_descriptor_table, sets));
       }
       if (unlikely(check)) {
          static unsigned reported;
@@ -2701,7 +2705,31 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
                      struct kk_sampled_image_descriptor d;
                      memcpy(&d, (const uint8_t *)set_cpu + off, sizeof(d));
-                     p_atomic_inc(&kk_limina_sampled_slots_seen);
+                     {
+                        uint32_t r = p_atomic_inc_return(&kk_limina_root_ring_n) - 1u;
+                        struct kk_limina_root_note *n =
+                           &kk_limina_root_ring[r % KK_LIMINA_ROOT_RING];
+                        n->root = g->descriptors.root.addr;
+                        n->set_addr = set_addr;
+                        n->id = d.image_gpu_resource_id;
+                        n->off = off;
+                        n->samp = d.sampler_index;
+                        n->set_index = s_i;
+                        n->samples = g->render.samples;
+                     }
+
+                     /* Which bytes the walk actually read: a clean result means nothing unless
+                      * the slot inspected is the one the shader's `root + N` load names. */
+                     if (p_atomic_inc_return(&kk_limina_sampled_slots_seen) <= 8u)
+                        fprintf(stderr,
+                                "[LIMINA-SLOT] set%u (root+%u) binding%u[%u] +%u id=0x%llx "
+                                "samp=%u (pass %ux%u s%u)\n",
+                                s_i,
+                                (unsigned)(offsetof(struct kk_root_descriptor_table, sets) +
+                                           s_i * sizeof(uint64_t)),
+                                b, e, off, (unsigned long long)d.image_gpu_resource_id,
+                                (unsigned)d.sampler_index, g->render.area.extent.width,
+                                g->render.area.extent.height, g->render.samples);
                      if (off > p_atomic_read(&kk_limina_max_slot_offset))
                         kk_limina_max_slot_offset = off;
 

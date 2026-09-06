@@ -298,6 +298,23 @@ extern uint32_t kk_limina_max_slot_offset;
 extern uint32_t kk_limina_msaa_draws_checked;
 extern uint32_t kk_limina_ms_binds_seen;
 
+/* limina: what the last few multisampled draws put in front of the GPU. The encode-time chain
+ * check proves the bytes were right when they were written; this keeps enough to re-read the
+ * same bytes from the loss callback, which is the only place that can tell "we wrote garbage"
+ * apart from "something overwrote it after we wrote it". */
+struct kk_limina_root_note {
+   uint64_t root;
+   uint64_t set_addr;
+   uint64_t id;
+   uint32_t off;
+   uint32_t samp;
+   uint32_t set_index;
+   uint32_t samples;
+};
+#define KK_LIMINA_ROOT_RING 16u
+extern struct kk_limina_root_note kk_limina_root_ring[KK_LIMINA_ROOT_RING];
+extern uint32_t kk_limina_root_ring_n;
+
 void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
 void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
                                               mtl_heap *heap);

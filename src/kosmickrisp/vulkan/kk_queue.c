@@ -22,6 +22,8 @@
 
 #include "vk_cmd_queue.h"
 
+#include "kosmickrisp/compiler/nir_to_msl.h"
+
 /* limina: what one commit submitted, so the device-loss report can mark the GPU's last work.
  * Allocated per commit and freed by the callback, which Metal invokes exactly once. */
 struct kk_commit_note {
@@ -140,6 +142,51 @@ commit_callback(struct mtl_feedback_data *data)
            "sampled images\n",
            p_atomic_read(&kk_limina_msaa_draws_checked),
            p_atomic_read(&kk_limina_ms_binds_seen));
+
+         /* limina: re-read, now, the exact bytes the last multisampled draws handed the GPU.
+          * The encode-time walk says they were right when written; only this can say whether
+          * they were still right when the GPU read them. The sampler table entry is read too:
+          * the generated MSL indexes it with no bounds check and it is a different buffer from
+          * the descriptor set, so nothing upstream speaks for it. */
+         {
+            uint32_t n = p_atomic_read(&kk_limina_root_ring_n);
+            uint32_t first = n > KK_LIMINA_ROOT_RING ? n - KK_LIMINA_ROOT_RING : 0u;
+            const uint64_t *samptab =
+               dev->samplers.table.bo ? (const uint64_t *)dev->samplers.table.bo->cpu : NULL;
+            for (uint32_t i = first; i < n; i++) {
+               const struct kk_limina_root_note *note_i =
+                  &kk_limina_root_ring[i % KK_LIMINA_ROOT_RING];
+               const uint8_t *set_cpu = kk_limina_addr_to_cpu(note_i->set_addr);
+               const uint8_t *root_cpu = kk_limina_addr_to_cpu(note_i->root);
+               uint64_t now_id = 0ull, now_set = 0ull;
+               uint32_t now_samp = 0u;
+               if (set_cpu != NULL) {
+                  memcpy(&now_id, set_cpu + note_i->off, sizeof(now_id));
+                  memcpy(&now_samp, set_cpu + note_i->off + 8u, sizeof(now_samp));
+                  now_samp &= 0xffffu;
+               }
+               if (root_cpu != NULL)
+                  memcpy(&now_set,
+                         root_cpu + offsetof(struct kk_root_descriptor_table, sets) +
+                            note_i->set_index * sizeof(uint64_t),
+                         sizeof(now_set));
+               fprintf(stderr,
+                       "  draw[-%u] s%u set%u: at encode set=0x%llx id=0x%llx samp=%u | now "
+                       "set=0x%llx id=0x%llx samp=%u%s | sampler handle 0x%llx\n",
+                       n - i, note_i->samples, note_i->set_index,
+                       (unsigned long long)note_i->set_addr, (unsigned long long)note_i->id,
+                       note_i->samp, (unsigned long long)now_set, (unsigned long long)now_id,
+                       now_samp,
+                       (set_cpu == NULL) ? " (set not mapped)"
+                       : (now_id != note_i->id || now_samp != note_i->samp ||
+                          (root_cpu != NULL && now_set != note_i->set_addr))
+                          ? "  <== CHANGED"
+                          : "",
+                       (unsigned long long)((samptab && note_i->samp < MSL_MAX_SAMPLERS)
+                                               ? samptab[note_i->samp]
+                                               : 0ull));
+            }
+         }
 
          if (dev->limina_heap_bottom != NULL)
             fprintf(stderr, "  poly heap bottom = %u B of %llu\n",

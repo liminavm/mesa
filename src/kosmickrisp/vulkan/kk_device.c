@@ -656,6 +656,8 @@ uint32_t kk_limina_slots_skipped = 0u;
 uint32_t kk_limina_max_slot_offset = 0u;
 uint32_t kk_limina_msaa_draws_checked = 0u;
 uint32_t kk_limina_ms_binds_seen = 0u;
+struct kk_limina_root_note kk_limina_root_ring[KK_LIMINA_ROOT_RING];
+uint32_t kk_limina_root_ring_n = 0u;
 
 /* limina: keep every sampler slot alive for the process lifetime. The hash table dedupes on
  * the packed descriptor, so the leak is bounded by the number of distinct sampler states. */
