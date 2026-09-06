@@ -31,6 +31,8 @@ static enum capture_phase phase = PHASE_OFF;
 static bool configured = false;
 
 static uint32_t want_w, want_h;
+static bool want_any_extent;    /* KK_LIMINA_CAPTURE=any */
+static uint32_t want_samples;   /* KK_LIMINA_CAPTURE_SAMPLES; 0 = any */
 static uint32_t arm_w, arm_h;   /* the pass that opens the window; 0 = open at the trigger */
 static bool pending_start;
 static bool skip_first;         /* arm on the SECOND render of a pair, not the first */
@@ -76,11 +78,19 @@ configure(void)
    if (spec == NULL)
       return;
 
-   if (sscanf(spec, "%ux%u", &want_w, &want_h) != 2) {
-      fprintf(stderr, "[LIMINA-KK-CAPTURE] KK_LIMINA_CAPTURE=\"%s\" is not WxH; disabled\n", spec);
+   if (strcmp(spec, "any") == 0) {
+      /* The extent is not knowable ahead of a boot when the guest's window layout picks it, so
+       * "any" plus KK_LIMINA_CAPTURE_SAMPLES is the form that survives a relaunch. */
+      want_any_extent = true;
+   } else if (sscanf(spec, "%ux%u", &want_w, &want_h) != 2) {
+      fprintf(stderr, "[LIMINA-KK-CAPTURE] KK_LIMINA_CAPTURE=\"%s\" is not WxH or \"any\"; "
+                      "disabled\n", spec);
       fflush(stderr);
       return;
    }
+
+   const char *sam = getenv("KK_LIMINA_CAPTURE_SAMPLES");
+   want_samples = sam ? (unsigned)atoi(sam) : 0u;
 
    /* A device-scope Metal capture is brutally expensive -- left open across a few seconds it
     * writes gigabytes and drags the compositor to a crawl, which is its own kind of lie about
@@ -88,7 +98,11 @@ configure(void)
     * one under investigation: KK's cs_start_render makes a fresh Metal command buffer per pass,
     * and the hook runs before that creation, so arming here captures the very next pass. */
    const char *arm = getenv("KK_LIMINA_CAPTURE_ARM");
-   if (arm != NULL && sscanf(arm, "%ux%u", &arm_w, &arm_h) != 2) {
+   if (arm != NULL && strcmp(arm, "any") == 0) {
+      /* Any nonzero pair puts the lever in PHASE_TRIGGERED, which is all repeat-arming needs;
+       * the value itself is never compared in that mode. */
+      arm_w = arm_h = 1u;
+   } else if (arm != NULL && sscanf(arm, "%ux%u", &arm_w, &arm_h) != 2) {
       fprintf(stderr, "[LIMINA-KK-CAPTURE] KK_LIMINA_CAPTURE_ARM=\"%s\" is not WxH; ignored\n", arm);
       arm_w = arm_h = 0;
    }
@@ -131,11 +145,15 @@ configure(void)
       fprintf(stderr, "[LIMINA-KK-CAPTURE] WARNING: MTL_CAPTURE_ENABLED is unset -- Metal will "
                       "refuse to start the capture\n");
 
+   char extent_desc[32];
+   snprintf(extent_desc, sizeof(extent_desc), "%ux%u", want_w, want_h);
+
    phase = PHASE_WAITING;
    fprintf(stderr,
-           "[LIMINA-KK-CAPTURE] armed for %ux%u arm=%ux%u passes=%u max_cbs=%u runs=%u dir=%s "
-           "trigger=%s skip=%d repeat=%d\n",
-           want_w, want_h, arm_w, arm_h, want_passes, max_cbs, runs_left,
+           "[LIMINA-KK-CAPTURE] armed for %s samples=%u arm=%ux%u passes=%u max_cbs=%u runs=%u "
+           "dir=%s trigger=%s skip=%d repeat=%d\n",
+           want_any_extent ? "any extent" : extent_desc, want_samples, arm_w, arm_h, want_passes,
+           max_cbs, runs_left,
            dir_base ? dir_base : "(attached developer tool)",
            trigger_path ? trigger_path : "(none: opens at the first command buffer)", skip_first, arm_on_repeat);
    fflush(stderr);
@@ -199,9 +217,11 @@ kk_limina_capture_cmdbuf_begin(struct kk_device *dev)
 char kk_limina_capture_pending_label[64];
 
 void
-kk_limina_capture_note_pass(uint32_t width, uint32_t height, const void *attachment)
+kk_limina_capture_note_pass(uint32_t width, uint32_t height, uint32_t samples,
+                            const void *attachment)
 {
-   bool matches = width == want_w && height == want_h;
+   bool matches = (want_any_extent || (width == want_w && height == want_h)) &&
+                  (want_samples == 0u || samples == want_samples);
 
    if (phase == PHASE_TRIGGERED) {
       if (arm_on_repeat) {
@@ -209,8 +229,9 @@ kk_limina_capture_note_pass(uint32_t width, uint32_t height, const void *attachm
           * rendered once. Nothing about the preceding pass identifies it; the attachment does. */
          if (matches && seen_attachment(attachment)) {
             pending_start = true;
-            fprintf(stderr, "[LIMINA-KK-CAPTURE] repeat render of attachment %p -- opening\n",
-                    attachment);
+            fprintf(stderr,
+                    "[LIMINA-KK-CAPTURE] repeat render of attachment %p (%ux%u s%u) -- opening\n",
+                    attachment, width, height, samples);
             fflush(stderr);
          }
          return;
@@ -228,9 +249,9 @@ kk_limina_capture_note_pass(uint32_t width, uint32_t height, const void *attachm
 
    seen_passes++;
    snprintf(kk_limina_capture_pending_label, sizeof(kk_limina_capture_pending_label),
-            "LIMINA %ux%u pass #%u", width, height, seen_passes);
-   fprintf(stderr, "[LIMINA-KK-CAPTURE] pass #%u matches %ux%u (cb %u)\n", seen_passes, width,
-           height, seen_cbs);
+            "LIMINA %ux%u s%u pass #%u", width, height, samples, seen_passes);
+   fprintf(stderr, "[LIMINA-KK-CAPTURE] pass #%u matches %ux%u s%u (cb %u)\n", seen_passes, width,
+           height, samples, seen_cbs);
    fflush(stderr);
 
    /* Close after the commit of the command buffer that holds this pass, not at the next pass

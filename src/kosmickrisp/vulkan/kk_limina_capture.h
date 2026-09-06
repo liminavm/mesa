@@ -50,8 +50,14 @@ void kk_limina_capture_cmdbuf_begin(struct kk_device *dev);
 
 /* Called per colour attachment at render-pass start, before the encoder exists. Counts the
  * passes whose extent matches KK_LIMINA_CAPTURE=WxH and, for those, leaves a name in
- * kk_limina_capture_pending_label for the encoder to pick up. */
-void kk_limina_capture_note_pass(uint32_t width, uint32_t height, const void *attachment);
+ * kk_limina_capture_pending_label for the encoder to pick up.
+ *
+ * KK_LIMINA_CAPTURE=any matches every extent, and KK_LIMINA_CAPTURE_SAMPLES=N narrows that
+ * to passes of a given sample count. A guest whose window layout decides the canvas size
+ * renders its multisampled passes at an extent that changes from boot to boot, so an extent
+ * is a lottery there; the sample count is not. */
+void kk_limina_capture_note_pass(uint32_t width, uint32_t height, uint32_t samples,
+                                 const void *attachment);
 
 /* Empty string when there is nothing to label. Consumed (and cleared) at encoder creation. */
 extern char kk_limina_capture_pending_label[64];

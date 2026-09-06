@@ -375,7 +375,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
          bool seen = kk_limina_seen_texture(tex);
 
          /* limina: count this pass for the triggered GPU capture while the extent is in hand. */
-         kk_limina_capture_note_pass(iview->vk.extent.width, iview->vk.extent.height, tex);
+         kk_limina_capture_note_pass(iview->vk.extent.width, iview->vk.extent.height,
+                                     iview->vk.image->samples, tex);
 
          if (!seen) {
             /* A label offscreen is created per card, so its first pass is ALWAYS a fresh
