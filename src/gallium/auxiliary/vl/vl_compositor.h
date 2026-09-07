@@ -141,8 +141,6 @@ struct vl_compositor_state
    vl_csc_matrix yuv2rgb;
    vl_csc_matrix rgb2yuv;
    vl_csc_matrix primaries;
-
-   vl_csc_matrix csc_matrix; /* gfx compositor only */
 };
 
 struct vl_compositor

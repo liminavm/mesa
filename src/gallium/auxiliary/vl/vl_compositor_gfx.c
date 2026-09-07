@@ -641,9 +641,20 @@ gen_vertex_data(struct vl_compositor *c, struct vl_compositor_state *s, struct u
 }
 
 static void
-set_csc_matrix(struct vl_compositor_state *s)
+set_csc_matrix(struct vl_compositor_state *s, struct vl_compositor *c)
 {
    struct pipe_transfer *buf_transfer;
+   const vl_csc_matrix *matrix = &s->yuv2rgb;
+
+   /* Constants 0..2 hold rgb2yuv for the RGB->YUV shaders, yuv2rgb otherwise. */
+   for (unsigned i = 0; i < VL_COMPOSITOR_MAX_LAYERS; ++i) {
+      if (!(s->used_layers & (1 << i)))
+         continue;
+      if (s->layers[i].fs == c->fs_rgb_yuv.y || s->layers[i].fs == c->fs_rgb_yuv.uv) {
+         matrix = &s->rgb2yuv;
+         break;
+      }
+   }
 
    float *ptr = pipe_buffer_map(s->pipe, s->shader_params,
                                 PIPE_MAP_WRITE | PIPE_MAP_DISCARD_WHOLE_RESOURCE,
@@ -652,7 +663,7 @@ set_csc_matrix(struct vl_compositor_state *s)
    if (!ptr)
      return;
 
-   memcpy(ptr, &s->csc_matrix, sizeof(vl_csc_matrix));
+   memcpy(ptr, matrix, sizeof(vl_csc_matrix));
 
    ptr += sizeof(vl_csc_matrix) / sizeof(float);
    *ptr++ = 0.0f; /* luma_min */
@@ -721,7 +732,7 @@ vl_compositor_gfx_render(struct vl_compositor_state *s,
 
    struct pipe_resource *releasebuf = NULL;
    gen_vertex_data(c, s, dirty_area, &releasebuf);
-   set_csc_matrix(s);
+   set_csc_matrix(s, c);
 
    if (clear_dirty && dirty_area &&
        (dirty_area->x0 < dirty_area->x1 || dirty_area->y0 < dirty_area->y1)) {
