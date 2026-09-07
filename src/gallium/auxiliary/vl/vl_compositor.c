@@ -880,9 +880,14 @@ vl_compositor_init_state(struct vl_compositor_state *s, struct pipe_context *pip
 
    vl_compositor_clear_layers(s);
 
+   /* Seed both directions, so a frontend that never sets them draws with what the gfx
+    * compositor used to hold rather than with a zero matrix. */
    vl_csc_get_rgbyuv_matrix(PIPE_VIDEO_VPP_MCF_BT709, PIPE_FORMAT_NV12, PIPE_FORMAT_B8G8R8A8_UNORM,
                             PIPE_VIDEO_VPP_CHROMA_COLOR_RANGE_REDUCED, PIPE_VIDEO_VPP_CHROMA_COLOR_RANGE_FULL,
-                            &s->csc_matrix);
+                            &s->yuv2rgb);
+   vl_csc_get_rgbyuv_matrix(PIPE_VIDEO_VPP_MCF_BT709, PIPE_FORMAT_B8G8R8A8_UNORM, PIPE_FORMAT_NV12,
+                            PIPE_VIDEO_VPP_CHROMA_COLOR_RANGE_FULL, PIPE_VIDEO_VPP_CHROMA_COLOR_RANGE_REDUCED,
+                            &s->rgb2yuv);
 
    return true;
 }

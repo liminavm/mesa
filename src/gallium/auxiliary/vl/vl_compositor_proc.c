@@ -70,8 +70,6 @@ compositor_proc_process_frame(struct pipe_video_codec *codec,
          /* RGB to RGB */
          vl_csc_get_rgbyuv_matrix(PIPE_VIDEO_VPP_MCF_RGB, src->buffer_format, dst->buffer_format,
                                   param->in_color_range, param->out_color_range, &proc->cstate.yuv2rgb);
-         vl_csc_get_rgbyuv_matrix(PIPE_VIDEO_VPP_MCF_RGB, src->buffer_format, dst->buffer_format,
-                                  param->in_color_range, param->out_color_range, &proc->cstate.csc_matrix);
       } else {
          /* YUV to YUV (convert to RGB for transfer function and primaries) */
          enum pipe_format rgb_format = util_format_get_plane_format(src->buffer_format, 0);
@@ -87,8 +85,6 @@ compositor_proc_process_frame(struct pipe_video_codec *codec,
       /* YUV to RGB */
       vl_csc_get_rgbyuv_matrix(param->in_matrix_coefficients, src->buffer_format, dst->buffer_format,
                                param->in_color_range, param->out_color_range, &proc->cstate.yuv2rgb);
-      vl_csc_get_rgbyuv_matrix(param->in_matrix_coefficients, src->buffer_format, dst->buffer_format,
-                               param->in_color_range, param->out_color_range, &proc->cstate.csc_matrix);
    } else {
       /* RGB to YUV */
       vl_csc_get_rgbyuv_matrix(param->out_matrix_coefficients, src->buffer_format, dst->buffer_format,
