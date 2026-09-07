@@ -21,6 +21,7 @@
 /* limina: atomics for the attachment-less clamp warning counter, execinfo for
  * its one-shot backtrace. */
 #include <execinfo.h>
+#include <string.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -82,6 +83,198 @@ limina_stats_bump(_Atomic uint64_t *ctr)
    }
 }
 
+/*
+ * limina: compute-encoder liveness, keyed by pointer.
+ *
+ * The dogfood SIGSEGV inside AGX `prepareForEnqueue` is a store through
+ * `ComputeContext+0x918`, whose only writer in AGXMetalG16X is `beginComputePass` -- which AGX
+ * runs from `-[AGXG16XFamilyComputeContext_mtlnext initWithCommandBuffer:allocator:...]`, i.e. at
+ * `[cmd_buf computeCommandEncoder]`. So every encoder KK is handed has been begun, and a NULL
+ * there means the object lost its pass state after we got it. The dispatch ring showed the
+ * faulting pointer had already served 58 copies, which leaves exactly two readings: the same
+ * object was reset under us, or the address was recycled under a pointer we kept too long.
+ *
+ * A generation stamped per pointer separates them, and checking at the *use* site turns a
+ * segfault inside Apple's driver into a named report in code we own -- which is the whole reason
+ * this is at the bridge and not at the nine `cs_get_compute` callers: a future call site cannot
+ * forget to be covered.
+ *
+ * Cost is a lock-free probe of at most LIMINA_ENC_PROBE slots on each recorded compute op. The
+ * mutex is taken only when an encoder is created or marked, which is rare (35 encoders per 4096
+ * dispatches in the measured dogfood ring).
+ */
+#define LIMINA_ENC_SLOTS 8192u
+#define LIMINA_ENC_MASK (LIMINA_ENC_SLOTS - 1u)
+#define LIMINA_ENC_PROBE 16u
+
+enum limina_enc_state {
+   LIMINA_ENC_UNKNOWN = 0, /* not in the table: evicted, or never a compute encoder */
+   LIMINA_ENC_LIVE = 1,
+   LIMINA_ENC_ENDED = 2,   /* endEncoding called */
+   LIMINA_ENC_RELEASED = 3, /* our retain dropped; the address may be recycled at any moment */
+};
+
+struct limina_enc_slot {
+   _Atomic uintptr_t ptr;
+   _Atomic uint64_t gen;
+   _Atomic uint32_t state;
+   _Atomic uint32_t pad;
+   _Atomic uint64_t uses;
+   _Atomic uint64_t thread; /* the thread that created this incarnation */
+};
+
+static struct limina_enc_slot limina_enc_tab[LIMINA_ENC_SLOTS];
+static pthread_mutex_t limina_enc_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t limina_enc_gen_next = 1;
+static _Atomic uint64_t limina_enc_bad[4];
+
+static inline uint32_t
+limina_enc_hash(const void *p)
+{
+   /* Encoders are malloc'd objects, so the low bits are dead; take from bit 6 up. */
+   return (uint32_t)(((uintptr_t)p >> 6) & LIMINA_ENC_MASK);
+}
+
+static const char *
+limina_enc_state_name(uint32_t st)
+{
+   switch (st) {
+   case LIMINA_ENC_LIVE: return "live";
+   case LIMINA_ENC_ENDED: return "ENDED";
+   case LIMINA_ENC_RELEASED: return "RELEASED";
+   default: return "UNKNOWN";
+   }
+}
+
+/* Find the slot currently describing `enc`, or NULL. Lock-free: the worst a concurrent insert can
+ * do is make us miss, which reports UNKNOWN rather than a lie. */
+static struct limina_enc_slot *
+limina_enc_find(const void *enc)
+{
+   const uint32_t h = limina_enc_hash(enc);
+   for (uint32_t i = 0; i < LIMINA_ENC_PROBE; i++) {
+      struct limina_enc_slot *s = &limina_enc_tab[(h + i) & LIMINA_ENC_MASK];
+      if (atomic_load_explicit(&s->ptr, memory_order_acquire) == (uintptr_t)enc)
+         return s;
+   }
+   return NULL;
+}
+
+static void
+limina_enc_note_new(void *enc)
+{
+   if (!enc)
+      return;
+   const uint32_t h = limina_enc_hash(enc);
+   pthread_mutex_lock(&limina_enc_lock);
+   struct limina_enc_slot *pick = NULL;
+   struct limina_enc_slot *oldest = NULL;
+   for (uint32_t i = 0; i < LIMINA_ENC_PROBE; i++) {
+      struct limina_enc_slot *s = &limina_enc_tab[(h + i) & LIMINA_ENC_MASK];
+      uintptr_t sp = atomic_load(&s->ptr);
+      if (sp == (uintptr_t)enc) { pick = s; break; }       /* this address, reincarnated */
+      if (sp == 0) { pick = pick ? pick : s; continue; }   /* free */
+      if (!pick && atomic_load(&s->state) == LIMINA_ENC_RELEASED) { pick = s; continue; }
+      if (!oldest || atomic_load(&s->gen) < atomic_load(&oldest->gen))
+         oldest = s;
+   }
+   if (!pick)
+      pick = oldest ? oldest : &limina_enc_tab[h];
+   atomic_store(&pick->gen, atomic_fetch_add(&limina_enc_gen_next, 1));
+   atomic_store(&pick->uses, 0);
+   atomic_store(&pick->thread, (uint64_t)(uintptr_t)pthread_self());
+   atomic_store(&pick->state, LIMINA_ENC_LIVE);
+   atomic_store_explicit(&pick->ptr, (uintptr_t)enc, memory_order_release);
+   pthread_mutex_unlock(&limina_enc_lock);
+}
+
+static void
+limina_enc_mark(void *enc, uint32_t state)
+{
+   if (!enc)
+      return;
+   pthread_mutex_lock(&limina_enc_lock);
+   struct limina_enc_slot *s = limina_enc_find(enc);
+   /* Never walk a state backwards: end-then-release is the order, and a stray endEncoding on an
+    * already-released pointer must not resurrect it to ENDED. */
+   if (s && atomic_load(&s->state) < state)
+      atomic_store(&s->state, state);
+   pthread_mutex_unlock(&limina_enc_lock);
+}
+
+void
+mtl_encoder_note_released(void *encoder)
+{
+   limina_enc_mark(encoder, LIMINA_ENC_RELEASED);
+}
+
+uint64_t
+mtl_encoder_generation(void *encoder)
+{
+   struct limina_enc_slot *s = encoder ? limina_enc_find(encoder) : NULL;
+   return s ? atomic_load(&s->gen) : 0;
+}
+
+static inline bool
+limina_enc_guard_aborts(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_ENC_GUARD");
+      v = (e && !strcmp(e, "abort")) ? 1 : 0;
+   }
+   return v == 1;
+}
+
+/* Report a use of an encoder that is not live, and hand back what we knew about it. `gen_out` may
+ * be NULL. Returns the state, so the dispatch ring can record it beside the copy. */
+static uint32_t
+limina_enc_check(void *enc, const char *site, uint64_t *gen_out)
+{
+   if (gen_out)
+      *gen_out = 0;
+
+   if (enc == NULL) {
+      /* cs_get_compute hands NULL back when the allocator pool is empty; every downstream call
+       * site uses it unchecked, and a nil ObjC receiver is a silent no-op -- so the copy simply
+       * never happens and the corruption surfaces somewhere else entirely. Name it here. */
+      uint64_t n = atomic_fetch_add(&limina_enc_bad[0], 1);
+      if (n < 8 || (n & 4095u) == 0)
+         fprintf(stderr, "[LIMINA-ENC] NULL compute encoder at %s (%llu so far)\n", site,
+                 (unsigned long long)n + 1);
+      if (limina_enc_guard_aborts())
+         abort();
+      return LIMINA_ENC_UNKNOWN;
+   }
+
+   struct limina_enc_slot *s = limina_enc_find(enc);
+   if (!s)
+      return LIMINA_ENC_UNKNOWN; /* evicted, or a render encoder -- not evidence of anything */
+
+   const uint32_t st = atomic_load(&s->state);
+   const uint64_t gen = atomic_load(&s->gen);
+   if (gen_out)
+      *gen_out = gen;
+   atomic_fetch_add(&s->uses, 1);
+   if (st == LIMINA_ENC_LIVE)
+      return st;
+
+   uint64_t n = atomic_fetch_add(&limina_enc_bad[st & 3u], 1);
+   if (n < 8 || (n & 4095u) == 0) {
+      fprintf(stderr,
+              "[LIMINA-ENC] %s encoder %p used at %s — gen %llu, created on thread 0x%llx, "
+              "%llu uses, this thread 0x%llx (%llu so far)\n",
+              limina_enc_state_name(st), enc, site, (unsigned long long)gen,
+              (unsigned long long)atomic_load(&s->thread),
+              (unsigned long long)atomic_load(&s->uses),
+              (unsigned long long)(uintptr_t)pthread_self(), (unsigned long long)n + 1);
+      fflush(stderr);
+   }
+   if (limina_enc_guard_aborts())
+      abort();
+   return st;
+}
+
 /* Common encoder utils */
 void
 mtl_end_encoding(void *encoder)
@@ -90,6 +283,9 @@ mtl_end_encoding(void *encoder)
       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
       [enc endEncoding];
    }
+   /* After this the encoder records nothing; a later op on it is the bug we are hunting. Render
+    * encoders are not in the table, so marking them is a no-op. */
+   limina_enc_mark(encoder, LIMINA_ENC_ENDED);
 }
 
 void
@@ -167,7 +363,7 @@ mtl_wait_for_fence(void *encoder, mtl_fence *fence,
  * being inferred from whatever happened to be logged nearby.
  */
 #define LIMINA_DT_ENTRIES 4096u
-#define LIMINA_DT_MAGIC 0x4c444d54u /* 'LDMT' */
+#define LIMINA_DT_MAGIC 0x4c444d32u /* 'LDM2' — v2 entries carry the encoder generation */
 
 enum limina_dt_kind {
    LIMINA_DT_BUF_TO_IMG = 1,
@@ -188,6 +384,12 @@ struct limina_dt_entry {
    uint32_t w, h, d;
    uint32_t x, y, z;
    uint32_t slice, level, options, kind;
+   /* limina: which *incarnation* of `encoder` this was. The 2026-09-07 fault landed on a pointer
+    * that had already served 58 copies, so the raw pointer cannot say whether the object was
+    * reset under us or the address was recycled -- the generation can. */
+   uint64_t gen;
+   uint32_t enc_state; /* enum limina_enc_state as seen at record time */
+   uint32_t pad2;
 };
 
 struct limina_dt_hdr {
@@ -247,7 +449,7 @@ limina_dt_init(void)
  * trace is off — in which case every call here is one predictable branch. */
 static struct limina_dt_entry *
 limina_dt_begin(enum limina_dt_kind kind, void *encoder, void *buffer, void *texture,
-                const struct mtl_buffer_image_copy *d)
+                const struct mtl_buffer_image_copy *d, uint64_t gen, uint32_t enc_state)
 {
    limina_dt_init();
    struct limina_dt_hdr *h = limina_dt_map;
@@ -263,6 +465,8 @@ limina_dt_begin(enum limina_dt_kind kind, void *encoder, void *buffer, void *tex
    e->buffer = (uint64_t)(uintptr_t)buffer;
    e->texture = (uint64_t)(uintptr_t)texture;
    e->kind = (uint32_t)kind;
+   e->gen = gen;
+   e->enc_state = enc_state;
    if (d) {
       e->offset_B = d->buffer_offset_B;
       e->stride_B = d->buffer_stride_B;
@@ -286,7 +490,9 @@ mtl_new_compute_command_encoder(mtl_command_buffer *cmd_buffer)
 {
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)cmd_buffer;
-      return (mtl_compute_encoder *)limina_mtl_note_new([[cmd_buf computeCommandEncoder] retain]);
+      void *enc = limina_mtl_note_new([[cmd_buf computeCommandEncoder] retain]);
+      limina_enc_note_new(enc);
+      return (mtl_compute_encoder *)enc;
    }
 }
 
@@ -296,6 +502,7 @@ mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder,
                                mtl_buffer *dst_buf, size_t dst_offset,
                                size_t size)
 {
+   limina_enc_check(encoder, "mtl_copy_from_buffer_to_buffer", NULL);
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLBuffer> mtl_src_buffer = (id<MTLBuffer>)src_buf;
@@ -308,6 +515,8 @@ void
 mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
                                 struct mtl_buffer_image_copy *data)
 {
+   uint64_t limina_gen = 0;
+   const uint32_t limina_enc_st = limina_enc_check(encoder, "mtl_copy_from_buffer_to_texture", &limina_gen);
    @autoreleasepool {
       const MTLSize size = MTLSizeMake(data->image_size.x, data->image_size.y, data->image_size.z);
       const MTLOrigin origin = MTLOriginMake(data->image_origin.x, data->image_origin.y, data->image_origin.z);
@@ -315,7 +524,8 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
       id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
       id<MTLTexture> image = (id<MTLTexture>)data->image;
       struct limina_dt_entry *bc =
-         limina_dt_begin(LIMINA_DT_BUF_TO_IMG, encoder, data->buffer, data->image, data);
+         limina_dt_begin(LIMINA_DT_BUF_TO_IMG, encoder, data->buffer, data->image, data,
+                         limina_gen, limina_enc_st);
       [enc copyFromBuffer:buffer
              sourceOffset:data->buffer_offset_B
         sourceBytesPerRow:data->buffer_stride_B
@@ -335,6 +545,7 @@ void
 mtl_copy_from_texture_to_buffer(mtl_compute_encoder *encoder,
                                 struct mtl_buffer_image_copy *data)
 {
+   limina_enc_check(encoder, "mtl_copy_from_texture_to_buffer", NULL);
    @autoreleasepool {
       const MTLSize size = MTLSizeMake(data->image_size.x, data->image_size.y, data->image_size.z);
       const MTLOrigin origin = MTLOriginMake(data->image_origin.x, data->image_origin.y, data->image_origin.z);
@@ -362,6 +573,7 @@ mtl_copy_from_texture_to_texture(mtl_compute_encoder *encoder,
                                  mtl_texture *dst_tex_handle, size_t dst_slice,
                                  size_t dst_level, struct mtl_origin dst_origin)
 {
+   limina_enc_check(encoder, "mtl_copy_from_texture_to_texture", NULL);
    @autoreleasepool {
       MTLOrigin mtl_src_origin = MTLOriginMake(src_origin.x, src_origin.y, src_origin.z);
       MTLSize mtl_src_size = MTLSizeMake(src_size.x, src_size.y, src_size.z);
@@ -385,6 +597,7 @@ void
 mtl_compute_set_pipeline_state(mtl_compute_encoder *encoder,
                                mtl_compute_pipeline_state *state_handle)
 {
+   limina_enc_check(encoder, "mtl_compute_set_pipeline_state", NULL);
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLComputePipelineState> state = (id<MTLComputePipelineState>)state_handle;
@@ -396,6 +609,7 @@ void
 mtl_compute_set_argument_table(mtl_compute_encoder *encoder,
                                mtl_argument_table *table)
 {
+   limina_enc_check(encoder, "mtl_compute_set_argument_table", NULL);
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTL4ArgumentTable> t = (id<MTL4ArgumentTable>)table;
@@ -407,6 +621,7 @@ void
 mtl_dispatch_threads(mtl_compute_encoder *encoder,
                      struct mtl_size grid_size, struct mtl_size local_size)
 {
+   limina_enc_check(encoder, "mtl_dispatch_threads", NULL);
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       MTLSize thread_count = MTLSizeMake(grid_size.x, grid_size.y, grid_size.z);
@@ -422,6 +637,7 @@ mtl_dispatch_threadgroups_with_indirect_buffer(mtl_compute_encoder *encoder,
                                                uint64_t addr,
                                                struct mtl_size local_size)
 {
+   limina_enc_check(encoder, "mtl_dispatch_threadgroups_with_indirect_buffer", NULL);
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       MTLSize threads_per_threadgroup = MTLSizeMake(local_size.x,

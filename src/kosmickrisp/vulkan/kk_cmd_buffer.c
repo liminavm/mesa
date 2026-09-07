@@ -7,8 +7,12 @@
 
 #include "kk_cmd_buffer.h"
 #include "util/u_atomic.h"
+#include "util/log.h"
 
 #include <dlfcn.h>
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
@@ -530,24 +534,48 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    return cmd->gfx.encoder;
 }
 
-static void
+/* limina: same knob the bridge's use-site check honours, so whichever site catches the stale
+ * pointer first can take a core with our own frame on top of it. */
+static bool
+kk_enc_guard_aborts(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_ENC_GUARD");
+      v = (e && !strcmp(e, "abort")) ? 1 : 0;
+   }
+   return v == 1;
+}
+
+/* Returns false with `es->encoder` still NULL when there was no allocator to borrow. limina: the
+ * render twin (cs_start_render) marks the device lost in that case; this path used to return
+ * quietly, and cs_get_compute then handed a NULL encoder to every caller, where a nil ObjC
+ * receiver makes the copy or dispatch a silent no-op. Losing the device here is the same answer
+ * given at the one place that knows the begin failed, rather than at nine call sites that each
+ * have to remember to test. */
+static bool
 kk_start_compute_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
                          mtl_device *handle,
                          mtl_argument_table *argument_table)
 {
-   kk_limina_capture_cmdbuf_begin(kk_cmd_buffer_device(cmd));
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   kk_limina_capture_cmdbuf_begin(dev);
    es->cmd_buf = mtl_new_command_buffer(handle);
    if (!kk_encoder_begin(cmd, es, KK_ALLOC_CLASS_COMPUTE)) {
       mtl_release(es->cmd_buf);
       es->cmd_buf = NULL;
-      return;
+      vk_device_set_lost(&dev->vk, "out of command allocators (compute)");
+      return false;
    }
    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
+   es->enc_gen = mtl_encoder_generation(es->encoder);
    es->ops = 0;
    snprintf(es->what, sizeof(es->what), "compute");
 
    /* Argument table won't ever change */
    mtl_compute_set_argument_table(es->encoder, argument_table);
+   return true;
 }
 
 mtl_compute_encoder *
@@ -568,21 +596,47 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
          p_atomic_inc(&kk_limina_counts.compute_during_pass_postgfx);
    }
    /* If we are not inside a render, we can just take pre_gfx. */
-   if (!cmd->gfx.encoder || pre_gfx) {
-      if (!cmd->pre_gfx->encoder) {
-         kk_start_compute_encoder(cmd, cmd->pre_gfx, dev->mtl_handle,
-                                  cmd->argument_table);
-      }
-      encoder = cmd->pre_gfx->encoder;
-      cmd->pre_gfx->ops++;
-   } else {
-      if (!cmd->post_gfx->encoder) {
-         kk_start_compute_encoder(cmd, cmd->post_gfx, dev->mtl_handle,
-                                  cmd->argument_table);
-      }
-      encoder = cmd->post_gfx->encoder;
-      cmd->post_gfx->ops++;
+   struct kk_encoder_state *es =
+      (!cmd->gfx.encoder || pre_gfx) ? cmd->pre_gfx : cmd->post_gfx;
+   const char *slot = es == cmd->pre_gfx ? "pre_gfx" : "post_gfx";
+
+   if (!es->encoder && !kk_start_compute_encoder(cmd, es, dev->mtl_handle,
+                                                 cmd->argument_table)) {
+      /* limina: say it once per device rather than per handout -- a diagnostic's cadence belongs
+       * to its reader, and this fires from the hot record path. */
+      static uint32_t said;
+      if (p_atomic_fetch_add(&said, 1) == 0)
+         mesa_loge("kk: no compute encoder for the %s slot -- the allocator pool is empty and "
+                   "the device is now lost; every compute op recorded from here is a no-op",
+                   slot);
+      return NULL;
    }
+
+   /* limina: the stale-pointer check. If this slot's encoder address has been re-tenanted since
+    * we were handed it, recording into it is exactly the AGX use-before-begin fault -- name it
+    * here, in our own code, instead of segfaulting inside the driver several ops later.
+    *
+    * gen_now == 0 means the table is no longer tracking this address (its slot was evicted), not
+    * that anything is wrong; treating that as stale would drop real work. */
+   const uint64_t gen_now = mtl_encoder_generation(es->encoder);
+   if (unlikely(es->enc_gen != 0 && gen_now != 0 && gen_now != es->enc_gen)) {
+      /* A stale encoder stays stale until cs_end, and this is the record path -- the dogfood
+       * workload calls it millions of times per session, so an unrate-limited line here is a
+       * flood, which is the mistake this tree has already made twice. */
+      static uint32_t said_stale;
+      const uint32_t n = p_atomic_fetch_add(&said_stale, 1);
+      if (n < 8 || (n & 4095u) == 0)
+         mesa_loge("kk: the %s compute encoder %p is stale — handed out at generation %" PRIu64
+                   ", the address now holds generation %" PRIu64 "; dropping the op rather than "
+                   "recording it into someone else's encoder (caller %p, %u so far)",
+                   slot, es->encoder, es->enc_gen, gen_now, __builtin_return_address(0), n + 1);
+      if (kk_enc_guard_aborts())
+         abort();
+      return NULL;
+   }
+
+   encoder = es->encoder;
+   es->ops++;
 
    return encoder;
 }
@@ -591,10 +645,34 @@ static void
 kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
 {
    /* TODO_KOSMICKRISP This is probably overkill */
-   mtl_barrier_after_stages(es->encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
-   mtl_end_encoding(es->encoder);
-   mtl_release(es->encoder);
-   es->encoder = NULL;
+   /* limina: check the address is still ours BEFORE ending it. Closing a re-tenanted address is
+    * worse than recording into one: mtl_end_encoding ends somebody else's live encoder and
+    * mtl_release drops a retain they still hold, so their object dies under them and their next
+    * dispatch lands on a freed or freshly re-inited context -- which is the very state the AGX
+    * fault shows. Skip both and let the new owner keep its encoder. */
+   const uint64_t stop_gen = mtl_encoder_generation(es->encoder);
+   if (unlikely(es->enc_gen != 0 && stop_gen != 0 && stop_gen != es->enc_gen)) {
+      static uint32_t said_stop;
+      const uint32_t n = p_atomic_fetch_add(&said_stop, 1);
+      if (n < 8 || (n & 4095u) == 0)
+         mesa_loge("kk: refusing to close compute encoder %p — it was ours at generation %" PRIu64
+                   " and the address now holds generation %" PRIu64 "; ending it would take down "
+                   "its new owner (%u so far)",
+                   es->encoder, es->enc_gen, stop_gen, n + 1);
+      if (kk_enc_guard_aborts())
+         abort();
+      es->encoder = NULL;
+      es->enc_gen = 0;
+   } else {
+      mtl_barrier_after_stages(es->encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+      mtl_end_encoding(es->encoder);
+      /* Before the retain goes, so the liveness table cannot lose the race against a new encoder
+       * landing on this very address. */
+      mtl_encoder_note_released(es->encoder);
+      mtl_release(es->encoder);
+      es->encoder = NULL;
+      es->enc_gen = 0;
+   }
 
    /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
    util_dynarray_foreach(&es->ts_resolves, struct kk_ts_resolve, r) {

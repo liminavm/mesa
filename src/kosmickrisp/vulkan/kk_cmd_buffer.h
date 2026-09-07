@@ -286,6 +286,11 @@ struct kk_encoder_state {
    /* limina: one line describing what this command buffer contains, recorded into the work ring
     * as the buffer closes so a device loss can name the work. Written at encoder open. */
    char what[112];
+   /* limina: the incarnation of `encoder`'s ADDRESS that we were handed. Encoder addresses are
+    * recycled fast, so `encoder` alone cannot tell a live pointer from a stale one pointing at a
+    * new tenant -- which is the standing reading of the AGX use-before-begin fault. Checked
+    * before every handout; 0 when the liveness table is not tracking this encoder. */
+   uint64_t enc_gen;
 };
 
 struct kk_cmd_buffer {
