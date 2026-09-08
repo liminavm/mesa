@@ -623,13 +623,15 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
       /* A stale encoder stays stale until cs_end, and this is the record path -- the dogfood
        * workload calls it millions of times per session, so an unrate-limited line here is a
        * flood, which is the mistake this tree has already made twice. */
-      static uint32_t said_stale;
-      const uint32_t n = p_atomic_fetch_add(&said_stale, 1);
+      const uint64_t n = p_atomic_fetch_add(&kk_limina_counts.enc_refused_handout, 1);
       if (n < 8 || (n & 4095u) == 0)
          mesa_loge("kk: the %s compute encoder %p is stale — handed out at generation %" PRIu64
                    ", the address now holds generation %" PRIu64 "; dropping the op rather than "
-                   "recording it into someone else's encoder (caller %p, %u so far)",
-                   slot, es->encoder, es->enc_gen, gen_now, __builtin_return_address(0), n + 1);
+                   "recording it into someone else's encoder (caller %p, %llu so far)",
+                   slot, es->encoder, es->enc_gen, gen_now, __builtin_return_address(0),
+                   (unsigned long long)n + 1);
+      if (n < 8)
+         mtl_encoder_report_incarnation(es->encoder, "stale handout");
       if (kk_enc_guard_aborts())
          abort();
       return NULL;
@@ -652,13 +654,14 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
     * fault shows. Skip both and let the new owner keep its encoder. */
    const uint64_t stop_gen = mtl_encoder_generation(es->encoder);
    if (unlikely(es->enc_gen != 0 && stop_gen != 0 && stop_gen != es->enc_gen)) {
-      static uint32_t said_stop;
-      const uint32_t n = p_atomic_fetch_add(&said_stop, 1);
+      const uint64_t n = p_atomic_fetch_add(&kk_limina_counts.enc_refused_close, 1);
       if (n < 8 || (n & 4095u) == 0)
          mesa_loge("kk: refusing to close compute encoder %p — it was ours at generation %" PRIu64
                    " and the address now holds generation %" PRIu64 "; ending it would take down "
-                   "its new owner (%u so far)",
-                   es->encoder, es->enc_gen, stop_gen, n + 1);
+                   "its new owner (%llu so far)",
+                   es->encoder, es->enc_gen, stop_gen, (unsigned long long)n + 1);
+      if (n < 8)
+         mtl_encoder_report_incarnation(es->encoder, "refused close");
       if (kk_enc_guard_aborts())
          abort();
       es->encoder = NULL;

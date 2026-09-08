@@ -544,6 +544,10 @@ struct kk_limina_counts {
    uint64_t copy_image_to_buffer;
    uint64_t copy_image_to_image;
    uint64_t copy_buffer_to_buffer;
+   /* How often each generation check refused. The messages they gate are rate-limited, so the log
+    * alone cannot be read as a total; these are reported unconditionally by the pool report. */
+   uint64_t enc_refused_handout;
+   uint64_t enc_refused_close;
 };
 extern struct kk_limina_counts kk_limina_counts;
 void kk_limina_counts_tick(const char *why);

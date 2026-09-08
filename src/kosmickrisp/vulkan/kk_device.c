@@ -127,6 +127,30 @@ kk_alloc_pool_report(struct kk_device *dev, const char *why)
            why, (unsigned)util_dynarray_num_elements(&pool->tombstones, kk_pooled_alloc_ptr),
            pool->use_after_destroy, pool->resets[KK_ALLOC_CLASS_RENDER],
            pool->resets[KK_ALLOC_CLASS_COMPUTE], pool->unmatched_discharge);
+
+   /* limina: the encoder guard's positive control. Its three messages are rate-limited and only
+    * appear when something is wrong, so an uneventful log cannot be told apart from a guard that
+    * is not running -- the same trap as a crash class whose only evidence is that it stopped
+    * happening. Reported here rather than beside the other [LIMINA] counters because that block
+    * is driven by kk_CmdPipelineBarrier2: a seated desktop measured 3 of those in a whole boot
+    * while this report fired steadily, so the guard's totals would have been frozen at their
+    * first-minute values and read as "nothing is happening". A diagnostic has to be paced by
+    * something that moves with what it measures, and encoder closes are exactly that.
+    *
+    * `untracked` is the guard's own blind spot made visible: an address the table has evicted
+    * passes every check by default, and `table` says how close we are to causing that. */
+   struct mtl_encoder_guard_stats g;
+   mtl_encoder_guard_stats(&g);
+   fprintf(stderr,
+           "[LIMINA-ALLOC-POOL] %s encoder guard: checks=%llu untracked=%llu | bad: null=%llu "
+           "ended=%llu released=%llu | refused: handout=%llu close=%llu | encoders=%llu "
+           "table=%u/%u\n",
+           why, (unsigned long long)g.checks, (unsigned long long)g.untracked,
+           (unsigned long long)g.bad_null, (unsigned long long)g.bad_ended,
+           (unsigned long long)g.bad_released,
+           (unsigned long long)kk_limina_counts.enc_refused_handout,
+           (unsigned long long)kk_limina_counts.enc_refused_close,
+           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total);
    fflush(stderr);
    simple_mtx_unlock(&pool->mtx);
 }
