@@ -293,8 +293,22 @@ _mesa_fence_sync(struct gl_context *ctx, GLenum condition, GLbitfield flags)
       assert(condition == GL_SYNC_GPU_COMMANDS_COMPLETE && flags == 0);
       assert(syncObj->fence == NULL);
 
-      /* Deferred flush are only allowed when there's a single context. See issue 1430 */
-      ctx->pipe->flush(ctx->pipe, &syncObj->fence, ctx->Shared->RefCount == 1 ? PIPE_FLUSH_DEFERRED : 0);
+      /* Deferred flush are only allowed when there's a single context. See issue 1430
+       *
+       * A shared context gets PIPE_FLUSH_ASYNC rather than a plain flush. Either flag takes
+       * tc_flush's async path (`async = flags & (DEFERRED | ASYNC)`), so without ASYNC this
+       * falls through to tc_sync_msg and every glFenceSync drains the whole call queue
+       * synchronously -- which is most of the cost of fencing in a multi-context app such as a
+       * virtio-gpu host renderer, where every context shares with the renderer's own.
+       *
+       * ASYNC alone is not the deferred case and does not reach issue 1430: the fence is
+       * created against the next batch's token and the batch is flushed (tc_batch_flush), so the
+       * work is submitted before this returns. Drivers set `deferred_ctx` only on the deferred
+       * path -- zink_flush takes `deferred_fence` from `deferred && pfence` -- so the hazard
+       * that comment names stays unreachable from here.
+       */
+      ctx->pipe->flush(ctx->pipe, &syncObj->fence,
+                       ctx->Shared->RefCount == 1 ? PIPE_FLUSH_DEFERRED : PIPE_FLUSH_ASYNC);
 
       simple_mtx_lock(&ctx->Shared->Mutex);
       _mesa_set_add(ctx->Shared->SyncObjects, syncObj);
