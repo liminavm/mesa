@@ -34,6 +34,9 @@
 #include <time.h>
 /* limina: pthread_threadid_np for the LIMINA_KK_RPLOG thread tag. */
 #include <pthread.h>
+/* limina: the encoder's ivars and its driver image's UUID, for the AGX context check. */
+#include <mach-o/loader.h>
+#include <objc/runtime.h>
 
 /* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
  * ~7% of the hot ring core in __findenv_locked). */
@@ -114,6 +117,7 @@ enum limina_enc_state {
    LIMINA_ENC_LIVE = 1,
    LIMINA_ENC_ENDED = 2,   /* endEncoding called */
    LIMINA_ENC_RELEASED = 3, /* our retain dropped; the address may be recycled at any moment */
+   LIMINA_ENC_BROKEN = 4,   /* live, but its AGX context is not fit to record into: ops skipped */
 };
 
 /* Enough frames to name the caller and its caller; the bridge frame itself is skipped. */
@@ -136,12 +140,30 @@ struct limina_enc_slot {
    int born_n;
    int ended_n;
    uint64_t ended_thread;
+   /* The AGX context behind this incarnation, as the encoder's ivars read at birth (see the
+    * context check below). Written under the lock before `ptr` is published, read lock-free at
+    * each op. `ours` = the encoder is of the class whose ivar offsets we looked up. */
+   _Atomic uintptr_t impl;
+   _Atomic uintptr_t alloc;
+   uintptr_t cmdbuf;
+   uintptr_t canary_birth;
+   bool ours;
+   uint32_t trip; /* enum limina_ctx_trip; set once, together with LIMINA_ENC_BROKEN */
+   /* What KK says it began the command buffer on (mtl_encoder_note_allocator). */
+   void *kk_alloc;
+   uint32_t kk_resets;
+   uint32_t kk_ops;
+   /* The previous tenant of this address, kept across a reincarnation, so a trip can say
+    * whether the new encoder inherited its predecessor's context. */
+   uintptr_t prev_impl;
+   void *prev_ended[LIMINA_ENC_FRAMES];
+   int prev_ended_n;
 };
 
 static struct limina_enc_slot limina_enc_tab[LIMINA_ENC_SLOTS];
 static pthread_mutex_t limina_enc_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t limina_enc_gen_next = 1;
-static _Atomic uint64_t limina_enc_bad[4];
+static _Atomic uint64_t limina_enc_bad[5];
 static _Atomic uint64_t limina_enc_checks;   /* every guarded compute op */
 static _Atomic uint64_t limina_enc_untracked; /* ... of which the table knew nothing */
 
@@ -187,6 +209,7 @@ limina_enc_state_name(uint32_t st)
    case LIMINA_ENC_LIVE: return "live";
    case LIMINA_ENC_ENDED: return "ENDED";
    case LIMINA_ENC_RELEASED: return "RELEASED";
+   case LIMINA_ENC_BROKEN: return "BROKEN";
    default: return "UNKNOWN";
    }
 }
@@ -205,6 +228,280 @@ limina_enc_find(const void *enc)
    return NULL;
 }
 
+static inline bool
+limina_enc_guard_aborts(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_ENC_GUARD");
+      v = (e && !strcmp(e, "abort")) ? 1 : 0;
+   }
+   return v == 1;
+}
+
+/*
+ * limina: the AGX context behind the encoder.
+ *
+ * The guard above was live through the 2026-09-11 dogfood fault and silent: the KK encoder AGX
+ * faulted on was live and its own. So the bad object is not the one KK holds but the C++
+ * ComputeContext the encoder reaches through its `_impl` ivar, a separate, page-aligned
+ * allocation. Its pass state (`ctx+0x918` on G16X, `+0x8f0` on G13X) is written only by
+ * beginComputePass, as `[ctx+off-8] = cmd; [ctx+off] = cmd + 0xc0`, and nothing clears it, so NULL
+ * there means the context was zeroed or re-initialised wholesale -- and the next
+ * prepareForEnqueue loads through it.
+ *
+ * So each incarnation records the ivars AGX gave it, and every op re-reads them and the canary.
+ * WHERE it trips is the point: already NULL at birth means AGX handed out a broken context; set
+ * at birth and NULL later means something ran in between. Either way the op is skipped and named
+ * instead of faulting inside the driver.
+ *
+ * The canary is private AGX layout, so it is armed only on driver builds whose image UUID has
+ * been disassembled, and only once the +0xc0 relation has been seen on a live encoder -- which
+ * is what proves `_impl` is the object AGX faults on and the offset is right. The ivar
+ * comparisons need no such proof and run whenever the ivars exist.
+ * LIMINA_KK_CTX_CANARY=0 turns the canary off; =0x<hex> forces an offset for an unlisted build.
+ */
+enum limina_ctx_trip {
+   LIMINA_CTX_OK = 0,
+   LIMINA_CTX_BORN_BROKEN,
+   LIMINA_CTX_DIED,
+   LIMINA_CTX_SWAPPED_IMPL,
+   LIMINA_CTX_SWAPPED_ALLOC,
+};
+
+/* Samples of the +0xc0 relation taken before the canary is trusted for good; any one failing
+ * turns it off. */
+#define LIMINA_CTX_VALIDATE 16u
+
+static struct {
+   bool inited;
+   Class cls;
+   ptrdiff_t off_impl, off_alloc, off_cmdbuf;
+   uint32_t canary_off;
+   _Atomic int canary_state; /* 0 = unproven, 1 = armed, -1 = off */
+   uint32_t samples;
+   char mode_unproven[64], mode_armed[64], mode_off[64];
+} limina_ctx = {
+   .off_impl = -1, .off_alloc = -1, .off_cmdbuf = -1,
+   .mode_unproven = "canary=not-yet-seen", .mode_off = "canary=off",
+};
+
+static _Atomic uint64_t limina_ctx_born_broken, limina_ctx_died, limina_ctx_swapped,
+   limina_ctx_alloc_mismatch, limina_ctx_skipped, limina_ctx_trips;
+
+/* Driver builds whose beginComputePass has been read, with the offset it stores the pass state
+ * at. The relation check still has to pass before the offset is used. */
+static const struct {
+   uint8_t uuid[16];
+   const char *chip;
+   uint32_t canary_off;
+} limina_ctx_known[] = {
+   /* AGXMetalG16X arm64e 84D26FE7-A779-3AA5-8D39-A20CBBCA3A96 (the dogfood faults) */
+   { { 0x84, 0xd2, 0x6f, 0xe7, 0xa7, 0x79, 0x3a, 0xa5,
+       0x8d, 0x39, 0xa2, 0x0c, 0xbb, 0xca, 0x3a, 0x96 }, "G16X", 0x918 },
+   /* AGXMetalG13X arm64e E368C402-9A93-35F5-AE47-B1E561825A06 (M1 Max dev host) */
+   { { 0xe3, 0x68, 0xc4, 0x02, 0x9a, 0x93, 0x35, 0xf5,
+       0xae, 0x47, 0xb1, 0xe5, 0x61, 0x82, 0x5a, 0x06 }, "G13X", 0x8f0 },
+};
+
+static bool
+limina_ctx_image_uuid(const void *addr, uint8_t out[16], const char **path)
+{
+   Dl_info info;
+   if (!dladdr(addr, &info) || !info.dli_fbase)
+      return false;
+   *path = info.dli_fname;
+   const struct mach_header_64 *mh = info.dli_fbase;
+   if (mh->magic != MH_MAGIC_64)
+      return false;
+   const struct load_command *lc = (const void *)(mh + 1);
+   for (uint32_t i = 0; i < mh->ncmds; i++) {
+      if (lc->cmd == LC_UUID) {
+         memcpy(out, ((const struct uuid_command *)lc)->uuid, 16);
+         return true;
+      }
+      lc = (const void *)((const char *)lc + lc->cmdsize);
+   }
+   return false;
+}
+
+static ptrdiff_t
+limina_ctx_ivar_off(Class cls, const char *name)
+{
+   Ivar iv = class_getInstanceVariable(cls, name);
+   return iv ? ivar_getOffset(iv) : -1;
+}
+
+static inline uintptr_t
+limina_ctx_ivar(const void *obj, ptrdiff_t off)
+{
+   return off < 0 ? 0 : *(const volatile uintptr_t *)((const char *)obj + off);
+}
+
+static inline uintptr_t
+limina_ctx_word(uintptr_t impl, uint32_t off)
+{
+   return *(const volatile uintptr_t *)(impl + off);
+}
+
+/* Called once, under limina_enc_lock, with the first compute encoder AGX hands out. */
+static void
+limina_ctx_init(void *enc)
+{
+   limina_ctx.inited = true;
+   Class cls = object_getClass((id)enc);
+   limina_ctx.cls = cls;
+   limina_ctx.off_impl = limina_ctx_ivar_off(cls, "_impl");
+   limina_ctx.off_alloc = limina_ctx_ivar_off(cls, "_allocator");
+   limina_ctx.off_cmdbuf = limina_ctx_ivar_off(cls, "_command_buffer");
+
+   uint8_t uuid[16] = { 0 };
+   const char *img = NULL;
+   const bool have_uuid = limina_ctx_image_uuid((const void *)cls, uuid, &img);
+   const char *chip = NULL;
+   uint32_t off = 0;
+   for (unsigned i = 0; have_uuid && i < sizeof(limina_ctx_known) / sizeof(limina_ctx_known[0]); i++) {
+      if (!memcmp(uuid, limina_ctx_known[i].uuid, 16)) {
+         chip = limina_ctx_known[i].chip;
+         off = limina_ctx_known[i].canary_off;
+      }
+   }
+   const char *e = getenv("LIMINA_KK_CTX_CANARY");
+   if (e && e[0]) {
+      off = (uint32_t)strtoul(e, NULL, 0);
+      chip = off ? "forced" : "disabled";
+   }
+   if (limina_ctx.off_impl < 0)
+      off = 0;
+   limina_ctx.canary_off = off;
+   atomic_store(&limina_ctx.canary_state, off ? 0 : -1);
+   snprintf(limina_ctx.mode_armed, sizeof(limina_ctx.mode_armed), "canary=%s+0x%x",
+            chip ? chip : "?", off);
+
+   char us[40];
+   snprintf(us, sizeof(us),
+            "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X", uuid[0],
+            uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8], uuid[9],
+            uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+   fprintf(stderr,
+           "[LIMINA-CTX] compute encoder class %s from %s (UUID %s): _impl@%td _allocator@%td "
+           "_command_buffer@%td; pass-state canary %s",
+           class_getName(cls), img ? img : "?", have_uuid ? us : "?", limina_ctx.off_impl,
+           limina_ctx.off_alloc, limina_ctx.off_cmdbuf, off ? "at " : "OFF");
+   if (off)
+      fprintf(stderr, "+0x%x (%s), armed once the +0xc0 relation is seen\n", off, chip);
+   else
+      fprintf(stderr, " (%s)\n", limina_ctx.off_impl < 0 ? "no _impl ivar"
+                                 : chip                  ? chip
+                                                         : "driver build not listed");
+   fflush(stderr);
+}
+
+/* Feed one birth sample to the relation check. Under limina_enc_lock. */
+static void
+limina_ctx_validate(uintptr_t canary, uintptr_t cmd)
+{
+   if (canary == 0 || limina_ctx.samples >= LIMINA_CTX_VALIDATE ||
+       atomic_load(&limina_ctx.canary_state) < 0)
+      return;
+   limina_ctx.samples++;
+   if (canary == cmd + 0xc0) {
+      if (atomic_load(&limina_ctx.canary_state) == 0) {
+         atomic_store(&limina_ctx.canary_state, 1);
+         fprintf(stderr, "[LIMINA-CTX] pass-state canary armed (%s): [+0x%x]=0x%llx is "
+                         "[+0x%x]+0xc0 as beginComputePass writes it\n",
+                 limina_ctx.mode_armed, limina_ctx.canary_off, (unsigned long long)canary,
+                 limina_ctx.canary_off - 8u);
+         fflush(stderr);
+      }
+   } else {
+      atomic_store(&limina_ctx.canary_state, -1);
+      fprintf(stderr, "[LIMINA-CTX] pass-state canary turned OFF: [+0x%x]=0x%llx but "
+                      "[+0x%x]=0x%llx, not the +0xc0 beginComputePass writes -- wrong offset or "
+                      "_impl is not the ComputeContext on this build\n",
+              limina_ctx.canary_off, (unsigned long long)canary, limina_ctx.canary_off - 8u,
+              (unsigned long long)cmd);
+      fflush(stderr);
+   }
+}
+
+/* Name a trip. Under limina_enc_lock; the table walk is paid only here. */
+static void
+limina_ctx_report(struct limina_enc_slot *s, const void *enc, const char *site, uint32_t why,
+                  uintptr_t impl_now, uintptr_t alloc_now, uintptr_t canary_now, bool canary_read)
+{
+   static const char *const what[] = {
+      [LIMINA_CTX_OK] = "?",
+      [LIMINA_CTX_BORN_BROKEN] = "AGX handed out a compute encoder whose context has no pass state",
+      [LIMINA_CTX_DIED] = "the context of a live compute encoder lost its pass state",
+      [LIMINA_CTX_SWAPPED_IMPL] = "a live compute encoder's _impl (its context) changed",
+      [LIMINA_CTX_SWAPPED_ALLOC] = "a live compute encoder's _allocator changed",
+   };
+   const uint64_t n = atomic_fetch_add(&limina_ctx_trips, 1);
+   if (n >= 16 && (n & 4095u) != 0)
+      return;
+
+   const uintptr_t impl_birth = atomic_load(&s->impl);
+   fprintf(stderr,
+           "[LIMINA-CTX] %s -- encoder %p at %s, gen %llu, %llu uses, created on thread 0x%llx, "
+           "this thread 0x%llx (%llu so far)\n",
+           what[why], enc, site, (unsigned long long)atomic_load(&s->gen),
+           (unsigned long long)atomic_load(&s->uses), (unsigned long long)atomic_load(&s->thread),
+           (unsigned long long)(uintptr_t)pthread_self(), (unsigned long long)n + 1);
+   fprintf(stderr, "[LIMINA-CTX]   _impl: birth 0x%llx now 0x%llx; pass state [+0x%x]: birth "
+                   "0x%llx now ",
+           (unsigned long long)impl_birth, (unsigned long long)impl_now, limina_ctx.canary_off,
+           (unsigned long long)s->canary_birth);
+   if (canary_read)
+      fprintf(stderr, "0x%llx\n", (unsigned long long)canary_now);
+   else
+      fprintf(stderr, "(not read)\n");
+   fprintf(stderr, "[LIMINA-CTX]   _allocator: birth 0x%llx now 0x%llx; KK began the command "
+                   "buffer on %p (resets %u, ops since its last reset %u)%s\n",
+           (unsigned long long)atomic_load(&s->alloc), (unsigned long long)alloc_now, s->kk_alloc,
+           s->kk_resets, s->kk_ops, s->kk_alloc ? "" : " -- not told yet, see the next line");
+   fprintf(stderr, "[LIMINA-CTX]   _command_buffer: birth 0x%llx now 0x%llx\n",
+           (unsigned long long)s->cmdbuf,
+           (unsigned long long)limina_ctx_ivar(enc, limina_ctx.off_cmdbuf));
+
+   /* Does anyone else think they own this context? AGX hands successive encoders on one
+    * allocator the SAME ComputeContext (measured on G13X: one page-aligned context across every
+    * encoder of a vkcube run), so a shared context with the previous tenant is normal -- but two
+    * encoders LIVE on one context at once is the re-issue story in one line. */
+   uint32_t sharers = 0;
+   const struct limina_enc_slot *first = NULL;
+   for (uint32_t i = 0; impl_birth && i < LIMINA_ENC_SLOTS; i++) {
+      const struct limina_enc_slot *t = &limina_enc_tab[i];
+      if (t == s || !atomic_load(&t->ptr))
+         continue;
+      const uint32_t tst = atomic_load(&t->state);
+      if ((tst == LIMINA_ENC_LIVE || tst == LIMINA_ENC_BROKEN) &&
+          (atomic_load(&t->impl) == impl_birth || (impl_now && atomic_load(&t->impl) == impl_now))) {
+         if (!first)
+            first = t;
+         sharers++;
+      }
+   }
+   if (first)
+      fprintf(stderr, "[LIMINA-CTX]   %u other live encoder(s) on this context, first %p gen %llu "
+                      "created on thread 0x%llx\n",
+              sharers, (void *)atomic_load(&first->ptr), (unsigned long long)atomic_load(&first->gen),
+              (unsigned long long)atomic_load(&first->thread));
+   else
+      fprintf(stderr, "[LIMINA-CTX]   no other live encoder on this context\n");
+
+   limina_enc_print_frames("created by", s->born, s->born_n);
+   if (s->prev_impl || s->prev_ended_n) {
+      fprintf(stderr, "[LIMINA-CTX]   this address's previous tenant had _impl 0x%llx (%s)\n",
+              (unsigned long long)s->prev_impl,
+              s->prev_impl == impl_birth ? "the SAME context" : "a different context");
+      limina_enc_print_frames("previous tenant ended by", s->prev_ended, s->prev_ended_n);
+   }
+   fprintf(stderr, "[LIMINA-CTX]   dropping this and every later op on this encoder rather than "
+                   "recording into it (LIMINA_KK_ENC_GUARD=abort takes a core instead)\n");
+   fflush(stderr);
+}
+
 static void
 limina_enc_note_new(void *enc)
 {
@@ -214,10 +511,11 @@ limina_enc_note_new(void *enc)
    pthread_mutex_lock(&limina_enc_lock);
    struct limina_enc_slot *pick = NULL;
    struct limina_enc_slot *oldest = NULL;
+   bool same = false;
    for (uint32_t i = 0; i < LIMINA_ENC_PROBE; i++) {
       struct limina_enc_slot *s = &limina_enc_tab[(h + i) & LIMINA_ENC_MASK];
       uintptr_t sp = atomic_load(&s->ptr);
-      if (sp == (uintptr_t)enc) { pick = s; break; }       /* this address, reincarnated */
+      if (sp == (uintptr_t)enc) { pick = s; same = true; break; } /* this address, reincarnated */
       if (sp == 0) { pick = pick ? pick : s; continue; }   /* free */
       if (!pick && atomic_load(&s->state) == LIMINA_ENC_RELEASED) { pick = s; continue; }
       if (!oldest || atomic_load(&s->gen) < atomic_load(&oldest->gen))
@@ -225,14 +523,127 @@ limina_enc_note_new(void *enc)
    }
    if (!pick)
       pick = oldest ? oldest : &limina_enc_tab[h];
+
+   /* The context AGX attached, read before anyone records into the encoder -- this sample is
+    * what can say "born broken". */
+   if (!limina_ctx.inited)
+      limina_ctx_init(enc);
+   const bool ours = object_getClass((id)enc) == limina_ctx.cls;
+   uintptr_t impl = 0, alloc = 0, cmdbuf = 0, canary = 0;
+   bool born_broken = false;
+   if (ours) {
+      impl = limina_ctx_ivar(enc, limina_ctx.off_impl);
+      alloc = limina_ctx_ivar(enc, limina_ctx.off_alloc);
+      cmdbuf = limina_ctx_ivar(enc, limina_ctx.off_cmdbuf);
+      if (impl && limina_ctx.canary_off && atomic_load(&limina_ctx.canary_state) >= 0) {
+         canary = limina_ctx_word(impl, limina_ctx.canary_off);
+         limina_ctx_validate(canary, limina_ctx_word(impl, limina_ctx.canary_off - 8u));
+      }
+      born_broken = atomic_load(&limina_ctx.canary_state) == 1 && (!impl || !canary);
+   }
+
+   if (same) {
+      pick->prev_impl = atomic_load(&pick->impl);
+      pick->prev_ended_n = pick->ended_n;
+      memcpy(pick->prev_ended, pick->ended, sizeof(pick->ended));
+   } else {
+      pick->prev_impl = 0;
+      pick->prev_ended_n = 0;
+   }
    atomic_store(&pick->gen, atomic_fetch_add(&limina_enc_gen_next, 1));
    atomic_store(&pick->uses, 0);
    atomic_store(&pick->thread, (uint64_t)(uintptr_t)pthread_self());
    pick->born_n = limina_enc_capture(pick->born);
    pick->ended_n = 0;
    pick->ended_thread = 0;
-   atomic_store(&pick->state, LIMINA_ENC_LIVE);
+   atomic_store(&pick->impl, impl);
+   atomic_store(&pick->alloc, alloc);
+   pick->cmdbuf = cmdbuf;
+   pick->canary_birth = canary;
+   pick->ours = ours;
+   pick->trip = born_broken ? LIMINA_CTX_BORN_BROKEN : LIMINA_CTX_OK;
+   pick->kk_alloc = NULL;
+   pick->kk_resets = 0;
+   pick->kk_ops = 0;
+   atomic_store(&pick->state, born_broken ? LIMINA_ENC_BROKEN : LIMINA_ENC_LIVE);
    atomic_store_explicit(&pick->ptr, (uintptr_t)enc, memory_order_release);
+   if (born_broken) {
+      atomic_fetch_add(&limina_ctx_born_broken, 1);
+      limina_ctx_report(pick, enc, "birth", LIMINA_CTX_BORN_BROKEN, impl, alloc, canary, true);
+   }
+   pthread_mutex_unlock(&limina_enc_lock);
+   if (born_broken && limina_enc_guard_aborts())
+      abort();
+}
+
+/* A live encoder's context no longer matches what it was born with. Marks it BROKEN once and
+ * names it; every later op on it is skipped. */
+static uint32_t
+limina_ctx_trip(struct limina_enc_slot *s, void *enc, const char *site, uint32_t why,
+                uintptr_t impl, uintptr_t alloc, uintptr_t canary, bool canary_read)
+{
+   pthread_mutex_lock(&limina_enc_lock);
+   if (atomic_load(&s->ptr) == (uintptr_t)enc && atomic_load(&s->state) == LIMINA_ENC_LIVE) {
+      atomic_store(&s->state, LIMINA_ENC_BROKEN);
+      s->trip = why;
+      atomic_fetch_add(why == LIMINA_CTX_DIED ? &limina_ctx_died : &limina_ctx_swapped, 1);
+      limina_ctx_report(s, enc, site, why, impl, alloc, canary, canary_read);
+   }
+   pthread_mutex_unlock(&limina_enc_lock);
+   if (limina_enc_guard_aborts())
+      abort();
+   return LIMINA_ENC_BROKEN;
+}
+
+/* The per-op half: two ivar loads and, when armed, one canary load. */
+static inline uint32_t
+limina_ctx_check(struct limina_enc_slot *s, void *enc, const char *site)
+{
+   if (!s->ours)
+      return LIMINA_ENC_LIVE;
+   const uintptr_t impl = limina_ctx_ivar(enc, limina_ctx.off_impl);
+   const uintptr_t alloc = limina_ctx_ivar(enc, limina_ctx.off_alloc);
+   if (__builtin_expect(impl != atomic_load_explicit(&s->impl, memory_order_relaxed), 0))
+      return limina_ctx_trip(s, enc, site, LIMINA_CTX_SWAPPED_IMPL, impl, alloc, 0, false);
+   if (__builtin_expect(alloc != atomic_load_explicit(&s->alloc, memory_order_relaxed), 0))
+      return limina_ctx_trip(s, enc, site, LIMINA_CTX_SWAPPED_ALLOC, impl, alloc, 0, false);
+   if (impl && atomic_load_explicit(&limina_ctx.canary_state, memory_order_relaxed) == 1) {
+      const uintptr_t canary = limina_ctx_word(impl, limina_ctx.canary_off);
+      if (__builtin_expect(canary == 0, 0))
+         return limina_ctx_trip(s, enc, site, LIMINA_CTX_DIED, impl, alloc, canary, true);   }
+   return LIMINA_ENC_LIVE;
+}
+
+void
+mtl_encoder_note_allocator(void *encoder, void *allocator, uint32_t resets,
+                           uint32_t ops_since_reset)
+{
+   if (!encoder)
+      return;
+   pthread_mutex_lock(&limina_enc_lock);
+   struct limina_enc_slot *s = limina_enc_find(encoder);
+   if (s) {
+      s->kk_alloc = allocator;
+      s->kk_resets = resets;
+      s->kk_ops = ops_since_reset;
+      const uintptr_t mine = atomic_load(&s->alloc);
+      if (s->ours && limina_ctx.off_alloc >= 0 && mine != (uintptr_t)allocator) {
+         const uint64_t n = atomic_fetch_add(&limina_ctx_alloc_mismatch, 1);
+         if (n < 8 || (n & 4095u) == 0) {
+            fprintf(stderr, "[LIMINA-CTX] compute encoder %p (gen %llu) carries _allocator 0x%llx "
+                            "but KK began its command buffer on %p (%llu so far)\n",
+                    encoder, (unsigned long long)atomic_load(&s->gen), (unsigned long long)mine,
+                    allocator, (unsigned long long)n + 1);
+            fflush(stderr);
+         }
+      }
+      if (s->trip == LIMINA_CTX_BORN_BROKEN && atomic_load(&limina_ctx_trips) <= 16) {
+         fprintf(stderr, "[LIMINA-CTX]   born-broken encoder %p: KK began its command buffer on "
+                         "allocator %p, resets %u, ops since its last reset %u\n",
+                 encoder, allocator, resets, ops_since_reset);
+         fflush(stderr);
+      }
+   }
    pthread_mutex_unlock(&limina_enc_lock);
 }
 
@@ -245,10 +656,12 @@ limina_enc_mark(void *enc, uint32_t state)
    struct limina_enc_slot *s = limina_enc_find(enc);
    /* Never walk a state backwards: end-then-release is the order, and a stray endEncoding on an
     * already-released pointer must not resurrect it to ENDED. */
-   if (s && atomic_load(&s->state) < state) {
+   const uint32_t cur = s ? atomic_load(&s->state) : LIMINA_ENC_UNKNOWN;
+   /* BROKEN is still an open encoder: KK ends and releases it like any other. */
+   if (s && (cur < state || cur == LIMINA_ENC_BROKEN)) {
       /* Only the first transition out of LIVE is recorded: that is the call that took the
        * encoder away, and the release that follows it is bookkeeping. */
-      if (atomic_load(&s->state) == LIMINA_ENC_LIVE) {
+      if (cur == LIMINA_ENC_LIVE || cur == LIMINA_ENC_BROKEN) {
          s->ended_n = limina_enc_capture(s->ended);
          s->ended_thread = (uint64_t)(uintptr_t)pthread_self();
       }
@@ -315,17 +728,16 @@ mtl_encoder_guard_stats(struct mtl_encoder_guard_stats *out)
          used++;
    }
    out->slots_used = used;
-}
 
-static inline bool
-limina_enc_guard_aborts(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      const char *e = getenv("LIMINA_KK_ENC_GUARD");
-      v = (e && !strcmp(e, "abort")) ? 1 : 0;
-   }
-   return v == 1;
+   const int cs = atomic_load(&limina_ctx.canary_state);
+   out->ctx_mode = cs > 0    ? limina_ctx.mode_armed
+                   : cs == 0 ? limina_ctx.mode_unproven
+                             : limina_ctx.mode_off;
+   out->ctx_born_broken = atomic_load(&limina_ctx_born_broken);
+   out->ctx_died = atomic_load(&limina_ctx_died);
+   out->ctx_swapped = atomic_load(&limina_ctx_swapped);
+   out->ctx_alloc_mismatch = atomic_load(&limina_ctx_alloc_mismatch);
+   out->ctx_skipped = atomic_load(&limina_ctx_skipped);
 }
 
 /* Report a use of an encoder that is not live, and hand back what we knew about it. `gen_out` may
@@ -366,7 +778,12 @@ limina_enc_check(void *enc, const char *site, uint64_t *gen_out)
       *gen_out = gen;
    atomic_fetch_add(&s->uses, 1);
    if (st == LIMINA_ENC_LIVE)
+      return limina_ctx_check(s, enc, site);
+   if (st == LIMINA_ENC_BROKEN) {
+      /* Already named once, at the trip. */
+      atomic_fetch_add(&limina_ctx_skipped, 1);
       return st;
+   }
 
    uint64_t n = atomic_fetch_add(&limina_enc_bad[st & 3u], 1);
    if (n < 8 || (n & 4095u) == 0) {
@@ -615,7 +1032,8 @@ mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder,
                                mtl_buffer *dst_buf, size_t dst_offset,
                                size_t size)
 {
-   limina_enc_check(encoder, "mtl_copy_from_buffer_to_buffer", NULL);
+   if (limina_enc_check(encoder, "mtl_copy_from_buffer_to_buffer", NULL) == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLBuffer> mtl_src_buffer = (id<MTLBuffer>)src_buf;
@@ -630,6 +1048,8 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
 {
    uint64_t limina_gen = 0;
    const uint32_t limina_enc_st = limina_enc_check(encoder, "mtl_copy_from_buffer_to_texture", &limina_gen);
+   if (limina_enc_st == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       const MTLSize size = MTLSizeMake(data->image_size.x, data->image_size.y, data->image_size.z);
       const MTLOrigin origin = MTLOriginMake(data->image_origin.x, data->image_origin.y, data->image_origin.z);
@@ -658,7 +1078,8 @@ void
 mtl_copy_from_texture_to_buffer(mtl_compute_encoder *encoder,
                                 struct mtl_buffer_image_copy *data)
 {
-   limina_enc_check(encoder, "mtl_copy_from_texture_to_buffer", NULL);
+   if (limina_enc_check(encoder, "mtl_copy_from_texture_to_buffer", NULL) == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       const MTLSize size = MTLSizeMake(data->image_size.x, data->image_size.y, data->image_size.z);
       const MTLOrigin origin = MTLOriginMake(data->image_origin.x, data->image_origin.y, data->image_origin.z);
@@ -686,7 +1107,8 @@ mtl_copy_from_texture_to_texture(mtl_compute_encoder *encoder,
                                  mtl_texture *dst_tex_handle, size_t dst_slice,
                                  size_t dst_level, struct mtl_origin dst_origin)
 {
-   limina_enc_check(encoder, "mtl_copy_from_texture_to_texture", NULL);
+   if (limina_enc_check(encoder, "mtl_copy_from_texture_to_texture", NULL) == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       MTLOrigin mtl_src_origin = MTLOriginMake(src_origin.x, src_origin.y, src_origin.z);
       MTLSize mtl_src_size = MTLSizeMake(src_size.x, src_size.y, src_size.z);
@@ -710,7 +1132,8 @@ void
 mtl_compute_set_pipeline_state(mtl_compute_encoder *encoder,
                                mtl_compute_pipeline_state *state_handle)
 {
-   limina_enc_check(encoder, "mtl_compute_set_pipeline_state", NULL);
+   if (limina_enc_check(encoder, "mtl_compute_set_pipeline_state", NULL) == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLComputePipelineState> state = (id<MTLComputePipelineState>)state_handle;
@@ -722,7 +1145,8 @@ void
 mtl_compute_set_argument_table(mtl_compute_encoder *encoder,
                                mtl_argument_table *table)
 {
-   limina_enc_check(encoder, "mtl_compute_set_argument_table", NULL);
+   if (limina_enc_check(encoder, "mtl_compute_set_argument_table", NULL) == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTL4ArgumentTable> t = (id<MTL4ArgumentTable>)table;
@@ -734,7 +1158,8 @@ void
 mtl_dispatch_threads(mtl_compute_encoder *encoder,
                      struct mtl_size grid_size, struct mtl_size local_size)
 {
-   limina_enc_check(encoder, "mtl_dispatch_threads", NULL);
+   if (limina_enc_check(encoder, "mtl_dispatch_threads", NULL) == LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       MTLSize thread_count = MTLSizeMake(grid_size.x, grid_size.y, grid_size.z);
@@ -750,7 +1175,9 @@ mtl_dispatch_threadgroups_with_indirect_buffer(mtl_compute_encoder *encoder,
                                                uint64_t addr,
                                                struct mtl_size local_size)
 {
-   limina_enc_check(encoder, "mtl_dispatch_threadgroups_with_indirect_buffer", NULL);
+   if (limina_enc_check(encoder, "mtl_dispatch_threadgroups_with_indirect_buffer", NULL) ==
+       LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       MTLSize threads_per_threadgroup = MTLSizeMake(local_size.x,

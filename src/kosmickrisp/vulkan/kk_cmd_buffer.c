@@ -570,6 +570,8 @@ kk_start_compute_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es,
    }
    es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
    es->enc_gen = mtl_encoder_generation(es->encoder);
+   mtl_encoder_note_allocator(es->encoder, es->allocator, es->pa->resets,
+                              es->pa->ops_since_reset);
    es->ops = 0;
    snprintf(es->what, sizeof(es->what), "compute");
 

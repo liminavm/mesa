@@ -144,13 +144,17 @@ kk_alloc_pool_report(struct kk_device *dev, const char *why)
    fprintf(stderr,
            "[LIMINA-ALLOC-POOL] %s encoder guard: checks=%llu untracked=%llu | bad: null=%llu "
            "ended=%llu released=%llu | refused: handout=%llu close=%llu | encoders=%llu "
-           "table=%u/%u\n",
+           "table=%u/%u | context: %s born-broken=%llu died=%llu swapped=%llu "
+           "alloc-mismatch=%llu skipped=%llu\n",
            why, (unsigned long long)g.checks, (unsigned long long)g.untracked,
            (unsigned long long)g.bad_null, (unsigned long long)g.bad_ended,
            (unsigned long long)g.bad_released,
            (unsigned long long)kk_limina_counts.enc_refused_handout,
            (unsigned long long)kk_limina_counts.enc_refused_close,
-           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total);
+           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total, g.ctx_mode,
+           (unsigned long long)g.ctx_born_broken, (unsigned long long)g.ctx_died,
+           (unsigned long long)g.ctx_swapped, (unsigned long long)g.ctx_alloc_mismatch,
+           (unsigned long long)g.ctx_skipped);
    fflush(stderr);
    simple_mtx_unlock(&pool->mtx);
 }
