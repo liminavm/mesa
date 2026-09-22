@@ -56,6 +56,7 @@ vk_common_CreateFramebuffer(VkDevice _device,
    framebuffer->width = pCreateInfo->width;
    framebuffer->height = pCreateInfo->height;
    framebuffer->layers = pCreateInfo->layers;
+   framebuffer->attachment_count = 0;
 
    if (!(pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT)) {
       for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++)
