@@ -2650,29 +2650,6 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(vk_framebuffer, framebuffer,
                   pRenderPassBeginInfo->framebuffer);
 
-   assert(cmd_buffer->render_pass == NULL);
-   cmd_buffer->render_pass = pass;
-   cmd_buffer->subpass_idx = 0;
-
-   assert(cmd_buffer->framebuffer == NULL);
-   cmd_buffer->framebuffer = framebuffer;
-
-   cmd_buffer->render_area = pRenderPassBeginInfo->renderArea;
-
-   assert(cmd_buffer->attachments == NULL);
-   if (pass->attachment_count > ARRAY_SIZE(cmd_buffer->_attachments)) {
-      cmd_buffer->attachments = malloc(pass->attachment_count *
-                                       sizeof(*cmd_buffer->attachments));
-   } else {
-      cmd_buffer->attachments = cmd_buffer->_attachments;
-   }
-
-   const VkRenderPassAttachmentBeginInfo *attach_begin =
-      vk_find_struct_const(pRenderPassBeginInfo,
-                           RENDER_PASS_ATTACHMENT_BEGIN_INFO);
-   if (!attach_begin)
-      assert(pass->attachment_count == framebuffer->attachment_count);
-
 /* Invalid-usage mismatches between the framebuffer's image views and the
  * render pass reach this code from untrusted sources (a virtio-gpu venus
  * guest replays app command streams through the common runtime), so a
@@ -2690,13 +2667,57 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
       }                                                                       \
    } while (0)
 
+   const VkRenderPassAttachmentBeginInfo *attach_begin =
+      vk_find_struct_const(pRenderPassBeginInfo,
+                           RENDER_PASS_ATTACHMENT_BEGIN_INFO);
+
    const VkImageView *image_views;
+   uint32_t view_count;
    if (attach_begin && attach_begin->attachmentCount != 0) {
-      assert(attach_begin->attachmentCount == pass->attachment_count);
       image_views = attach_begin->pAttachments;
+      view_count = attach_begin->attachmentCount;
    } else {
-      assert(framebuffer->attachment_count >= pass->attachment_count);
       image_views = framebuffer->attachments;
+      view_count = framebuffer->attachment_count;
+   }
+
+   /* Valid usage requires exactly one image view per render pass
+    * attachment, whether they come from the framebuffer or, for an imageless
+    * framebuffer, from VkRenderPassAttachmentBeginInfo.  Extra views are
+    * never read, but with too few every later access to the missing ones --
+    * the attachment state below, begin_subpass() and the final layout
+    * transitions in vkCmdEndRenderPass2() -- would read past the end of the
+    * array.  Refuse the begin instead: leave the command buffer outside a
+    * render pass, so vkCmdNextSubpass2() and vkCmdEndRenderPass2() do
+    * nothing, and fail vkEndCommandBuffer().
+    */
+   if (unlikely(view_count != pass->attachment_count)) {
+      VU_VIOLATION_LOGW("%u attachment image views supplied for a render "
+                        "pass with %u attachments%s",
+                        view_count, pass->attachment_count,
+                        view_count < pass->attachment_count ?
+                        "; render pass not begun" : "");
+      if (view_count < pass->attachment_count) {
+         vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
+         return;
+      }
+   }
+
+   assert(cmd_buffer->render_pass == NULL);
+   cmd_buffer->render_pass = pass;
+   cmd_buffer->subpass_idx = 0;
+
+   assert(cmd_buffer->framebuffer == NULL);
+   cmd_buffer->framebuffer = framebuffer;
+
+   cmd_buffer->render_area = pRenderPassBeginInfo->renderArea;
+
+   assert(cmd_buffer->attachments == NULL);
+   if (pass->attachment_count > ARRAY_SIZE(cmd_buffer->_attachments)) {
+      cmd_buffer->attachments = malloc(pass->attachment_count *
+                                       sizeof(*cmd_buffer->attachments));
+   } else {
+      cmd_buffer->attachments = cmd_buffer->_attachments;
    }
 
    for (uint32_t a = 0; a < pass->attachment_count; ++a) {
@@ -2855,6 +2876,10 @@ vk_common_CmdNextSubpass2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(vk_command_buffer, cmd_buffer, commandBuffer);
 
+   /* The render pass begin was refused (or never recorded) */
+   if (unlikely(cmd_buffer->render_pass == NULL))
+      return;
+
    end_subpass(cmd_buffer, pSubpassEndInfo);
    cmd_buffer->subpass_idx++;
    begin_subpass(cmd_buffer, pSubpassBeginInfo);
@@ -2868,6 +2893,10 @@ vk_common_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
    const struct vk_render_pass *pass = cmd_buffer->render_pass;
    struct vk_device_dispatch_table *disp =
       &cmd_buffer->base.device->dispatch_table;
+
+   /* The render pass begin was refused (or never recorded) */
+   if (unlikely(pass == NULL))
+      return;
 
    end_subpass(cmd_buffer, pSubpassEndInfo);
 
