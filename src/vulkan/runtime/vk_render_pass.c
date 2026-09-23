@@ -2662,6 +2662,18 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
       }                                                                       \
    } while (0)
 
+   /* Both handles are required, and a venus guest can still send
+    * VK_NULL_HANDLE for either.  The framebuffer is needed even when the
+    * views come from VkRenderPassAttachmentBeginInfo: begin_subpass() and
+    * the layout transitions read its layer count.
+    */
+   if (unlikely(pass == NULL || framebuffer == NULL)) {
+      VU_VIOLATION_LOGW("%s is VK_NULL_HANDLE; render pass not begun",
+                        pass == NULL ? "renderPass" : "framebuffer");
+      vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
+      return;
+   }
+
    const VkRenderPassAttachmentBeginInfo *attach_begin =
       vk_find_struct_const(pRenderPassBeginInfo,
                            RENDER_PASS_ATTACHMENT_BEGIN_INFO);
@@ -2693,6 +2705,19 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                         view_count < pass->attachment_count ?
                         "; render pass not begun" : "");
       if (view_count < pass->attachment_count) {
+         vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
+         return;
+      }
+   }
+
+   /* Every view the pass uses must be a real one: the attachment state
+    * below dereferences each of them.  A framebuffer's views are not
+    * checked at creation, so this covers both sources.
+    */
+   for (uint32_t a = 0; a < pass->attachment_count; ++a) {
+      if (unlikely(image_views[a] == VK_NULL_HANDLE)) {
+         VU_VIOLATION_LOGW("attachment %u has a VK_NULL_HANDLE image view; "
+                           "render pass not begun", a);
          vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
          return;
       }
