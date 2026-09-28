@@ -3952,6 +3952,56 @@ zink_limina_rp_note_fb(struct zink_context *ctx, bool begin, const char *end)
    }
 }
 
+/* LIMINA: make what a render pass wrote to its attachments readable by shaders as soon as the pass
+ * ends, while no pass is open.
+ *
+ * Otherwise the barrier waits for the first bind that samples the texture, and if that bind lands
+ * while a later pass is open -- a texture rendered by one pass, sampled by a draw in the next --
+ * the barrier cannot sit inside that pass and ends it, and the draws after it resume on the same
+ * attachments in a new pass. KosmicKrisp begins a Metal command buffer per pass, so each such
+ * split costs one. Measured on wildbrush.vercel.app: 30% of all passes were these resumes, 79% of
+ * them after a texture bind's barrier (spikes/wildbrush-stall/RESULTS.md in limina).
+ *
+ * Issued through the normal barrier path, the access it records (SHADER_READ at the shader
+ * stages) is what lets the later bind find nothing to do. It costs one barrier per written
+ * attachment per pass, sampled or not; a barrier between passes is cheap next to a split pass.
+ *
+ * Only under general_layout: there the attachment layout already is the sampled layout, so this
+ * is a memory dependency and nothing else. With per-use layouts it would be a layout transition
+ * the next pass on the same attachment would have to undo. LIMINA_ZINK_NO_EAGER_RP_BARRIER=1 turns
+ * it off, for A/B. */
+static bool
+zink_limina_eager_rp_barrier_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = !debug_get_bool_option("LIMINA_ZINK_NO_EAGER_RP_BARRIER", false);
+   return enabled;
+}
+
+static void
+zink_limina_eager_rp_barrier(struct zink_context *ctx)
+{
+   struct zink_screen *screen = zink_screen(ctx->base.screen);
+   if (!screen->driver_workarounds.general_layout || ctx->blitting || ctx->unordered_blitting ||
+       !zink_limina_eager_rp_barrier_enabled())
+      return;
+   for (unsigned i = 0; i <= ctx->fb_state.nr_cbufs; i++) {
+      struct pipe_resource *pres =
+         i < ctx->fb_state.nr_cbufs ? ctx->fb_state.cbufs[i].texture : ctx->fb_state.zsbuf.texture;
+      if (!pres)
+         continue;
+      struct zink_resource *res = zink_resource(pres);
+      if (zink_is_swapchain(res) ||
+          !(res->obj->access & (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)))
+         continue;
+      screen->image_barrier(ctx, res, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                            res->gfx_barrier | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+   }
+}
+
 void
 zink_batch_no_rp_safe_at(struct zink_context *ctx, const char *site)
 {
@@ -4013,6 +4063,7 @@ zink_batch_no_rp_safe_at(struct zink_context *ctx, const char *site)
       }
    }
    ctx->rp_draw = false;
+   zink_limina_eager_rp_barrier(ctx);
 }
 
 void
