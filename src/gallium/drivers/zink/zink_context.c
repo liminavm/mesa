@@ -51,6 +51,7 @@
 #include "util/u_thread.h"
 #include "util/perf/u_trace.h"
 #include "util/u_cpu_detect.h"
+#include "util/os_time.h"
 #include "util/thread_sched.h"
 #include "util/strndup.h"
 #include "nir.h"
@@ -3543,6 +3544,7 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
    ctx->dynamic_fb.info.pNext = ctx->transient_msrtss && has_msrtss ? &msrtss : NULL;
 
    VKCTX(CmdBeginRendering)(ctx->bs->cmdbuf, &ctx->dynamic_fb.info);
+   zink_limina_rp_count(ctx, ZINK_LIMINA_RP_BEGIN, ZINK_LIMINA_SITE);
    ctx->in_rp = true;
    ctx->can_promote_depth_op = ctx->fb_state.zsbuf.texture && ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
    if (formats_changed) {
@@ -3657,11 +3659,254 @@ zink_batch_rp(struct zink_context *ctx)
    }
 }
 
+/* LIMINA: LIMINA_ZINK_RP_STATS=1 counts, per context, where render passes begin and end and where
+ * batches are submitted, by call site, and prints the counts every few seconds.
+ *
+ * The question it answers is what multiplies a guest submit into Metal command buffers: on
+ * KosmicKrisp every render pass is its own command buffer, so a pass split by a context switch's
+ * flush, by a fence, by a transfer or by the guest's own framebuffer change costs one each. The
+ * submit sites separate `zink_flush` with a fence (glFenceSync, a guest fence) from one without
+ * (the flush Mesa's _mesa_make_current does on the context being released, or a glFlush).
+ * Per context rather than global because those flushes land on the OUTGOING context. */
+#define ZINK_LIMINA_RP_SITES 48
+#define ZINK_LIMINA_RP_REPORT_NS (5ull * 1000000000ull)
+
+struct zink_limina_rp_site {
+   const char *site;
+   uint64_t n;
+   uint64_t reported;
+};
+
+struct zink_limina_rp_stats {
+   uint64_t since;
+   uint64_t lost;
+   struct zink_limina_rp_site sites[3][ZINK_LIMINA_RP_SITES];
+   /* The entry points wrapped to name themselves as the cause of the passes they end: a copy's
+    * barrier and its command buffer both end the pass inside helpers that every copy shares, so
+    * the call site alone cannot say whether a buffer upload or a texture upload did it. */
+   struct pipe_context wrapped;
+};
+
+/* The wrapped entry point this THREAD is inside, charged for any pass it ends. Per thread and not
+ * per context: threaded_context runs an unsynchronized buffer_map on the application thread while
+ * the driver thread goes on executing queued calls for the same context, and a per-context tag
+ * charged the driver thread's framebuffer changes to the map. */
+static __thread const char *zink_limina_rp_cause;
+
+static const char *const zink_limina_rp_event_name[] = {
+   [ZINK_LIMINA_RP_BEGIN] = "begin",
+   [ZINK_LIMINA_RP_END] = "end",
+   [ZINK_LIMINA_RP_SUBMIT] = "submit",
+};
+
+static void
+zink_limina_rp_stats_init(struct zink_context *ctx)
+{
+   if (!debug_get_bool_option("LIMINA_ZINK_RP_STATS", false))
+      return;
+   ctx->limina_rp = rzalloc(ctx, struct zink_limina_rp_stats);
+   if (ctx->limina_rp)
+      ctx->limina_rp->since = os_time_get_nano();
+}
+
+#define ZINK_LIMINA_RP_WRAP(name, ret, params, args)                                              \
+   static ret                                                                                  \
+   zink_limina_rp_##name params                                                                \
+   {                                                                                           \
+      struct zink_context *ctx = zink_context(pctx);                                            \
+      const char *outer = zink_limina_rp_cause;                                                 \
+      if (!outer)                                                                               \
+         zink_limina_rp_cause = "pipe " #name;                                                 \
+      ret r = ctx->limina_rp->wrapped.name args;                                                \
+      zink_limina_rp_cause = outer;                                                             \
+      return r;                                                                                 \
+   }
+#define ZINK_LIMINA_RP_WRAP_VOID(name, params, args)                                               \
+   static void                                                                                 \
+   zink_limina_rp_##name params                                                                \
+   {                                                                                           \
+      struct zink_context *ctx = zink_context(pctx);                                            \
+      const char *outer = zink_limina_rp_cause;                                                 \
+      if (!outer)                                                                               \
+         zink_limina_rp_cause = "pipe " #name;                                                 \
+      ctx->limina_rp->wrapped.name args;                                                        \
+      zink_limina_rp_cause = outer;                                                             \
+   }
+
+ZINK_LIMINA_RP_WRAP_VOID(buffer_subdata,
+                         (struct pipe_context *pctx, struct pipe_resource *res, unsigned usage,
+                          unsigned offset, unsigned size, const void *data),
+                         (pctx, res, usage, offset, size, data))
+ZINK_LIMINA_RP_WRAP_VOID(texture_subdata,
+                         (struct pipe_context *pctx, struct pipe_resource *res, unsigned level,
+                          unsigned usage, const struct pipe_box *box, const void *data,
+                          unsigned stride, uintptr_t layer_stride),
+                         (pctx, res, level, usage, box, data, stride, layer_stride))
+ZINK_LIMINA_RP_WRAP(buffer_map, void *,
+                    (struct pipe_context *pctx, struct pipe_resource *res, unsigned level,
+                     unsigned usage, const struct pipe_box *box, struct pipe_transfer **out),
+                    (pctx, res, level, usage, box, out))
+ZINK_LIMINA_RP_WRAP(texture_map, void *,
+                    (struct pipe_context *pctx, struct pipe_resource *res, unsigned level,
+                     unsigned usage, const struct pipe_box *box, struct pipe_transfer **out),
+                    (pctx, res, level, usage, box, out))
+ZINK_LIMINA_RP_WRAP_VOID(buffer_unmap, (struct pipe_context *pctx, struct pipe_transfer *t),
+                         (pctx, t))
+ZINK_LIMINA_RP_WRAP_VOID(texture_unmap, (struct pipe_context *pctx, struct pipe_transfer *t),
+                         (pctx, t))
+ZINK_LIMINA_RP_WRAP_VOID(transfer_flush_region,
+                         (struct pipe_context *pctx, struct pipe_transfer *t,
+                          const struct pipe_box *box),
+                         (pctx, t, box))
+ZINK_LIMINA_RP_WRAP_VOID(resource_copy_region,
+                         (struct pipe_context *pctx, struct pipe_resource *dst, unsigned dst_level,
+                          unsigned dstx, unsigned dsty, unsigned dstz, struct pipe_resource *src,
+                          unsigned src_level, const struct pipe_box *src_box),
+                         (pctx, dst, dst_level, dstx, dsty, dstz, src, src_level, src_box))
+ZINK_LIMINA_RP_WRAP_VOID(blit, (struct pipe_context *pctx, const struct pipe_blit_info *info),
+                         (pctx, info))
+ZINK_LIMINA_RP_WRAP_VOID(clear_texture,
+                         (struct pipe_context *pctx, struct pipe_resource *res, unsigned level,
+                          const struct pipe_box *box, const void *data),
+                         (pctx, res, level, box, data))
+ZINK_LIMINA_RP_WRAP_VOID(set_sampler_views,
+                         (struct pipe_context *pctx, mesa_shader_stage shader, unsigned start,
+                          unsigned num, unsigned unbind, struct pipe_sampler_view **views),
+                         (pctx, shader, start, num, unbind, views))
+ZINK_LIMINA_RP_WRAP_VOID(set_shader_images,
+                         (struct pipe_context *pctx, mesa_shader_stage shader, unsigned start,
+                          unsigned count, unsigned unbind, const struct pipe_image_view *images),
+                         (pctx, shader, start, count, unbind, images))
+ZINK_LIMINA_RP_WRAP_VOID(set_vertex_buffers,
+                         (struct pipe_context *pctx, unsigned count,
+                          const struct pipe_vertex_buffer *buffers),
+                         (pctx, count, buffers))
+ZINK_LIMINA_RP_WRAP_VOID(set_constant_buffer,
+                         (struct pipe_context *pctx, mesa_shader_stage shader, uint index,
+                          const struct pipe_constant_buffer *buf),
+                         (pctx, shader, index, buf))
+ZINK_LIMINA_RP_WRAP_VOID(set_shader_buffers,
+                         (struct pipe_context *pctx, mesa_shader_stage shader, unsigned start,
+                          unsigned count, const struct pipe_shader_buffer *buffers,
+                          unsigned writable),
+                         (pctx, shader, start, count, buffers, writable))
+ZINK_LIMINA_RP_WRAP_VOID(clear,
+                         (struct pipe_context *pctx, unsigned buffers, uint32_t color_mask,
+                          uint8_t stencil_mask, const struct pipe_scissor_state *scissor,
+                          const union pipe_color_union *color, double depth, unsigned stencil),
+                         (pctx, buffers, color_mask, stencil_mask, scissor, color, depth, stencil))
+ZINK_LIMINA_RP_WRAP_VOID(texture_barrier, (struct pipe_context *pctx, unsigned flags),
+                         (pctx, flags))
+ZINK_LIMINA_RP_WRAP_VOID(memory_barrier, (struct pipe_context *pctx, unsigned flags),
+                         (pctx, flags))
+ZINK_LIMINA_RP_WRAP_VOID(flush_resource,
+                         (struct pipe_context *pctx, struct pipe_resource *res), (pctx, res))
+ZINK_LIMINA_RP_WRAP_VOID(clear_buffer,
+                         (struct pipe_context *pctx, struct pipe_resource *res, unsigned offset,
+                          unsigned size, const void *value, int value_size),
+                         (pctx, res, offset, size, value, value_size))
+
+static void
+zink_limina_rp_wrap(struct zink_context *ctx)
+{
+   if (!ctx->limina_rp)
+      return;
+   ctx->limina_rp->wrapped = ctx->base;
+#define WRAP(name) ctx->base.name = zink_limina_rp_##name
+   WRAP(buffer_subdata);
+   WRAP(texture_subdata);
+   WRAP(buffer_map);
+   WRAP(texture_map);
+   WRAP(buffer_unmap);
+   WRAP(texture_unmap);
+   WRAP(transfer_flush_region);
+   WRAP(resource_copy_region);
+   WRAP(blit);
+   WRAP(clear_texture);
+   WRAP(clear_buffer);
+   WRAP(set_sampler_views);
+   WRAP(set_shader_images);
+   WRAP(set_vertex_buffers);
+   WRAP(set_constant_buffer);
+   WRAP(set_shader_buffers);
+   WRAP(clear);
+   WRAP(texture_barrier);
+   WRAP(memory_barrier);
+   WRAP(flush_resource);
+#undef WRAP
+}
+
+static void
+zink_limina_rp_report(struct zink_context *ctx, struct zink_limina_rp_stats *st, uint64_t secs_ns)
+{
+   uint64_t totals[3] = {0};
+   for (unsigned w = 0; w < 3; w++) {
+      for (unsigned i = 0; i < ZINK_LIMINA_RP_SITES; i++) {
+         struct zink_limina_rp_site *slot = &st->sites[w][i];
+         if (slot->site)
+            totals[w] += p_atomic_read(&slot->n) - slot->reported;
+      }
+   }
+   fprintf(stderr,
+           "[LIMINA-ZINK-RP] ctx %p over %.1f s: %" PRIu64 " begins  %" PRIu64 " ends  %" PRIu64
+           " submits  (%.2f passes/submit, %" PRIu64 " sites lost)\n",
+           (void *)ctx, secs_ns / 1e9, totals[ZINK_LIMINA_RP_BEGIN], totals[ZINK_LIMINA_RP_END],
+           totals[ZINK_LIMINA_RP_SUBMIT],
+           totals[ZINK_LIMINA_RP_SUBMIT] ?
+              (double)totals[ZINK_LIMINA_RP_BEGIN] / totals[ZINK_LIMINA_RP_SUBMIT] : 0.0,
+           p_atomic_read(&st->lost));
+   for (unsigned w = 0; w < 3; w++) {
+      for (unsigned i = 0; i < ZINK_LIMINA_RP_SITES; i++) {
+         struct zink_limina_rp_site *slot = &st->sites[w][i];
+         if (!slot->site)
+            continue;
+         uint64_t n = p_atomic_read(&slot->n);
+         uint64_t delta = n - slot->reported;
+         slot->reported = n;
+         if (!delta)
+            continue;
+         const char *base = strrchr(slot->site, '/');
+         fprintf(stderr, "[LIMINA-ZINK-RP]   %-6s %8" PRIu64 "  %s\n",
+                 zink_limina_rp_event_name[w], delta, base ? base + 1 : slot->site);
+      }
+   }
+}
+
 void
-zink_batch_no_rp_safe(struct zink_context *ctx)
+zink_limina_rp_count(struct zink_context *ctx, enum zink_limina_rp_event what, const char *site)
+{
+   struct zink_limina_rp_stats *st = ctx->limina_rp;
+   if (!st)
+      return;
+
+   struct zink_limina_rp_site *table = st->sites[what];
+   unsigned i;
+   for (i = 0; i < ZINK_LIMINA_RP_SITES; i++) {
+      const char *cur = p_atomic_read(&table[i].site);
+      if (cur == NULL)
+         cur = p_atomic_cmpxchg(&table[i].site, NULL, site);
+      if (cur == NULL || cur == site)
+         break;
+   }
+   if (i == ZINK_LIMINA_RP_SITES)
+      p_atomic_inc(&st->lost);
+   else
+      p_atomic_inc(&table[i].n);
+
+   uint64_t now = os_time_get_nano();
+   uint64_t since = p_atomic_read(&st->since);
+   if (now - since >= ZINK_LIMINA_RP_REPORT_NS &&
+       p_atomic_cmpxchg(&st->since, since, now) == since)
+      zink_limina_rp_report(ctx, st, now - since);
+}
+
+void
+zink_batch_no_rp_safe_at(struct zink_context *ctx, const char *site)
 {
    if (!ctx->in_rp)
       return;
+   zink_limina_rp_count(ctx, ZINK_LIMINA_RP_END,
+                        zink_limina_rp_cause ? zink_limina_rp_cause : site);
    if (ctx->render_condition.query)
       zink_stop_conditional_render(ctx);
    /* suspend all queries that were started in a renderpass
@@ -3718,13 +3963,13 @@ zink_batch_no_rp_safe(struct zink_context *ctx)
 }
 
 void
-zink_batch_no_rp(struct zink_context *ctx)
+zink_batch_no_rp_at(struct zink_context *ctx, const char *site)
 {
    if (!ctx->in_rp)
       return;
    if (ctx->track_renderpasses && !ctx->blitting)
       tc_renderpass_info_reset(&ctx->dynamic_fb.tc_info);
-   zink_batch_no_rp_safe(ctx);
+   zink_batch_no_rp_safe_at(ctx, site);
 }
 
 static void
@@ -4043,13 +4288,14 @@ zink_reset_ds3_states(struct zink_context *ctx)
 }
 
 static void
-flush_batch(struct zink_context *ctx, bool sync)
+flush_batch_at(struct zink_context *ctx, bool sync, const char *site)
 {
    assert(!ctx->unordered_blitting);
    if (ctx->clears_enabled)
       /* start rp to do all the clears */
       zink_flush_clears(ctx);
-   zink_batch_no_rp_safe(ctx);
+   zink_batch_no_rp_safe_at(ctx, site);
+   zink_limina_rp_count(ctx, ZINK_LIMINA_RP_SUBMIT, site);
 
    util_queue_fence_wait(&ctx->unsync_fence);
    util_queue_fence_reset(&ctx->flush_fence);
@@ -4094,6 +4340,7 @@ flush_batch(struct zink_context *ctx, bool sync)
    }
    util_queue_fence_signal(&ctx->flush_fence);
 }
+#define flush_batch(ctx, sync) flush_batch_at(ctx, sync, ZINK_LIMINA_SITE)
 
 void
 zink_flush_queue(struct zink_context *ctx)
@@ -4536,7 +4783,8 @@ zink_flush(struct pipe_context *pctx,
       if (deferred && !(flags & PIPE_FLUSH_FENCE_FD) && pfence)
          deferred_fence = true;
       else
-         flush_batch(ctx, false);
+         flush_batch_at(ctx, false, pfence ? "zink_flush with a fence"
+                                           : "zink_flush without a fence");
    }
 
    if (pfence) {
@@ -5871,6 +6119,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    ctx->base.priv = priv;
 
    ctx->base.destroy = zink_context_destroy;
+   zink_limina_rp_stats_init(ctx);
    ctx->base.set_debug_callback = zink_set_debug_callback;
    ctx->base.get_device_reset_status = zink_get_device_reset_status;
    ctx->base.set_device_reset_callback = zink_set_device_reset_callback;
@@ -6193,6 +6442,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 
    if (is_compute_only || zink_debug & ZINK_DEBUG_NOREORDER)
       ctx->no_reorder = true;
+   zink_limina_rp_wrap(ctx);
 
    if (!(flags & PIPE_CONTEXT_PREFER_THREADED) || flags & PIPE_CONTEXT_COMPUTE_ONLY) {
       return &ctx->base;

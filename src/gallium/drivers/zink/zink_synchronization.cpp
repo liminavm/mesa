@@ -139,7 +139,8 @@ check_unordered_exec(struct zink_context *ctx, struct zink_resource *res, bool i
 }
 
 VkCommandBuffer
-zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst)
+zink_get_cmdbuf_at(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst,
+                   const char *site)
 {
    bool unordered_exec = !ctx->no_reorder;
 
@@ -152,7 +153,7 @@ zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink
       dst->obj->unordered_write = unordered_exec;
 
    if (!unordered_exec || ctx->unordered_blitting)
-      zink_batch_no_rp(ctx);
+      zink_batch_no_rp_at(ctx, site);
 
    if (unordered_exec) {
       ctx->bs->has_reordered_work = true;
