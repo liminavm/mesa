@@ -1902,6 +1902,8 @@ struct zink_context {
    struct {
       uint64_t render_passes;
    } hud;
+   /* LIMINA: what ends this context's render passes (LIMINA_ZINK_RP_STATS=1), NULL when off. */
+   struct zink_limina_rp_stats *limina_rp;
 
    struct pipe_resource *dummy_xfb_buffer;
 
