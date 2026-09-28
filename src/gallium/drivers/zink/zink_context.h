@@ -135,7 +135,10 @@ zink_reset_ds3_states(struct zink_context *ctx);
 bool
 zink_check_batch_completion(struct zink_context *ctx, uint64_t batch_id);
 VkCommandBuffer
-zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst);
+zink_get_cmdbuf_at(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst,
+                   const char *site);
+/* LIMINA: the pass this ends is charged to the caller, for LIMINA_ZINK_RP_STATS. */
+#define zink_get_cmdbuf(ctx, src, dst) zink_get_cmdbuf_at(ctx, src, dst, ZINK_LIMINA_SITE)
 unsigned
 zink_update_rendering_info(struct zink_context *ctx);
 void
@@ -179,9 +182,24 @@ void
 zink_batch_rp(struct zink_context *ctx);
 
 void
-zink_batch_no_rp(struct zink_context *ctx);
+zink_batch_no_rp_at(struct zink_context *ctx, const char *site);
 void
-zink_batch_no_rp_safe(struct zink_context *ctx);
+zink_batch_no_rp_safe_at(struct zink_context *ctx, const char *site);
+/* LIMINA: every render-pass end names its call site, for LIMINA_ZINK_RP_STATS. KosmicKrisp mints
+ * one Metal command buffer per render pass, so what ends a pass is what multiplies the command
+ * buffers a guest submit costs. */
+#define ZINK_LIMINA_STR(x) #x
+#define ZINK_LIMINA_XSTR(x) ZINK_LIMINA_STR(x)
+#define zink_batch_no_rp(ctx) zink_batch_no_rp_at(ctx, ZINK_LIMINA_SITE)
+#define zink_batch_no_rp_safe(ctx) zink_batch_no_rp_safe_at(ctx, ZINK_LIMINA_SITE)
+enum zink_limina_rp_event {
+   ZINK_LIMINA_RP_BEGIN,
+   ZINK_LIMINA_RP_END,
+   ZINK_LIMINA_RP_SUBMIT,
+};
+void
+zink_limina_rp_count(struct zink_context *ctx, enum zink_limina_rp_event what, const char *site);
+#define ZINK_LIMINA_SITE __FILE__ ":" ZINK_LIMINA_XSTR(__LINE__)
 
 static inline VkPipelineStageFlags
 zink_pipeline_flags_from_pipe_stage(mesa_shader_stage pstage)
