@@ -3332,6 +3332,11 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
       return 0;
    ctx->rp_changed = false;
 
+   /* LIMINA: what changed, for LIMINA_ZINK_RP_STATS to name a restart on the same attachments. */
+   VkPipelineRenderingCreateInfo limina_before = ctx->gfx_pipeline_state.rendering_info;
+   VkFormat limina_formats_before[PIPE_MAX_COLOR_BUFS];
+   memcpy(limina_formats_before, ctx->gfx_pipeline_state.rendering_formats, sizeof(limina_formats_before));
+
    /* update pipeline info id for compatibility VUs */
    unsigned rp_state = zink_update_rendering_info(ctx);
    /* validate zs VUs: attachment must be null or format must be valid */
@@ -3342,7 +3347,23 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
    if (!rp_changed && ctx->in_rp)
       return 0;
 
-   zink_batch_no_rp(ctx);
+   const VkPipelineRenderingCreateInfo *limina_after = &ctx->gfx_pipeline_state.rendering_info;
+   const char *limina_why = "rendering info: other";
+   if ((limina_before.depthAttachmentFormat != VK_FORMAT_UNDEFINED) !=
+          (limina_after->depthAttachmentFormat != VK_FORMAT_UNDEFINED) ||
+       (limina_before.stencilAttachmentFormat != VK_FORMAT_UNDEFINED) !=
+          (limina_after->stencilAttachmentFormat != VK_FORMAT_UNDEFINED))
+      limina_why = zink_is_zsbuf_used(ctx) ? "rendering info: depth/stencil now used"
+                                           : "rendering info: depth/stencil now unused";
+   else if (limina_before.depthAttachmentFormat != limina_after->depthAttachmentFormat ||
+            limina_before.stencilAttachmentFormat != limina_after->stencilAttachmentFormat)
+      limina_why = "rendering info: depth/stencil format";
+   else if (memcmp(limina_formats_before, ctx->gfx_pipeline_state.rendering_formats,
+                   sizeof(limina_formats_before)))
+      limina_why = "rendering info: color format";
+   else if (limina_before.viewMask != limina_after->viewMask)
+      limina_why = "rendering info: view mask";
+   zink_batch_no_rp_at(ctx, limina_why);
    for (int i = 0; i < ctx->fb_state.nr_cbufs; i++) {
       VkImageView iv = VK_NULL_HANDLE;
       struct zink_resource *res = zink_resource(ctx->fb_state.cbufs[i].texture);
