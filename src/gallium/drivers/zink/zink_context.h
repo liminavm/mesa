@@ -196,7 +196,21 @@ enum zink_limina_rp_event {
    ZINK_LIMINA_RP_BEGIN,
    ZINK_LIMINA_RP_END,
    ZINK_LIMINA_RP_SUBMIT,
+   /* a barrier that ended the open pass, by what it guarded */
+   ZINK_LIMINA_RP_SPLIT,
+   /* a pass begun on the same attachments as the pass before it, by what ended that one */
+   ZINK_LIMINA_RP_RESUME,
 };
+enum zink_limina_rp_split {
+   ZINK_LIMINA_SPLIT_WRITE,
+   ZINK_LIMINA_SPLIT_READ_AFTER_WRITE,
+   ZINK_LIMINA_SPLIT_READ_WIDENS_AFTER_WRITE,
+   ZINK_LIMINA_SPLIT_READ_AFTER_READ,
+   ZINK_LIMINA_SPLIT_LAYOUT,
+   ZINK_LIMINA_SPLIT_COUNT,
+};
+void
+zink_limina_rp_split(struct zink_context *ctx, enum zink_limina_rp_split what, bool attachment);
 void
 zink_limina_rp_count(struct zink_context *ctx, enum zink_limina_rp_event what, const char *site);
 #define ZINK_LIMINA_SITE __FILE__ ":" ZINK_LIMINA_XSTR(__LINE__)
