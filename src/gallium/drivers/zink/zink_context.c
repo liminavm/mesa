@@ -52,6 +52,9 @@
 #include "util/perf/u_trace.h"
 #include "util/u_cpu_detect.h"
 #include "util/os_time.h"
+
+static void
+zink_limina_rp_note_fb(struct zink_context *ctx, bool begin, const char *end);
 #include "util/thread_sched.h"
 #include "util/strndup.h"
 #include "nir.h"
@@ -3545,6 +3548,7 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
 
    VKCTX(CmdBeginRendering)(ctx->bs->cmdbuf, &ctx->dynamic_fb.info);
    zink_limina_rp_count(ctx, ZINK_LIMINA_RP_BEGIN, ZINK_LIMINA_SITE);
+   zink_limina_rp_note_fb(ctx, true, NULL);
    ctx->in_rp = true;
    ctx->can_promote_depth_op = ctx->fb_state.zsbuf.texture && ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
    if (formats_changed) {
@@ -3680,7 +3684,12 @@ struct zink_limina_rp_site {
 struct zink_limina_rp_stats {
    uint64_t since;
    uint64_t lost;
-   struct zink_limina_rp_site sites[3][ZINK_LIMINA_RP_SITES];
+   struct zink_limina_rp_site sites[5][ZINK_LIMINA_RP_SITES];
+   /* The attachments of the last pass that ended, and what ended it: a pass that begins on the
+    * same attachments is one the end split in two. */
+   struct pipe_resource *last_cbufs[PIPE_MAX_COLOR_BUFS];
+   struct pipe_resource *last_zs;
+   const char *last_end;
    /* The entry points wrapped to name themselves as the cause of the passes they end: a copy's
     * barrier and its command buffer both end the pass inside helpers that every copy shares, so
     * the call site alone cannot say whether a buffer upload or a texture upload did it. */
@@ -3697,6 +3706,8 @@ static const char *const zink_limina_rp_event_name[] = {
    [ZINK_LIMINA_RP_BEGIN] = "begin",
    [ZINK_LIMINA_RP_END] = "end",
    [ZINK_LIMINA_RP_SUBMIT] = "submit",
+   [ZINK_LIMINA_RP_SPLIT] = "split",
+   [ZINK_LIMINA_RP_RESUME] = "resume",
 };
 
 static void
@@ -3839,8 +3850,8 @@ zink_limina_rp_wrap(struct zink_context *ctx)
 static void
 zink_limina_rp_report(struct zink_context *ctx, struct zink_limina_rp_stats *st, uint64_t secs_ns)
 {
-   uint64_t totals[3] = {0};
-   for (unsigned w = 0; w < 3; w++) {
+   uint64_t totals[5] = {0};
+   for (unsigned w = 0; w < 5; w++) {
       for (unsigned i = 0; i < ZINK_LIMINA_RP_SITES; i++) {
          struct zink_limina_rp_site *slot = &st->sites[w][i];
          if (slot->site)
@@ -3855,7 +3866,7 @@ zink_limina_rp_report(struct zink_context *ctx, struct zink_limina_rp_stats *st,
            totals[ZINK_LIMINA_RP_SUBMIT] ?
               (double)totals[ZINK_LIMINA_RP_BEGIN] / totals[ZINK_LIMINA_RP_SUBMIT] : 0.0,
            p_atomic_read(&st->lost));
-   for (unsigned w = 0; w < 3; w++) {
+   for (unsigned w = 0; w < 5; w++) {
       for (unsigned i = 0; i < ZINK_LIMINA_RP_SITES; i++) {
          struct zink_limina_rp_site *slot = &st->sites[w][i];
          if (!slot->site)
@@ -3900,6 +3911,47 @@ zink_limina_rp_count(struct zink_context *ctx, enum zink_limina_rp_event what, c
       zink_limina_rp_report(ctx, st, now - since);
 }
 
+/* What a pass-ending barrier guarded, by whether a texture bind issued it and whether the
+ * resource is bound as an attachment of the current framebuffer. The strings are the keys. */
+void
+zink_limina_rp_split(struct zink_context *ctx, enum zink_limina_rp_split what, bool attachment)
+{
+   static const char *const names[2][2][ZINK_LIMINA_SPLIT_COUNT] = {
+#define CLASSES(prefix)                                                                            \
+   {prefix "write", prefix "read after write", prefix "read, new access after an earlier write",   \
+    prefix "read after read", prefix "layout change"}
+      {CLASSES("draw/other: "), CLASSES("draw/other, attachment: ")},
+      {CLASSES("texture bind: "), CLASSES("texture bind, attachment: ")},
+#undef CLASSES
+   };
+   bool bind = zink_limina_rp_cause && !strcmp(zink_limina_rp_cause, "pipe set_sampler_views");
+   zink_limina_rp_count(ctx, ZINK_LIMINA_RP_SPLIT, names[bind][attachment][what]);
+}
+
+/* Remember the attachments of a pass that ends; on the next begin, count it as resumed if the
+ * attachments are the same. Both run on whichever thread owns the context's command buffer. */
+static void
+zink_limina_rp_note_fb(struct zink_context *ctx, bool begin, const char *end)
+{
+   struct zink_limina_rp_stats *st = ctx->limina_rp;
+   if (!st)
+      return;
+   bool same = true;
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+      struct pipe_resource *c = i < ctx->fb_state.nr_cbufs ? ctx->fb_state.cbufs[i].texture : NULL;
+      same &= st->last_cbufs[i] == c;
+      if (!begin)
+         st->last_cbufs[i] = c;
+   }
+   same &= st->last_zs == ctx->fb_state.zsbuf.texture;
+   if (!begin) {
+      st->last_zs = ctx->fb_state.zsbuf.texture;
+      st->last_end = end;
+   } else if (same && st->last_end) {
+      zink_limina_rp_count(ctx, ZINK_LIMINA_RP_RESUME, st->last_end);
+   }
+}
+
 void
 zink_batch_no_rp_safe_at(struct zink_context *ctx, const char *site)
 {
@@ -3907,6 +3959,7 @@ zink_batch_no_rp_safe_at(struct zink_context *ctx, const char *site)
       return;
    zink_limina_rp_count(ctx, ZINK_LIMINA_RP_END,
                         zink_limina_rp_cause ? zink_limina_rp_cause : site);
+   zink_limina_rp_note_fb(ctx, false, zink_limina_rp_cause ? zink_limina_rp_cause : site);
    if (ctx->render_condition.query)
       zink_stop_conditional_render(ctx);
    /* suspend all queries that were started in a renderpass
