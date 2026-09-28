@@ -521,6 +521,8 @@ struct kk_limina_counts {
    uint64_t unroll_trig_promote;
    uint64_t unroll_trig_robust;
    uint64_t unroll_trig_restart;
+   /* Fan draws served by the static fan index buffer instead of a GPU unroll. */
+   uint64_t fan_static;
    /* Passes that begin on a texture already rendered to, without loading it. Whatever was there
     * is discarded or cleared, which is what losing a card's early rows would look like. */
    uint64_t reload_hazard;

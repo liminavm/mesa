@@ -883,11 +883,13 @@ kk_limina_counts_tick(const char *why)
            (unsigned long long)kk_limina_counts.copy_image_to_image,
            (unsigned long long)kk_limina_counts.copy_buffer_to_buffer);
    fprintf(stderr,
-           "[LIMINA]   unroll triggers: fan=%llu promote=%llu robust=%llu restart=%llu\n",
+           "[LIMINA]   unroll triggers: fan=%llu promote=%llu robust=%llu restart=%llu "
+           "| fan static=%llu\n",
            (unsigned long long)kk_limina_counts.unroll_trig_fan,
            (unsigned long long)kk_limina_counts.unroll_trig_promote,
            (unsigned long long)kk_limina_counts.unroll_trig_robust,
-           (unsigned long long)kk_limina_counts.unroll_trig_restart);
+           (unsigned long long)kk_limina_counts.unroll_trig_restart,
+           (unsigned long long)kk_limina_counts.fan_static);
    fprintf(stderr, "[LIMINA]   unroll_geometry calls=%llu (fan=%llu strip=%llu other=%llu)\n",
            (unsigned long long)kk_limina_counts.unroll_calls,
            (unsigned long long)kk_limina_counts.unroll_fan,
