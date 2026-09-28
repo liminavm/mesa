@@ -46,6 +46,16 @@ kk_limina_rtlog(void)
    return v;
 }
 
+/* Cached: it is consulted on every draw, and getenv walks the whole environment each call. */
+static inline bool
+kk_limina_vplog(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("KK_LIMINA_VP_LOG") != NULL;
+   return v;
+}
+
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
 {
@@ -778,7 +788,7 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
     * because Metal rejects anything outside it -- and a rect whose offset already lies past a
     * 44-tall target collapses to a few rows or to nothing, which would produce exactly that. Log
     * what actually reaches Metal for small targets; the GL-side box is not what zink sends. */
-   if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+   if (unlikely(kk_limina_vplog()) &&
        cmd->state.gfx.render.area.extent.height <= 64) {
       for (uint32_t i = 0; i < dyn->vp.scissor_count && i < 2; i++)
          fprintf(stderr,
@@ -818,7 +828,7 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
     * not, and KK flips it (originY = y + height, height = -height). A degenerate or flipped
     * viewport maps the geometry outside the target and rasterises nothing, which is the observed
     * symptom with everything else matching. */
-   if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+   if (unlikely(kk_limina_vplog()) &&
        cmd->state.gfx.render.area.extent.height <= 64) {
       for (uint32_t i = 0; i < dyn->vp.viewport_count && i < 2; i++)
          fprintf(stderr,
@@ -2506,7 +2516,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
     * Every GL-side attempt to read the geometry aborted the worker, but the vertex binding is
     * plain state here -- an address and a range, with no synchronisation needed to look at it,
     * which is what made every GL probe either fatal or curative. */
-   if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+   if (unlikely(kk_limina_vplog()) &&
        cmd->state.gfx.render.area.extent.height <= 64) {
       {
          const float *v = kk_limina_addr_to_cpu(cmd->state.gfx.vb.addr_range[0].addr);
@@ -2802,7 +2812,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       /* [LIMINA] Reached the actual encode, past every early return in kk_draw -- the predicate
        * path and the geometry unroll both bail out silently, and a draw that never gets here
        * would look exactly like one that rasterises nothing. */
-      if (unlikely(getenv("KK_LIMINA_VP_LOG") != NULL) &&
+      if (unlikely(kk_limina_vplog()) &&
           cmd->state.gfx.render.area.extent.height <= 64)
          /* [LIMINA] Which texture is this draw's colour attachment, at the moment it is
           * encoded? Every other dimension of the two passes now matches exactly, so the last
