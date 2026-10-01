@@ -1074,6 +1074,32 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
    }
 }
 
+/* Largest fan the static index buffer serves. uint16 indices, and the largest index it holds is
+ * KK_FAN_MAX_VERTICES - 1, which stays clear of 0xFFFF: Metal always restarts on that index. */
+#define KK_FAN_MAX_VERTICES 65535u
+
+static void
+kk_init_fan_indices(const void *data)
+{
+   struct kk_device *dev = (struct kk_device *)data;
+   const uint32_t tris = KK_FAN_MAX_VERTICES - 2u;
+
+   if (kk_alloc_bo(dev, &dev->vk.base, tris * 3u * sizeof(uint16_t), 0,
+                   &dev->fan_indices) != VK_SUCCESS) {
+      dev->fan_indices = NULL;
+      return;
+   }
+
+   /* Vulkan's (i + 1, i + 2, 0), provoking vertex first -- the order kk_unroll_geometry
+    * produces with flatshade_first, so both paths rasterise a fan identically. */
+   uint16_t *idx = dev->fan_indices->cpu;
+   for (uint32_t i = 0; i < tris; i++) {
+      idx[3u * i + 0u] = i + 1u;
+      idx[3u * i + 1u] = i + 2u;
+      idx[3u * i + 2u] = 0u;
+   }
+}
+
 static void
 kk_init_heap(const void *data)
 {
@@ -2460,13 +2486,15 @@ kk_xfb_post_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
 }
 
 static void
-kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+kk_draw_impl(struct kk_cmd_buffer *cmd, struct kk_draw_command *data, bool fan_static)
 {
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
    kk_flush_gfx_state(cmd);
 
-   data->restart = dyn->ia.primitive_restart_enable;
+   /* A fan rewritten onto the static index buffer was non-indexed, so restart never applied to
+    * it; the buffer holds no restart index either. */
+   data->restart = !fan_static && dyn->ia.primitive_restart_enable;
    data->restart_index = dyn->ia.primitive_restart_index;
    data->flatshade_first =
       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
@@ -2478,7 +2506,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
 
    /* Unroll geometry. Skip draw if we fail. */
-   if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
+   if (!fan_static && requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
       return;
 
    cmd->limina_draws += data->draw_count;
@@ -2520,6 +2548,91 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       if (xfb_track)
          kk_xfb_post_draw(cmd, data, i, xfb_captured, xfb_fit, xfb_gen);
    }
+}
+
+/* A direct, non-indexed triangle fan needs no per-draw index data: its triangle list is a function
+ * of the vertex count alone, so it can be drawn indexed from one device-wide buffer with
+ * vertexOffset = firstVertex. That skips the GPU geometry unroll, and with it the compute encoder
+ * the unroll is dispatched on -- which per fan draw costs a compute pass plus the encoder churn
+ * around it, and is what let a fan-heavy WebGL page outrun the GPU. */
+static bool
+kk_fan_can_use_static_indices(struct kk_cmd_buffer *cmd,
+                              const struct kk_draw_command *data)
+{
+   if (data->prim != MESA_PRIM_TRIANGLE_FAN || data->indexed || data->indirect ||
+       data->predicate_count > 0)
+      return false;
+
+   /* LIMINA A/B lever, LIMINA_KK_NO_FAN_STATIC=1: send every fan through the GPU unroll again. */
+   static int off = -1;
+   if (unlikely(off < 0)) {
+      const char *e = getenv("LIMINA_KK_NO_FAN_STATIC");
+      off = e && strcmp(e, "0") != 0;
+   }
+   if (off)
+      return false;
+
+   /* Tessellation unrolls on its own, and transform feedback counts and captures by the
+    * original topology. */
+   if (cmd->state.shaders[MESA_SHADER_TESS_EVAL] || cmd->state.gfx.xfb.enabled ||
+       cmd->state.gfx.xfb.pg_pool)
+      return false;
+
+   for (uint32_t i = 0; i < data->draw_count; i++) {
+      if (data->draws[i].vertexCount > KK_FAN_MAX_VERTICES)
+         return false;
+   }
+
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   util_call_once_data(&dev->fan_indices_once, kk_init_fan_indices, dev);
+   return dev->fan_indices != NULL;
+}
+
+static void
+kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+{
+   if (!kk_fan_can_use_static_indices(cmd, data)) {
+      kk_draw_impl(cmd, data, false);
+      return;
+   }
+
+   /* The indexed draw records are larger than the non-indexed ones the caller sized `data` for,
+    * so build the rewritten command separately rather than in place. */
+   struct kk_draw_command *list = rzalloc_size(
+      NULL, sizeof(*list) + sizeof(VkDrawIndexedIndirectCommand) * (data->draw_count - 1u));
+   if (!list) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   *list = (struct kk_draw_command){
+      .prim = MESA_PRIM_TRIANGLES,
+      .upload_mask = data->upload_mask,
+      .index_buffer = {.addr = dev->fan_indices->gpu,
+                       .range = dev->fan_indices->size_B},
+      .index_buffer_el_size_B = sizeof(uint16_t),
+      .indexed = true,
+   };
+
+   for (uint32_t i = 0; i < data->draw_count; i++) {
+      const VkDrawIndirectCommand *d = &data->draws[i];
+      /* Fewer than three vertices draw nothing, and Metal validation rejects an empty draw. */
+      if (d->vertexCount < 3u)
+         continue;
+      list->indexed_draws[list->draw_count++] = (VkDrawIndexedIndirectCommand){
+         .indexCount = 3u * (d->vertexCount - 2u),
+         .instanceCount = d->instanceCount,
+         .firstIndex = 0u,
+         .vertexOffset = (int32_t)d->firstVertex,
+         .firstInstance = d->firstInstance,
+      };
+   }
+
+   if (list->draw_count > 0)
+      kk_draw_impl(cmd, list, true);
+
+   ralloc_free(list);
 }
 
 VKAPI_ATTR void VKAPI_CALL
