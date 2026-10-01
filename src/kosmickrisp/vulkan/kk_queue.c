@@ -19,6 +19,9 @@
 
 #include "vk_cmd_queue.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 struct kk_commit_data {
    struct kk_queue *queue;
    struct kk_cmd_buffer *cmd;
@@ -126,18 +129,75 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
    return cmd->metal.cmd_buf;
 }
 
+/* limina: GPU completion for one commit: discharge the allocator charge its command buffer took
+ * at begin, which is what lets an over-budget allocator drain and be released. Metal
+ * snapshots the feedback-handler list per commit (measured, mtl4-repro T4), so this fires once. */
+struct kk_submit_discharge {
+   struct kk_device *dev;
+   struct kk_pooled_alloc *pa;
+};
+
 static void
+discharge_callback(struct mtl_feedback_data *data)
+{
+   struct kk_submit_discharge *d = (struct kk_submit_discharge *)data->user_data;
+   kk_alloc_pool_discharge(d->dev, d->pa);
+   free(d);
+}
+
+/* limina: fault injection for the discharge-payload allocation. It is a few dozen bytes and
+ * effectively never fails, which is exactly why its recovery path once carried a use-after-free
+ * unnoticed: an untestable error path is an unreviewed one. LIMINA_KK_FAIL_DISCHARGE_ALLOC=<n>
+ * fails the first <n>. The counter is deliberately plain: a race can only change how many
+ * injections land, never whether the path under test is correct. */
+static bool
+kk_discharge_alloc_should_fail(void)
+{
+   static int remaining = -1;
+   if (remaining < 0) {
+      const char *e = getenv("LIMINA_KK_FAIL_DISCHARGE_ALLOC");
+      remaining = (e && *e) ? atoi(e) : 0;
+   }
+   if (remaining > 0) {
+      remaining--;
+      fprintf(stderr, "[LIMINA-KK] injecting discharge-payload allocation failure\n");
+      return true;
+   }
+   return false;
+}
+
+/* On failure nothing has been committed and `user_data` still belongs to the caller. */
+static VkResult
 kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
                 mtl_feedback_handler_callback callback, void *user_data)
 {
    assert(kk_cmd_buffer_has_work(cmd));
 
+   /* limina: build the discharge payload BEFORE anything is committed. The charge must be
+    * released at GPU completion; if this allocation could fail after the commit, the charge
+    * would be left for command-buffer reset, which the rerecord path reaches while this
+    * submission is still executing, and the pool could then release heaps the GPU is
+    * reading. Failing first means the GPU never receives the work, so the charge discharging at
+    * reset is exactly right. */
+   struct kk_submit_discharge *d = NULL;
+   if (cmd->charged) {
+      d = kk_discharge_alloc_should_fail() ? NULL : malloc(sizeof(*d));
+      if (d == NULL)
+         return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+      d->dev = kk_queue_device(queue);
+      d->pa = cmd->charged;
+      cmd->charged = NULL;
+   }
+
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, callback, user_data);
+   if (d)
+      mtl_commit_options_add_feedback_handler(options, discharge_callback, d);
 
    mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
                             options);
    mtl_release(options);
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -197,7 +257,12 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    kk_device_make_resources_resident(dev);
 
    queue->commits_in_flight++;
-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   result = kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   if (result != VK_SUCCESS) {
+      queue->commits_in_flight--;
+      vk_free(&dev->vk.alloc, commit);
+      goto release;
+   }
 
    mtx_unlock(&queue->mutex);
    return VK_SUCCESS;
@@ -256,7 +321,11 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          note->dev = dev;
          note->seq_lo = cmd_buffer->work_seq_lo;
          note->seq_hi = cmd_buffer->work_seq_hi;
-         kk_queue_commit(queue, cmd_buffer, commit_callback, note);
+         VkResult result = kk_queue_commit(queue, cmd_buffer, commit_callback, note);
+         if (result != VK_SUCCESS) {
+            free(note);
+            return result;
+         }
       }
 
       cmd_buffer->submitted = true;

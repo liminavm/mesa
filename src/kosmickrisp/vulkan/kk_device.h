@@ -78,8 +78,72 @@ struct kk_precompiled_cache {
    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
 };
 
+/* limina: shared MTL4 command-allocator pool.
+ *
+ * Upstream gives each VkCommandPool its own free list of allocators and never resets them, and
+ * two measured facts make that ratchet (spikes/vrend-region-leak/, spikes/kk-alloc-pool/):
+ *   - reset() marks heaps for reuse and NEVER shrinks allocatedSize, so an allocator's size is
+ *     non-decreasing for its whole lifetime; only releasing it returns its heaps (100%, measured);
+ *   - each workload launch drives a different subset of allocators to a new high-water, so
+ *     never-reset allocators climb with every launch and return nothing when it closes
+ *     (663 -> 1492 MiB over eight aquarium launches on the vrend tier, 117 allocators throughout).
+ * On the vrend tier the KK VkDevice belongs to host zink's screen and lives until the worker
+ * exits, so nothing else ever gives that memory back.
+ *
+ * The pool bounds and returns it: allocators are borrowed device-wide for the span of one
+ * recording, so the count follows concurrency; one that crosses a byte budget leaves service and
+ * is released once every command buffer begun on it has completed; and an idle one past a decay
+ * window is released above a floor. Nothing is ever reset: reset returns no memory, and reusing a
+ * reset allocator faults inside -[IOGPUMetal4CommandBuffer fillCommandBufferArgs:] at commit under
+ * upstream's reused-MTL4CommandBuffer model (spikes/kk-alloc-pool/RESULTS.md).
+ */
+struct kk_pooled_alloc {
+   mtl_command_allocator *handle;
+   /* Command buffers begun on this allocator that the GPU has not completed. Charged at
+    * mtl_begin_command_buffer, NOT at commit: the borrow is returned at vkEndCommandBuffer while
+    * the command buffer still sits uncommitted, and releasing the allocator in that window would
+    * free heaps the GPU has not been handed yet. */
+   uint32_t pending;
+   bool in_use;   /* borrowed by a recording command buffer; Metal allows one at a time */
+   bool draining; /* over budget: never borrowed again, released once pending hits 0 */
+   uint32_t uses; /* recordings so far, for the stats */
+   /* os_time_get_nano() when the last borrow ended: the decay clock. 0 = borrowed. */
+   uint64_t idle_since;
+};
+
+struct kk_alloc_pool {
+   simple_mtx_t mtx;
+   struct util_dynarray allocs; /* struct kk_pooled_alloc * */
+   uint64_t budget_bytes;
+   uint64_t decay_ns;    /* idle this long before an under-budget allocator is surplus */
+   uint32_t floor;       /* never decay below this many (drained over-budget ones always go) */
+   bool destroy_enabled; /* LIMINA_KK_ALLOC_DESTROY=0 kill switch */
+   /* Stats, so neither growth nor reclaim is silent. */
+   uint32_t live;
+   uint32_t peak_live;
+   uint32_t destroyed;
+   uint32_t watermark_warned;
+   uint64_t acquires;
+   uint64_t stats_every; /* LIMINA_KK_ALLOC_STATS=<n>: a stats line every n acquires; 0 = off */
+   uint64_t retired;     /* crossed the budget */
+   uint64_t retired_uses; /* sum of their recordings, for the mean lifetime */
+};
+
+/* util_dynarray's macros take a single type token, so give the pointer a name. */
+typedef struct kk_pooled_alloc *kk_pooled_alloc_ptr;
+
+void kk_alloc_pool_init(struct kk_device *dev);
+void kk_alloc_pool_finish(struct kk_device *dev);
+struct kk_pooled_alloc *kk_alloc_pool_acquire(struct kk_device *dev);
+void kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa);
+void kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa);
+void kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa);
+
 struct kk_device {
    struct vk_device vk;
+
+   /* limina: see struct kk_alloc_pool. */
+   struct kk_alloc_pool alloc_pool;
 
    mtl_device *mtl_handle;
    mtl_compiler *mtl_compiler_handle;
