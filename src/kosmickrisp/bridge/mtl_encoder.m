@@ -21,6 +21,8 @@
 /* limina: atomics for the attachment-less clamp warning counter, execinfo for
  * its one-shot backtrace. */
 #include <execinfo.h>
+/* limina: dladdr, to name the frames the encoder guard records. */
+#include <dlfcn.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -114,6 +116,9 @@ enum limina_enc_state {
    LIMINA_ENC_RELEASED = 3, /* our retain dropped; the address may be recycled at any moment */
 };
 
+/* Enough frames to name the caller and its caller; the bridge frame itself is skipped. */
+#define LIMINA_ENC_FRAMES 4u
+
 struct limina_enc_slot {
    _Atomic uintptr_t ptr;
    _Atomic uint64_t gen;
@@ -121,18 +126,58 @@ struct limina_enc_slot {
    _Atomic uint32_t pad;
    _Atomic uint64_t uses;
    _Atomic uint64_t thread; /* the thread that created this incarnation */
+   /* Who created this incarnation, and who ended it. Not atomic: both are written under
+    * limina_enc_lock, and a report racing a rewrite gets a stale frame, not a wild pointer.
+    * These are the whole point of the table now that the guard prevents the crash -- a refusal
+    * happens while both parties are still alive, so it can name the code that took the address
+    * as well as the code still holding it, which no post-mortem crash report ever could. */
+   void *born[LIMINA_ENC_FRAMES];
+   void *ended[LIMINA_ENC_FRAMES];
+   int born_n;
+   int ended_n;
+   uint64_t ended_thread;
 };
 
 static struct limina_enc_slot limina_enc_tab[LIMINA_ENC_SLOTS];
 static pthread_mutex_t limina_enc_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t limina_enc_gen_next = 1;
 static _Atomic uint64_t limina_enc_bad[4];
+static _Atomic uint64_t limina_enc_checks;   /* every guarded compute op */
+static _Atomic uint64_t limina_enc_untracked; /* ... of which the table knew nothing */
 
 static inline uint32_t
 limina_enc_hash(const void *p)
 {
    /* Encoders are malloc'd objects, so the low bits are dead; take from bit 6 up. */
    return (uint32_t)(((uintptr_t)p >> 6) & LIMINA_ENC_MASK);
+}
+
+/* Capture the caller's frames, skipping this function and its caller inside the bridge. */
+static int
+limina_enc_capture(void **out)
+{
+   void *raw[LIMINA_ENC_FRAMES + 2u];
+   int n = backtrace(raw, (int)(LIMINA_ENC_FRAMES + 2u));
+   int keep = 0;
+   for (int i = 2; i < n && keep < (int)LIMINA_ENC_FRAMES; i++)
+      out[keep++] = raw[i];
+   return keep;
+}
+
+static void
+limina_enc_print_frames(const char *what, void *const *frames, int n)
+{
+   if (n <= 0)
+      return;
+   fprintf(stderr, "[LIMINA-ENC]   %s:", what);
+   for (int i = 0; i < n; i++) {
+      Dl_info info;
+      if (dladdr(frames[i], &info) && info.dli_sname)
+         fprintf(stderr, " %s", info.dli_sname);
+      else
+         fprintf(stderr, " %p", frames[i]);
+   }
+   fprintf(stderr, "\n");
 }
 
 static const char *
@@ -183,6 +228,9 @@ limina_enc_note_new(void *enc)
    atomic_store(&pick->gen, atomic_fetch_add(&limina_enc_gen_next, 1));
    atomic_store(&pick->uses, 0);
    atomic_store(&pick->thread, (uint64_t)(uintptr_t)pthread_self());
+   pick->born_n = limina_enc_capture(pick->born);
+   pick->ended_n = 0;
+   pick->ended_thread = 0;
    atomic_store(&pick->state, LIMINA_ENC_LIVE);
    atomic_store_explicit(&pick->ptr, (uintptr_t)enc, memory_order_release);
    pthread_mutex_unlock(&limina_enc_lock);
@@ -197,8 +245,15 @@ limina_enc_mark(void *enc, uint32_t state)
    struct limina_enc_slot *s = limina_enc_find(enc);
    /* Never walk a state backwards: end-then-release is the order, and a stray endEncoding on an
     * already-released pointer must not resurrect it to ENDED. */
-   if (s && atomic_load(&s->state) < state)
+   if (s && atomic_load(&s->state) < state) {
+      /* Only the first transition out of LIVE is recorded: that is the call that took the
+       * encoder away, and the release that follows it is bookkeeping. */
+      if (atomic_load(&s->state) == LIMINA_ENC_LIVE) {
+         s->ended_n = limina_enc_capture(s->ended);
+         s->ended_thread = (uint64_t)(uintptr_t)pthread_self();
+      }
       atomic_store(&s->state, state);
+   }
    pthread_mutex_unlock(&limina_enc_lock);
 }
 
@@ -213,6 +268,53 @@ mtl_encoder_generation(void *encoder)
 {
    struct limina_enc_slot *s = encoder ? limina_enc_find(encoder) : NULL;
    return s ? atomic_load(&s->gen) : 0;
+}
+
+void
+mtl_encoder_report_incarnation(void *encoder, const char *why)
+{
+   struct limina_enc_slot *s = encoder ? limina_enc_find(encoder) : NULL;
+   if (!s) {
+      fprintf(stderr, "[LIMINA-ENC] %s: encoder %p is not in the table (evicted, or never a "
+                      "compute encoder) — no history to give\n", why, encoder);
+      fflush(stderr);
+      return;
+   }
+   fprintf(stderr,
+           "[LIMINA-ENC] %s: encoder %p is now generation %llu, state %s, created on thread "
+           "0x%llx, %llu uses\n",
+           why, encoder, (unsigned long long)atomic_load(&s->gen),
+           limina_enc_state_name(atomic_load(&s->state)),
+           (unsigned long long)atomic_load(&s->thread),
+           (unsigned long long)atomic_load(&s->uses));
+   limina_enc_print_frames("created by", s->born, s->born_n);
+   if (s->ended_n > 0) {
+      fprintf(stderr, "[LIMINA-ENC]   ended on thread 0x%llx\n",
+              (unsigned long long)s->ended_thread);
+      limina_enc_print_frames("ended by", s->ended, s->ended_n);
+   }
+   fflush(stderr);
+}
+
+void
+mtl_encoder_guard_stats(struct mtl_encoder_guard_stats *out)
+{
+   out->checks = atomic_load(&limina_enc_checks);
+   out->untracked = atomic_load(&limina_enc_untracked);
+   out->bad_null = atomic_load(&limina_enc_bad[LIMINA_ENC_UNKNOWN]);
+   out->bad_ended = atomic_load(&limina_enc_bad[LIMINA_ENC_ENDED]);
+   out->bad_released = atomic_load(&limina_enc_bad[LIMINA_ENC_RELEASED]);
+   out->encoders_seen = atomic_load(&limina_enc_gen_next) - 1u;
+   out->slots_total = LIMINA_ENC_SLOTS;
+
+   /* Walked rather than counted incrementally: the reporter runs once every 2000 ticks, and a
+    * counter maintained on the insert path would have to track evictions to stay honest. */
+   uint32_t used = 0;
+   for (uint32_t i = 0; i < LIMINA_ENC_SLOTS; i++) {
+      if (atomic_load_explicit(&limina_enc_tab[i].ptr, memory_order_relaxed) != 0)
+         used++;
+   }
+   out->slots_used = used;
 }
 
 static inline bool
@@ -247,9 +349,16 @@ limina_enc_check(void *enc, const char *site, uint64_t *gen_out)
       return LIMINA_ENC_UNKNOWN;
    }
 
+   atomic_fetch_add(&limina_enc_checks, 1);
+
    struct limina_enc_slot *s = limina_enc_find(enc);
-   if (!s)
-      return LIMINA_ENC_UNKNOWN; /* evicted, or a render encoder -- not evidence of anything */
+   if (!s) {
+      /* Evicted, or a render encoder. Not evidence of anything by itself -- but it is the one
+       * shape in which a genuinely stale pointer sails through every check, so it is counted
+       * rather than merely tolerated. */
+      atomic_fetch_add(&limina_enc_untracked, 1);
+      return LIMINA_ENC_UNKNOWN;
+   }
 
    const uint32_t st = atomic_load(&s->state);
    const uint64_t gen = atomic_load(&s->gen);
@@ -268,6 +377,10 @@ limina_enc_check(void *enc, const char *site, uint64_t *gen_out)
               (unsigned long long)atomic_load(&s->thread),
               (unsigned long long)atomic_load(&s->uses),
               (unsigned long long)(uintptr_t)pthread_self(), (unsigned long long)n + 1);
+      limina_enc_print_frames("created by", s->born, s->born_n);
+      fprintf(stderr, "[LIMINA-ENC]   ended on thread 0x%llx\n",
+              (unsigned long long)s->ended_thread);
+      limina_enc_print_frames("ended by", s->ended, s->ended_n);
       fflush(stderr);
    }
    if (limina_enc_guard_aborts())
