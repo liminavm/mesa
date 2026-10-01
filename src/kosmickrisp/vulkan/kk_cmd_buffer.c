@@ -7,6 +7,13 @@
 
 #include "kk_cmd_buffer.h"
 
+#include "util/log.h"
+#include "util/u_atomic.h"
+
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
 #include "kk_descriptor_set_layout.h"
@@ -360,6 +367,19 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    return cmd->metal.render;
 }
 
+/* limina: same knob the bridge's use-site check honours, so whichever site catches the stale
+ * pointer first can take a core with our own frame on top of it. */
+static bool
+kk_enc_guard_aborts(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_ENC_GUARD");
+      v = (e && !strcmp(e, "abort")) ? 1 : 0;
+   }
+   return v == 1;
+}
+
 mtl_compute_encoder *
 cs_get_compute(struct kk_cmd_buffer *cmd)
 {
@@ -373,8 +393,34 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
 
    if (cmd->metal.compute == NULL) {
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
+      cmd->metal.compute_gen = mtl_encoder_generation(cmd->metal.compute);
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
+   }
+
+   /* limina: the stale-pointer check. If this encoder's address has been re-tenanted since we
+    * were handed it, recording into it is exactly the AGX use-before-begin fault -- name it
+    * here, in our own code, instead of segfaulting inside the driver several ops later.
+    *
+    * gen_now == 0 means the table is no longer tracking this address (its slot was evicted), not
+    * that anything is wrong; treating that as stale would drop real work. */
+   const uint64_t gen_now = mtl_encoder_generation(cmd->metal.compute);
+   if (unlikely(cmd->metal.compute_gen != 0 && gen_now != 0 &&
+                gen_now != cmd->metal.compute_gen)) {
+      /* A stale encoder stays stale until cs_end, and this is the record path -- the dogfood
+       * workload calls it millions of times per session, so an unrate-limited line here is a
+       * flood. */
+      static uint32_t said_stale;
+      const uint32_t n = p_atomic_fetch_add(&said_stale, 1);
+      if (n < 8 || (n & 4095u) == 0)
+         mesa_loge("kk: the compute encoder %p is stale — handed out at generation %" PRIu64
+                   ", the address now holds generation %" PRIu64 "; dropping the op rather than "
+                   "recording it into someone else's encoder (caller %p, %u so far)",
+                   cmd->metal.compute, cmd->metal.compute_gen, gen_now,
+                   __builtin_return_address(0), n + 1);
+      if (kk_enc_guard_aborts())
+         abort();
+      return NULL;
    }
 
    return cmd->metal.compute;
@@ -386,6 +432,10 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
    /* TODO_KOSMICKRISP This is probably overkill */
    mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
    mtl_end_encoding(encoder);
+   /* limina: before the retain goes, so the encoder-liveness table cannot lose the race against
+    * a new encoder landing on this very address. Render encoders are not in the table, so this
+    * is a no-op for them. */
+   mtl_encoder_note_released(encoder);
    mtl_release(encoder);
 
    /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
@@ -448,8 +498,28 @@ cs_end(struct kk_cmd_buffer *cmd)
    }
 
    if (cmd->metal.compute) {
-      end_encoder(cmd, cmd->metal.compute);
+      /* limina: check the address is still ours BEFORE ending it. Closing a re-tenanted address
+       * is worse than recording into one: mtl_end_encoding ends somebody else's live encoder and
+       * mtl_release drops a retain they still hold, so their object dies under them and their
+       * next dispatch lands on a freed or freshly re-inited context -- which is the very state
+       * the AGX fault shows. Skip both and let the new owner keep its encoder. */
+      const uint64_t stop_gen = mtl_encoder_generation(cmd->metal.compute);
+      if (unlikely(cmd->metal.compute_gen != 0 && stop_gen != 0 &&
+                   stop_gen != cmd->metal.compute_gen)) {
+         static uint32_t said_stop;
+         const uint32_t n = p_atomic_fetch_add(&said_stop, 1);
+         if (n < 8 || (n & 4095u) == 0)
+            mesa_loge("kk: refusing to close compute encoder %p — it was ours at generation "
+                      "%" PRIu64 " and the address now holds generation %" PRIu64 "; ending "
+                      "it would take down its new owner (%u so far)",
+                      cmd->metal.compute, cmd->metal.compute_gen, stop_gen, n + 1);
+         if (kk_enc_guard_aborts())
+            abort();
+      } else {
+         end_encoder(cmd, cmd->metal.compute);
+      }
       cmd->metal.compute = NULL;
+      cmd->metal.compute_gen = 0;
       kk_limina_note_encoder_closed(cmd, "compute", false);
    }
 }
