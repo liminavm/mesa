@@ -24,6 +24,30 @@ void mtl_encoder_note_released(void *encoder);
  * tenant is perfectly live. Comparing this against the generation recorded when the encoder was
  * handed out is what catches it. 0 means "not tracked". */
 uint64_t mtl_encoder_generation(void *encoder);
+
+/* limina: what the encoder guard has actually seen. Reported on the unconditional periodic
+ * counts line, because a guard whose only signal is silence cannot be told apart from a dead one
+ * -- `checks` rising with `bad_*` at zero is evidence, `checks == 0` means the needle is dead.
+ * `untracked` is the guard's own blind spot: the address was not in the table, so every check
+ * passed by default. `slots_used` says how close the table is to the eviction that causes it. */
+struct mtl_encoder_guard_stats {
+   uint64_t checks;
+   uint64_t untracked;
+   uint64_t bad_null;
+   uint64_t bad_ended;
+   uint64_t bad_released;
+   uint64_t encoders_seen;
+   uint32_t slots_used;
+   uint32_t slots_total;
+};
+
+void mtl_encoder_guard_stats(struct mtl_encoder_guard_stats *out);
+
+/* limina: dump what the table knows about whoever holds this address now -- the generation, and
+ * the recorded frames that created and ended the incarnation. Called from a refusal, where both
+ * the code holding the stale pointer and the code that took the address are still alive, so the
+ * pair of stacks is the cause a post-mortem crash report cannot supply. */
+void mtl_encoder_report_incarnation(void *encoder, const char *why);
 void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
                               enum mtl_stages before_queue_stages);
 void mtl_barrier_after_encoder_stages(void *encoder,

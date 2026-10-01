@@ -8,6 +8,7 @@
 #include "kk_cmd_buffer.h"
 
 #include "util/log.h"
+#include "util/os_time.h"
 #include "util/u_atomic.h"
 
 #include <inttypes.h>
@@ -367,6 +368,45 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    return cmd->metal.render;
 }
 
+/* limina: how often each generation check refused. The messages they gate are rate-limited, so
+ * the log alone cannot be read as a total; kk_limina_guard_report_maybe prints these
+ * unconditionally. */
+static uint64_t kk_limina_enc_refused_handout;
+static uint64_t kk_limina_enc_refused_close;
+
+/* limina: the encoder guard's positive control. Its messages are rate-limited and only appear
+ * when something is wrong, so an uneventful log cannot be told apart from a guard that is not
+ * running -- the same trap as a crash class whose only evidence is that it stopped happening.
+ * Paced by compute-encoder closes, which move with what the guard measures, and limited to one
+ * line every 30 s. Deliberately not tagged [LIMINA-ENC], which is the grep for a refusal.
+ *
+ * `untracked` is the guard's own blind spot made visible: an address the table has evicted passes
+ * every check by default, and `table` says how close we are to causing that. */
+static void
+kk_limina_guard_report_maybe(void)
+{
+   static uint64_t next_ns;
+   const uint64_t now = os_time_get_nano();
+   const uint64_t due = p_atomic_read(&next_ns);
+   if (now < due ||
+       p_atomic_cmpxchg(&next_ns, due, now + 30ull * 1000000000ull) != due)
+      return;
+
+   struct mtl_encoder_guard_stats g;
+   mtl_encoder_guard_stats(&g);
+   fprintf(stderr,
+           "[LIMINA-KK-GUARD] periodic encoder guard: checks=%llu untracked=%llu | bad: "
+           "null=%llu ended=%llu released=%llu | refused: handout=%llu close=%llu | "
+           "encoders=%llu table=%u/%u\n",
+           (unsigned long long)g.checks, (unsigned long long)g.untracked,
+           (unsigned long long)g.bad_null, (unsigned long long)g.bad_ended,
+           (unsigned long long)g.bad_released,
+           (unsigned long long)p_atomic_read(&kk_limina_enc_refused_handout),
+           (unsigned long long)p_atomic_read(&kk_limina_enc_refused_close),
+           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total);
+   fflush(stderr);
+}
+
 /* limina: same knob the bridge's use-site check honours, so whichever site catches the stale
  * pointer first can take a core with our own frame on top of it. */
 static bool
@@ -410,14 +450,15 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
       /* A stale encoder stays stale until cs_end, and this is the record path -- the dogfood
        * workload calls it millions of times per session, so an unrate-limited line here is a
        * flood. */
-      static uint32_t said_stale;
-      const uint32_t n = p_atomic_fetch_add(&said_stale, 1);
+      const uint64_t n = p_atomic_fetch_add(&kk_limina_enc_refused_handout, 1);
       if (n < 8 || (n & 4095u) == 0)
          mesa_loge("kk: the compute encoder %p is stale — handed out at generation %" PRIu64
                    ", the address now holds generation %" PRIu64 "; dropping the op rather than "
-                   "recording it into someone else's encoder (caller %p, %u so far)",
+                   "recording it into someone else's encoder (caller %p, %llu so far)",
                    cmd->metal.compute, cmd->metal.compute_gen, gen_now,
-                   __builtin_return_address(0), n + 1);
+                   __builtin_return_address(0), (unsigned long long)n + 1);
+      if (n < 8)
+         mtl_encoder_report_incarnation(cmd->metal.compute, "stale handout");
       if (kk_enc_guard_aborts())
          abort();
       return NULL;
@@ -506,13 +547,15 @@ cs_end(struct kk_cmd_buffer *cmd)
       const uint64_t stop_gen = mtl_encoder_generation(cmd->metal.compute);
       if (unlikely(cmd->metal.compute_gen != 0 && stop_gen != 0 &&
                    stop_gen != cmd->metal.compute_gen)) {
-         static uint32_t said_stop;
-         const uint32_t n = p_atomic_fetch_add(&said_stop, 1);
+         const uint64_t n = p_atomic_fetch_add(&kk_limina_enc_refused_close, 1);
          if (n < 8 || (n & 4095u) == 0)
             mesa_loge("kk: refusing to close compute encoder %p — it was ours at generation "
                       "%" PRIu64 " and the address now holds generation %" PRIu64 "; ending "
-                      "it would take down its new owner (%u so far)",
-                      cmd->metal.compute, cmd->metal.compute_gen, stop_gen, n + 1);
+                      "it would take down its new owner (%llu so far)",
+                      cmd->metal.compute, cmd->metal.compute_gen, stop_gen,
+                      (unsigned long long)n + 1);
+         if (n < 8)
+            mtl_encoder_report_incarnation(cmd->metal.compute, "refused close");
          if (kk_enc_guard_aborts())
             abort();
       } else {
@@ -521,6 +564,7 @@ cs_end(struct kk_cmd_buffer *cmd)
       cmd->metal.compute = NULL;
       cmd->metal.compute_gen = 0;
       kk_limina_note_encoder_closed(cmd, "compute", false);
+      kk_limina_guard_report_maybe();
    }
 }
 
