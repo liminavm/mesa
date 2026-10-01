@@ -106,6 +106,11 @@ struct kk_device {
    struct kk_bo *heap;
    util_once_flag heap_init_once;
 
+   /* Triangle-list indices for a triangle fan of up to KK_FAN_MAX_VERTICES vertices,
+    * shared by every direct non-indexed fan draw. Created on first use. */
+   struct kk_bo *fan_indices;
+   util_once_flag fan_indices_once;
+
    /* Transform feedback counter-buffer shadow: command replay is sequential
     * on the queue thread and zink only consumes counter values through
     * vkCmdBeginTransformFeedbackEXT resume / vkCmdDrawIndirectByteCountEXT,
