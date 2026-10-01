@@ -39,9 +39,23 @@ struct mtl_encoder_guard_stats {
    uint64_t encoders_seen;
    uint32_t slots_used;
    uint32_t slots_total;
+   /* The AGX context behind the encoder (see mtl_encoder.m). `ctx_mode` says whether the
+    * pass-state canary is armed on this driver build, and is never NULL. */
+   const char *ctx_mode;
+   uint64_t ctx_born_broken; /* pass state already gone when AGX handed us the encoder */
+   uint64_t ctx_died;        /* pass state gone at a later op on a live encoder */
+   uint64_t ctx_swapped;     /* the encoder's context or allocator ivar changed under us */
+   uint64_t ctx_alloc_mismatch; /* the encoder's allocator is not the one KK began it on */
+   uint64_t ctx_skipped;     /* ops dropped on an encoder already found broken */
 };
 
 void mtl_encoder_guard_stats(struct mtl_encoder_guard_stats *out);
+
+/* limina: tell the guard which pooled allocator KK began this encoder's command buffer on, and
+ * how worn that allocator was, so a broken context can be correlated with a just-reset allocator
+ * versus a warm one. Also checks the encoder's own allocator is that one. */
+void mtl_encoder_note_allocator(void *encoder, void *allocator, uint32_t resets,
+                                uint32_t ops_since_reset);
 
 /* limina: dump what the table knows about whoever holds this address now -- the generation, and
  * the recorded frames that created and ended the incarnation. Called from a refusal, where both
