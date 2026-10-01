@@ -288,7 +288,7 @@ struct kk_cmd_buffer {
       mtl_compute_encoder *compute;
       /* limina: one line describing the open render encoder, recorded into the work ring as it
        * closes so a device loss can name the work. Written at encoder open. */
-      char render_what[56];
+      char render_what[112];
    } metal;
    /* limina: work-ring sequence range this command buffer's encoders recorded, so a failing
     * commit marks exactly its own work rather than "the last N recorded", which another
