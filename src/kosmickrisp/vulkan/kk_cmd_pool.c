@@ -123,6 +123,22 @@ kk_cmd_pool_get_allocator(struct kk_cmd_pool *pool)
                                mtl_command_allocator *);
 
    struct kk_device *dev = kk_cmd_pool_device(pool);
+
+   /* limina: a lost device completes nothing, so an allocator minted after the loss can never
+    * come back. Measured on the WebGL {antialias:true} device loss: no allocator growth before
+    * the loss and thousands of allocators with tens of thousands of BO allocations behind them
+    * after it, costing the host ~100k compressor pages that only a reboot returned. Refuse
+    * instead; the one caller already handles NULL. */
+   if (vk_device_is_lost_no_report(&dev->vk)) {
+      static bool reported;
+      if (!reported) {
+         reported = true;
+         fprintf(stderr, "[LIMINA-KK] device is lost — refusing to mint command allocators\n");
+         fflush(stderr);
+      }
+      return NULL;
+   }
+
    return mtl_new_command_allocator(dev->mtl_handle);
 }
 
