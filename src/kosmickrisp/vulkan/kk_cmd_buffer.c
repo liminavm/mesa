@@ -397,13 +397,17 @@ kk_limina_guard_report_maybe(void)
    fprintf(stderr,
            "[LIMINA-KK-GUARD] periodic encoder guard: checks=%llu untracked=%llu | bad: "
            "null=%llu ended=%llu released=%llu | refused: handout=%llu close=%llu | "
-           "encoders=%llu table=%u/%u\n",
+           "encoders=%llu table=%u/%u | context: %s born-broken=%llu died=%llu swapped=%llu "
+           "alloc-mismatch=%llu skipped=%llu\n",
            (unsigned long long)g.checks, (unsigned long long)g.untracked,
            (unsigned long long)g.bad_null, (unsigned long long)g.bad_ended,
            (unsigned long long)g.bad_released,
            (unsigned long long)p_atomic_read(&kk_limina_enc_refused_handout),
            (unsigned long long)p_atomic_read(&kk_limina_enc_refused_close),
-           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total);
+           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total, g.ctx_mode,
+           (unsigned long long)g.ctx_born_broken, (unsigned long long)g.ctx_died,
+           (unsigned long long)g.ctx_swapped, (unsigned long long)g.ctx_alloc_mismatch,
+           (unsigned long long)g.ctx_skipped);
    fflush(stderr);
 }
 
@@ -434,6 +438,9 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
    if (cmd->metal.compute == NULL) {
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
       cmd->metal.compute_gen = mtl_encoder_generation(cmd->metal.compute);
+      /* limina: no reset or op counts to give -- upstream's per-command-pool allocators keep
+       * none -- so the guard's report names the allocator alone. */
+      mtl_encoder_note_allocator(cmd->metal.compute, cmd->metal.allocator, 0u, 0u);
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
    }
