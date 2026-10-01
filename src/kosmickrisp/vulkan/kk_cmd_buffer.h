@@ -281,7 +281,15 @@ struct kk_ts_stage_entry {
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;
 
+   /* limina: the pool charge taken when the Metal command buffer began. It outlives the borrow:
+    * it moves to the commit's discharge payload at submit, and is discharged at reset or destroy
+    * for a command buffer that is never submitted, or it would strand its allocator draining. */
+   struct kk_pooled_alloc *charged;
+
    struct {
+      /* limina: BORROWED from the device allocator pool between vkBeginCommandBuffer and
+       * vkEndCommandBuffer, not owned. `allocator` is just pa->handle. */
+      struct kk_pooled_alloc *pa;
       mtl_command_allocator *allocator;
       mtl_command_buffer *cmd_buf;
       mtl_render_encoder *render;
