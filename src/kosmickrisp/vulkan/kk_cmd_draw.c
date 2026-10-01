@@ -1735,6 +1735,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
                                 info);
 
+   cmd->limina_unrolls++;
+
    kk_set_unrolled_draw(cmd, data, u_decomposed_prim(data->prim),
                         out_draws.gpu);
 
@@ -2774,6 +2776,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    bool gs_restart = geom && !tess && data->restart && data->indexed;
    if (gs_restart && !kk_convert_to_indirect_draw(cmd, data))
       return;
+
+   cmd->limina_draws += data->draw_count;
 
    bool xfb_track =
       unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);
