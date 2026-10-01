@@ -13,6 +13,17 @@
 
 /* Common encoder utils */
 void mtl_end_encoding(void *encoder);
+
+/* limina: tell the encoder-liveness table that our retain on `encoder` is about to go, so a use
+ * after this point is reported by name instead of faulting inside AGX on a recycled address. */
+void mtl_encoder_note_released(void *encoder);
+
+/* limina: which incarnation of this address the table currently describes. Encoder addresses are
+ * recycled constantly -- a measured desktop reuses one within tens of encoders -- so the pointer
+ * alone carries no identity and a liveness state alone cannot see a stale pointer: the new
+ * tenant is perfectly live. Comparing this against the generation recorded when the encoder was
+ * handed out is what catches it. 0 means "not tracked". */
+uint64_t mtl_encoder_generation(void *encoder);
 void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
                               enum mtl_stages before_queue_stages);
 void mtl_barrier_after_encoder_stages(void *encoder,
