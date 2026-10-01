@@ -294,6 +294,11 @@ struct kk_cmd_buffer {
     * commit marks exactly its own work rather than "the last N recorded", which another
     * thread's encoding can interleave with. Zero until the first encoder closes. */
    uint64_t work_seq_lo, work_seq_hi;
+
+   /* limina: what the open render pass has encoded so far, so a device-loss report can say
+    * whether the failing work drew at all and whether its geometry was unrolled. Cleared at
+    * pass start. */
+   uint32_t limina_draws, limina_unrolls;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;
    /* Timestamps already sampled by the current render encoder. (struct

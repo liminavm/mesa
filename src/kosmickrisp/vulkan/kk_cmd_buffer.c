@@ -292,6 +292,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
       cmd->metal.cmd_buf, state->render_pass_descriptor);
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
+   cmd->limina_draws = 0u;
+   cmd->limina_unrolls = 0u;
 
    /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
     * target resolving into a single-sample one is a WebGL MSAA resolve, and the compositor's own
@@ -411,11 +413,16 @@ flush_post_render_writes(struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->post_render_writes);
 }
 
-/* limina: one work-ring line per closed encoder; see kk_limina_work.h. */
+/* limina: one work-ring line per closed encoder; see kk_limina_work.h. Draw and unroll counts
+ * belong to the render encoder alone: compute encoders close around it and would otherwise claim
+ * its pass's draws. */
 static void
-kk_limina_note_encoder_closed(struct kk_cmd_buffer *cmd, const char *what)
+kk_limina_note_encoder_closed(struct kk_cmd_buffer *cmd, const char *what, bool render)
 {
-   uint64_t seq = kk_limina_work_record("%s", what);
+   uint64_t seq =
+      render ? kk_limina_work_record("%s draws=%u unroll=%u", what[0] ? what : "(unnamed)",
+                                     cmd->limina_draws, cmd->limina_unrolls)
+             : kk_limina_work_record("%s", what);
    if (cmd->work_seq_hi == 0u)
       cmd->work_seq_lo = seq;
    cmd->work_seq_hi = seq + 1u;
@@ -430,7 +437,7 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.render) {
       end_encoder(cmd, cmd->metal.render);
       cmd->metal.render = NULL;
-      kk_limina_note_encoder_closed(cmd, cmd->metal.render_what);
+      kk_limina_note_encoder_closed(cmd, cmd->metal.render_what, true);
       /* A render encoder opened by a path that does not set a label would otherwise inherit
        * this one's and lie about what it held. */
       cmd->metal.render_what[0] = '\0';
@@ -443,7 +450,7 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.compute) {
       end_encoder(cmd, cmd->metal.compute);
       cmd->metal.compute = NULL;
-      kk_limina_note_encoder_closed(cmd, "compute");
+      kk_limina_note_encoder_closed(cmd, "compute", false);
    }
 }
 
