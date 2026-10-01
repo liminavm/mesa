@@ -963,6 +963,19 @@ kk_image_plane_create_texture(struct kk_image_plane *plane,
                                           mem_offset_B);
 }
 
+/* LIMINA_KK_IMPORT_TRACE: per-texture import logging. Off by default — it is one line per
+ * adopted texture, which is thousands a second at frame rate. */
+static bool
+kk_limina_import_trace(void)
+{
+   static int on = -1;
+   if (unlikely(on < 0)) {
+      const char *e = getenv("LIMINA_KK_IMPORT_TRACE");
+      on = e && e[0] && e[0] != '0';
+   }
+   return on;
+}
+
 static VkResult
 kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
                     struct kk_image_plane *plane, struct kk_device_memory *mem,
@@ -1073,7 +1086,10 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
       }
       KK_TEX_CENSUS_ACQUIRE(); /* limina census: adopted import (or its sRGB view) */
       plane->addr = 0u;
-      fprintf(stderr,
+      /* limina: one line per adopted texture is thousands a second at frame rate — 1.4 GB of
+       * dogfood supervisor log in 45 minutes. Keep it for import debugging, behind a switch. */
+      if (unlikely(kk_limina_import_trace()))
+         fprintf(stderr,
               "[LIMINA-KK-IMPORT] adopted MTLTexture %p (srgb_view=%d) for image plane: %ux%u "
               "type=%u fmt=%u usage=0x%x (image usage=0x%x linear=%u optimized=%u)\n",
               mem->bo->texture, srgb_view_ok, plane->layout.width_px, plane->layout.height_px,
