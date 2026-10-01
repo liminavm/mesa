@@ -114,41 +114,6 @@ kk_cmd_pool_free_bo_list(struct kk_cmd_pool *pool, struct list_head *bos)
    }
 }
 
-mtl_command_allocator *
-kk_cmd_pool_get_allocator(struct kk_cmd_pool *pool)
-{
-   if (util_dynarray_num_elements(&pool->metal.free_allocators,
-                                  mtl_command_allocator *) > 0u)
-      return util_dynarray_pop(&pool->metal.free_allocators,
-                               mtl_command_allocator *);
-
-   struct kk_device *dev = kk_cmd_pool_device(pool);
-
-   /* limina: a lost device completes nothing, so an allocator minted after the loss can never
-    * come back. Measured on the WebGL {antialias:true} device loss: no allocator growth before
-    * the loss and thousands of allocators with tens of thousands of BO allocations behind them
-    * after it, costing the host ~100k compressor pages that only a reboot returned. Refuse
-    * instead; the one caller already handles NULL. */
-   if (vk_device_is_lost_no_report(&dev->vk)) {
-      static bool reported;
-      if (!reported) {
-         reported = true;
-         fprintf(stderr, "[LIMINA-KK] device is lost — refusing to mint command allocators\n");
-         fflush(stderr);
-      }
-      return NULL;
-   }
-
-   return mtl_new_command_allocator(dev->mtl_handle);
-}
-
-void
-kk_cmd_pool_return_allocator(struct kk_cmd_pool *pool,
-                             mtl_command_allocator *allocator)
-{
-   util_dynarray_append(&pool->metal.free_allocators, allocator);
-}
-
 mtl_command_buffer *
 kk_cmd_pool_get_cmd_buf(struct kk_cmd_pool *pool)
 {
@@ -189,7 +154,6 @@ kk_CreateCommandPool(VkDevice _device,
       return result;
    }
 
-   pool->metal.free_allocators = UTIL_DYNARRAY_INIT;
    pool->metal.free_cmd_bufs = UTIL_DYNARRAY_INIT;
 
    list_inithead(&pool->free_bos);
@@ -202,12 +166,6 @@ kk_CreateCommandPool(VkDevice _device,
 static void
 kk_cmd_pool_release_mtl_objects(struct kk_cmd_pool *pool)
 {
-   util_dynarray_foreach(&pool->metal.free_allocators, mtl_command_allocator *,
-                         allocator) {
-      mtl_release(*allocator);
-   }
-   util_dynarray_clear(&pool->metal.free_allocators);
-
    util_dynarray_foreach(&pool->metal.free_cmd_bufs, mtl_command_buffer *,
                          cmd_buf) {
       mtl_release(*cmd_buf);
@@ -228,7 +186,6 @@ kk_DestroyCommandPool(VkDevice _device, VkCommandPool commandPool,
    vk_command_pool_finish(&pool->vk);
    kk_cmd_pool_destroy_bos(pool);
    kk_cmd_pool_release_mtl_objects(pool);
-   util_dynarray_fini(&pool->metal.free_allocators);
    util_dynarray_fini(&pool->metal.free_cmd_bufs);
    vk_free2(&device->vk.alloc, pAllocator, pool);
 }
