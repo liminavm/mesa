@@ -289,6 +289,12 @@ struct kk_cmd_buffer {
       /* limina: one line describing the open render encoder, recorded into the work ring as it
        * closes so a device loss can name the work. Written at encoder open. */
       char render_what[112];
+      /* limina: the incarnation of `compute`'s ADDRESS that we were handed. Encoder addresses
+       * are recycled fast, so `compute` alone cannot tell a live pointer from a stale one
+       * pointing at a new tenant -- which is the standing reading of the AGX use-before-begin
+       * fault. Checked before every handout and before the close; 0 when the bridge's liveness
+       * table is not tracking this encoder. */
+      uint64_t compute_gen;
    } metal;
    /* limina: work-ring sequence range this command buffer's encoders recorded, so a failing
     * commit marks exactly its own work rather than "the last N recorded", which another
