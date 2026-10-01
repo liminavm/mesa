@@ -78,7 +78,11 @@ end_recording(struct kk_cmd_buffer *cmd)
 
    cs_end(cmd);
    mtl_end_command_buffer(cmd->metal.cmd_buf);
-   kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
+   /* limina: reuse is legal the moment the command buffer ends (Apple: "You can safely reuse
+    * command allocators after ending the command buffer"); only releasing one needs GPU completion,
+    * which the pool gates on the charge taken at begin. So the borrow goes back now. */
+   kk_alloc_pool_release(kk_cmd_buffer_device(cmd), cmd->metal.pa);
+   cmd->metal.pa = NULL;
    cmd->metal.allocator = NULL;
 }
 
@@ -94,6 +98,8 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    /* Ensure closed command buffer for safe returns to pool */
    end_recording(cmd);
+   kk_alloc_pool_discharge(kk_cmd_buffer_device(cmd), cmd->charged);
+   cmd->charged = NULL;
    if (cmd->metal.cmd_buf)
       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
@@ -176,6 +182,10 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
    end_recording(cmd);
    kk_cmd_release_resources(dev, cmd);
 
+   /* limina: a charge still held here belongs to a recording that was never submitted. */
+   kk_alloc_pool_discharge(dev, cmd->charged);
+   cmd->charged = NULL;
+
    cmd->uploader.bo = NULL;
    cmd->uploader.offset = 0;
 
@@ -208,6 +218,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    /* If this is the first time starting the command buffer allocate Metal
     * resources */
@@ -228,13 +239,21 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */
-   if (cmd->metal.allocator == NULL) {
-      cmd->metal.allocator = kk_cmd_pool_get_allocator(pool);
-
-      if (cmd->metal.allocator == NULL)
+   /* limina: a recording that began and was never submitted still holds its charge. */
+   kk_alloc_pool_discharge(dev, cmd->charged);
+   cmd->charged = NULL;
+   if (cmd->metal.pa == NULL) {
+      cmd->metal.pa = kk_alloc_pool_acquire(dev);
+      if (cmd->metal.pa == NULL)
          goto fail_allocator;
+      cmd->metal.allocator = cmd->metal.pa->handle;
    }
    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
+   /* limina: charge at BEGIN, not commit: the borrow goes back at vkEndCommandBuffer while this
+    * command buffer still sits uncommitted, and releasing the allocator in that window would free
+    * heaps the GPU has not been handed yet. */
+   kk_alloc_pool_charge(dev, cmd->metal.pa);
+   cmd->charged = cmd->metal.pa;
 
    return VK_SUCCESS;
 
