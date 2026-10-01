@@ -489,13 +489,22 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       cs_start_render(cmd);
 
    /* Store descriptor in case we need to restart the pass at pipeline barrier,
-    * but force loads */
+    * but force loads.
+    *
+    * Address the descriptor by the MAPPED slot, as kk_set_color_attachments and
+    * kk_apply_attachment_store_ops both do. dyn->cal.color_map may permute or retire attachments
+    * (VK_KHR_dynamic_rendering_local_read), and indexing by the raw attachment index instead
+    * wrote LOAD to a slot the pass does not use while the real target kept the CLEAR or
+    * DONT_CARE it was created with -- so a restarted pass discarded everything drawn before the
+    * restart and kept everything after. An attachment the map retires has no slot to force. */
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       const struct kk_image_view *iview = render->color_att[i].iview;
-      if (!iview)
+      uint8_t logical_index = render->color_map[i];
+      if (!iview || logical_index == MESA_VK_ATTACHMENT_UNUSED)
          continue;
       mtl_render_pass_attachment_descriptor *attachment_descriptor =
-         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
+         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor,
+                                                         logical_index);
       mtl_render_pass_attachment_descriptor_set_load_action(
          attachment_descriptor, MTL_LOAD_ACTION_LOAD);
    }
