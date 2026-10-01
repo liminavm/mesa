@@ -12,6 +12,7 @@
 #include "kk_descriptor_set_layout.h"
 #include "kk_entrypoints.h"
 #include "kk_format.h"
+#include "kk_image.h"
 #include "kk_image_view.h"
 #include "kk_limina_work.h"
 
@@ -259,6 +260,24 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
       mtl_encoder_push_debug_group(encoder, label->pLabelName);
 }
 
+/* limina: the GPU address a view's first plane actually renders into. The kernel's gpuEvent
+ * report names a faulting VA, so a pass has to carry the address of what it wrote for the two
+ * to be matched. */
+static uint64_t
+kk_limina_view_addr(const struct kk_image_view *view)
+{
+   if (view == NULL || view->vk.image == NULL)
+      return 0ull;
+
+   const struct kk_image *image =
+      container_of(view->vk.image, const struct kk_image, vk);
+   uint8_t plane = view->planes[0].image_plane;
+   if (plane >= image->plane_count)
+      return 0ull;
+
+   return image->planes[plane].addr;
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
@@ -277,11 +296,18 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
     * target resolving into a single-sample one is a WebGL MSAA resolve, and the compositor's own
     * passes look nothing like it. */
+   const struct kk_image_view *civ =
+      state->render.color_att_count ? state->render.color_att[0].iview : NULL;
+   const struct kk_image_view *div = state->render.depth_att.iview;
    snprintf(cmd->metal.render_what, sizeof(cmd->metal.render_what),
-            "render %ux%u s%u rts%u fmt%u%s", state->render.area.extent.width,
-            state->render.area.extent.height, state->render.samples,
-            state->render.color_att_count,
+            "render %ux%u s%u rts%u fmt%u c=%p a=0x%llx d=%u%s%s",
+            state->render.area.extent.width, state->render.area.extent.height,
+            state->render.samples, state->render.color_att_count,
             state->render.color_att_count ? (unsigned)state->render.color_att[0].vk_format : 0u,
+            civ ? (void *)civ->planes[0].mtl_handle_render : NULL,
+            (unsigned long long)kk_limina_view_addr(civ),
+            div ? (unsigned)state->render.depth_att.vk_format : 0u,
+            div && civ && kk_limina_view_addr(div) == kk_limina_view_addr(civ) ? "!same" : "",
             state->render.color_att_count && state->render.color_att[0].resolve_iview
                ? " +resolve"
                : "");
@@ -405,6 +431,9 @@ cs_end(struct kk_cmd_buffer *cmd)
       end_encoder(cmd, cmd->metal.render);
       cmd->metal.render = NULL;
       kk_limina_note_encoder_closed(cmd, cmd->metal.render_what);
+      /* A render encoder opened by a path that does not set a label would otherwise inherit
+       * this one's and lie about what it held. */
+      cmd->metal.render_what[0] = '\0';
 
       /* The stage map is only valid for the current render encoder */
       util_dynarray_clear(&cmd->ts_stage_map);
