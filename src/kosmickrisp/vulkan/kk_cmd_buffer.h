@@ -286,7 +286,14 @@ struct kk_cmd_buffer {
       mtl_command_buffer *cmd_buf;
       mtl_render_encoder *render;
       mtl_compute_encoder *compute;
+      /* limina: one line describing the open render encoder, recorded into the work ring as it
+       * closes so a device loss can name the work. Written at encoder open. */
+      char render_what[56];
    } metal;
+   /* limina: work-ring sequence range this command buffer's encoders recorded, so a failing
+    * commit marks exactly its own work rather than "the last N recorded", which another
+    * thread's encoding can interleave with. Zero until the first encoder closes. */
+   uint64_t work_seq_lo, work_seq_hi;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;
    /* Timestamps already sampled by the current render encoder. (struct
