@@ -13,6 +13,7 @@
 #include "kk_entrypoints.h"
 #include "kk_format.h"
 #include "kk_image_view.h"
+#include "kk_limina_work.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_command_buffer.h"
@@ -54,6 +55,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    }
    util_dynarray_clear(&cmd->large_bos);
    util_dynarray_clear(&cmd->post_render_writes);
+   cmd->work_seq_lo = cmd->work_seq_hi = 0u;
    util_dynarray_clear(&cmd->ts_resolves);
    util_dynarray_clear(&cmd->ts_stage_map);
 }
@@ -271,6 +273,19 @@ cs_start_render(struct kk_cmd_buffer *cmd)
       cmd->metal.cmd_buf, state->render_pass_descriptor);
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
+
+   /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
+    * target resolving into a single-sample one is a WebGL MSAA resolve, and the compositor's own
+    * passes look nothing like it. */
+   snprintf(cmd->metal.render_what, sizeof(cmd->metal.render_what),
+            "render %ux%u s%u rts%u fmt%u%s", state->render.area.extent.width,
+            state->render.area.extent.height, state->render.samples,
+            state->render.color_att_count,
+            state->render.color_att_count ? (unsigned)state->render.color_att[0].vk_format : 0u,
+            state->render.color_att_count && state->render.color_att[0].resolve_iview
+               ? " +resolve"
+               : "");
+
    /* Starting a new render pass means we already flushed and no barrier is
     * needed. */
    state->render.write_available = false;
@@ -370,6 +385,16 @@ flush_post_render_writes(struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->post_render_writes);
 }
 
+/* limina: one work-ring line per closed encoder; see kk_limina_work.h. */
+static void
+kk_limina_note_encoder_closed(struct kk_cmd_buffer *cmd, const char *what)
+{
+   uint64_t seq = kk_limina_work_record("%s", what);
+   if (cmd->work_seq_hi == 0u)
+      cmd->work_seq_lo = seq;
+   cmd->work_seq_hi = seq + 1u;
+}
+
 void
 cs_end(struct kk_cmd_buffer *cmd)
 {
@@ -379,6 +404,7 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.render) {
       end_encoder(cmd, cmd->metal.render);
       cmd->metal.render = NULL;
+      kk_limina_note_encoder_closed(cmd, cmd->metal.render_what);
 
       /* The stage map is only valid for the current render encoder */
       util_dynarray_clear(&cmd->ts_stage_map);
@@ -388,6 +414,7 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.compute) {
       end_encoder(cmd, cmd->metal.compute);
       cmd->metal.compute = NULL;
+      kk_limina_note_encoder_closed(cmd, "compute");
    }
 }
 
