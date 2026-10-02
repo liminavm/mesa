@@ -1049,11 +1049,21 @@ vn_queue_submission_init_syncs(struct vn_queue_submission *submit)
       assert(fence->payload->type == VN_SYNC_TYPE_SYNC);
 
       submit->temp.syncs[sync_index] = fence->payload->sync;
-      submit->temp.sync_vals[sync_index] = 1;
+      submit->temp.sync_vals[sync_index++] = 1;
 
       /* fence is backed by renderer sync without renderer object */
       submit->fence_handle = VK_NULL_HANDLE;
    }
+
+   /* The count was taken before vn_queue_submission_init_wait_semaphores
+    * consumed any imported sync fd payloads. A binary semaphore both waited
+    * and signaled in one submission was counted while it still held the
+    * imported payload, but the wait has since restored its permanent one,
+    * which the renderer object signals and which needs no renderer sync.
+    * Submit only what was filled, never a slot nothing wrote.
+    */
+   assert(sync_index <= submit->sync_count);
+   submit->sync_count = sync_index;
 }
 
 static VkResult
