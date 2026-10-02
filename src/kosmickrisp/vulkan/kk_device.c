@@ -549,12 +549,12 @@ kk_sampler_heap_remove_locked(struct kk_device *dev, struct kk_sampler_heap *h,
        * GPU-visible entry and hands the index straight back to the allocator, with nothing
        * waiting on the command buffers still executing against it. Counted (and, with
        * LIMINA_KK_SAMPLER_LEAK, suppressed) so an arm can say whether that ever happens. */
+      if (kk_limina_sampler_leak())
+         return;
       uint32_t n = p_atomic_inc_return(&kk_limina_sampler_retires);
       if ((n & 0xffu) == 1u)
          fprintf(stderr, "[LIMINA] KK sampler slot retired (#%u, index %u)\n", n,
                  rc->index);
-      if (kk_limina_sampler_leak())
-         return;
       mtl_release(rc->handle);
       kk_query_table_remove(dev, &h->table, rc->index);
       _mesa_hash_table_remove_key(h->ht, &rc->key);
