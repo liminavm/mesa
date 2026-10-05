@@ -204,6 +204,18 @@ virgl_resource_transfer_prepare(struct virgl_context *vctx,
       wait = false;
    }
 
+   /* A read-only map of a clean resource reads guest storage that nothing in
+    * flight can change: every command that writes the resource on the host
+    * marks it dirty, which would have required a readback. Pending transfers
+    * and draws only read it, so there is nothing to wait for.
+    */
+   if (wait && !readback && !is_blob &&
+       !(xfer->base.usage & PIPE_MAP_WRITE) &&
+       likely(!(virgl_debug & VIRGL_DEBUG_XFER))) {
+      flush = false;
+      wait = false;
+   }
+
    /* When the resource is busy but its content can be discarded, we can
     * replace its HW resource or use a staging buffer to avoid waiting.
     */
