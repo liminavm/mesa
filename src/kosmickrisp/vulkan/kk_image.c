@@ -1195,6 +1195,13 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
       array_layout.type = MTL_TEXTURE_TYPE_2D_ARRAY;
       array_layout.layers = array_layout.layers * array_layout.depth_px;
       array_layout.depth_px = 1u;
+      /* A 3D image's mip chain runs as far as its depth does, but a 2D array's
+       * only as far as its width and height, and Metal aborts on a descriptor
+       * asking for more: a legal 8x4x16 image with five levels takes the
+       * process down. Levels past the 2D chain get no 2D view. */
+      const uint32_t levels_2d =
+         util_logbase2(MAX2(array_layout.width_px, array_layout.height_px)) + 1;
+      array_layout.levels = MIN2(array_layout.levels, levels_2d);
       /* limina: honor the private heap-backed bo (heap-less host-imported backing) here too. */
       plane->mtl_handle_array = mtl_new_texture_with_descriptor(
          plane->private_bo ? plane->private_bo->mtl_handle : mem->bo->mtl_handle,
