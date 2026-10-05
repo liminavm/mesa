@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "util/os_mman.h"
 #include "util/os_file.h"
@@ -690,6 +691,11 @@ static bool virgl_drm_winsys_resource_get_handle(struct virgl_winsys *qws,
          flags |= DRM_RDWR;
       if (drmPrimeHandleToFD(qdws->fd, res->bo_handle, flags, (int*)&whandle->handle))
             return false;
+      /* res->size is the requested size, which a staging-backed resource
+       * keeps at 1; the kernel knows how much memory the fd names. */
+      off_t size = lseek(whandle->handle, 0, SEEK_END);
+      if (size > 0)
+         whandle->size = size;
       mtx_lock(&qdws->bo_handles_mutex);
       _mesa_hash_table_insert(qdws->bo_handles, (void *)(uintptr_t)res->bo_handle, res);
       mtx_unlock(&qdws->bo_handles_mutex);
