@@ -628,6 +628,13 @@ enum virgl_formats {
 #define VIRGL_CAP_V2_MIRROR_CLAMP_TO_EDGE (1u << 16)
 #define VIRGL_CAP_V2_MIRROR_CLAMP         (1u << 17)
 #define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1u << 18)
+/* limina: the fork-only bits sit at the top of the word, away from where upstream allocates
+ * (upstream took bit 19 for QUERY_FORMAT_MODIFIER). */
+
+/* limina: the host writes each decoded frame into the guest memory backing a video
+ * buffer's plane resources, so those planes are worth allocating for real instead of
+ * as one-page staging stubs -- and can then be exported honestly. */
+#define VIRGL_CAP_V2_VIDEO_GUEST_PLANES   (1u << 31)
 
 /* virgl bind flags - these are compatible with mesa 10.5 gallium.
  * but are fixed, no other should be passed to virgl either.
