@@ -252,7 +252,7 @@ create_frag_shader_yuv(struct ureg_program *shader, struct ureg_dst texel)
       ureg_TEX(shader, ureg_writemask(texel, TGSI_WRITEMASK_X << i), TGSI_TEXTURE_2D_ARRAY, tc, sampler[i]);
 
    ureg_TEX(shader, ureg_writemask(texel, TGSI_WRITEMASK_W), TGSI_TEXTURE_2D_ARRAY,
-            tc, ureg_scalar(sampler[0], TGSI_SWIZZLE_W));
+            tc, sampler[0]);
 }
 
 void *
