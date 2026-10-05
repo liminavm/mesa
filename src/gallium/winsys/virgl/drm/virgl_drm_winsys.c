@@ -703,6 +703,9 @@ static bool virgl_drm_winsys_resource_get_handle(struct virgl_winsys *qws,
    p_atomic_set(&res->external, true);
 
    whandle->stride = stride;
+   /* VADRMPRIMESurfaceDescriptor.objects[].size is copied straight from here, and left at 0
+    * it tells a consumer nothing about how much memory the fd actually names. */
+   whandle->size = res->size;
    return true;
 }
 
