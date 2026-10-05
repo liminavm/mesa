@@ -636,6 +636,12 @@ enum virgl_formats {
  * as one-page staging stubs -- and can then be exported honestly. */
 #define VIRGL_CAP_V2_VIDEO_GUEST_PLANES   (1u << 31)
 
+/* limina: the host accepts a decode target as ONE resource in a planar format, with
+ * its planes chained behind it, rather than as one resource per plane. Separate from
+ * VIDEO_GUEST_PLANES because a host can do the writeback without accepting the
+ * composite shape -- that is exactly what shipped first. */
+#define VIRGL_CAP_V2_VIDEO_PLANAR_TARGET  (1u << 30)
+
 /* virgl bind flags - these are compatible with mesa 10.5 gallium.
  * but are fixed, no other should be passed to virgl either.
  */
