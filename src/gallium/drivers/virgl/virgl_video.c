@@ -1242,6 +1242,7 @@ virgl_video_create_buffer(struct pipe_context *ctx,
                           const struct pipe_video_buffer *tmpl)
 {
     struct virgl_context *vctx = virgl_context(ctx);
+    struct virgl_screen *vs = virgl_screen(ctx->screen);
     struct virgl_video_buffer *vbuf;
     struct pipe_video_buffer local_tmpl;
 
@@ -1257,7 +1258,37 @@ virgl_video_create_buffer(struct pipe_context *ctx,
     local_tmpl.flags |= VIRGL_RESOURCE_FLAG_VIDEO_TARGET;
     tmpl = &local_tmpl;
 
-    vbuf->buf = vl_video_buffer_create(ctx, tmpl);
+    /* limina: one composite resource with its planes chained behind it, when the host
+     * says it takes that shape. The per-plane form below allocates a resource per
+     * plane, so the host sees three unrelated R8/R8G8 textures and can never back the
+     * frame with one surface; only the composite create names a planar format, which
+     * is what a host-side planar allocation keys off.
+     *
+     * The decision has to be made here, from the caps, and not by trying: a create the
+     * host refuses is invisible to the guest. The kernel has already handed out the
+     * handle, so the driver goes on to attach backing and build sampler views on a
+     * resource the host never made, and the host answers with "Illegal resource" and
+     * puts the context in error for the rest of its life -- every later submission,
+     * the decode included, is dropped without a word. gst-va provokes exactly that
+     * during plugin registration, when it creates a 64x64 surface of every fourcc it
+     * knows to learn the layout each one derives to. So the composite shape is taken
+     * only for a format the host's sampler bitmask lists, which is the same lookup
+     * virgl_is_format_supported does for a planar layout; today that is NV12 alone.
+     * Everything else, single-plane formats included (Y800 would otherwise go out under
+     * its own name rather than as R8), takes the per-plane form the host has always
+     * accepted, and decodes through the copy path.
+     *
+     * Interlaced is excluded outright. Its template is a 2D_ARRAY, and a planar create
+     * has to chain plane resources over one allocation -- a shape neither the guest
+     * layout nor the host's plane addressing takes for an array target. */
+    if ((vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VIDEO_PLANAR_TARGET) &&
+        !tmpl->interlaced &&
+        util_format_get_num_planes(tmpl->buffer_format) > 1 &&
+        vs->base.is_format_supported(&vs->base, tmpl->buffer_format, PIPE_TEXTURE_2D,
+                                     0, 0, PIPE_BIND_SAMPLER_VIEW))
+        vbuf->buf = vl_video_buffer_create_as_resource(ctx, tmpl, NULL, 0);
+    if (!vbuf->buf)
+        vbuf->buf = vl_video_buffer_create(ctx, tmpl);
     if (!vbuf->buf) {
         free(vbuf);
         return NULL;
