@@ -756,6 +756,22 @@ static struct pipe_resource *virgl_resource_create_front(struct pipe_screen *scr
    // This size is not passed to the host
    res->use_staging = virgl_can_copy_transfer_from_host(vs, res, vbind);
 
+   /* limina: a video decode target's plane needs storage that actually holds the
+    * frame, not the one-page staging stub.
+    *
+    * Its consumers mmap the exported dmabuf: VADRMPRIMESurfaceDescriptor reports the
+    * real geometry, and GStreamer's dmabuf uploader maps the fd and copies the frame
+    * out whenever no direct dmabuf-to-texture import is available, so a stub SIGBUSes
+    * it. Given real guest pages the host writes each decoded frame into them and the
+    * export describes storage that genuinely holds the picture.
+    *
+    * Gated on the host actually doing that writeback: without the bit this would
+    * allocate the memory and export an honest-looking fd naming a frame nothing ever
+    * wrote. The enhanced tier requires a host that has it. */
+   if ((templ->flags & VIRGL_RESOURCE_FLAG_VIDEO_TARGET) &&
+       (vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VIDEO_GUEST_PLANES))
+      res->use_staging = false;
+
    if (res->use_staging)
       alloc_size = 1;
    else if (templ->bind & PIPE_BIND_SHARED)
