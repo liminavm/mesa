@@ -8,6 +8,7 @@
 #include "kk_buffer_view.h"
 
 #include "kk_buffer.h"
+#include "kk_descriptor_types.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_format.h"
@@ -19,6 +20,24 @@
 #include "kosmickrisp/bridge/mtl_format.h"
 
 #include "vk_format.h"
+
+/* Metal has no three-channel texel formats. A uniform texel buffer of one is
+ * read through a texture buffer of its channel format, three texels to an
+ * element (KK_TEXEL_BUFFER_RGB32). */
+static enum pipe_format
+kk_texel_buffer_rgb32_channel_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32_FLOAT:
+      return PIPE_FORMAT_R32_FLOAT;
+   case PIPE_FORMAT_R32G32B32_UINT:
+      return PIPE_FORMAT_R32_UINT;
+   case PIPE_FORMAT_R32G32B32_SINT:
+      return PIPE_FORMAT_R32_SINT;
+   default:
+      return PIPE_FORMAT_NONE;
+   }
+}
 
 VkFormatFeatureFlags2
 kk_get_buffer_format_features(struct kk_physical_device *pdev,
@@ -44,6 +63,9 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
       /* Only these formats allow atomics for texel buffers */
       if (vk_format == VK_FORMAT_R32_UINT || vk_format == VK_FORMAT_R32_SINT)
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+   } else if (kk_texel_buffer_rgb32_channel_format(p_format) !=
+              PIPE_FORMAT_NONE) {
+      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
    }
 
    if (kk_vbo_supports_format(p_format))
@@ -64,6 +86,18 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    enum pipe_format p_format = vk_format_to_pipe_format(view->vk.format);
+   uint64_t width_px = view->vk.elements;
+
+   enum pipe_format channel_format =
+      kk_texel_buffer_rgb32_channel_format(p_format);
+   if (channel_format != PIPE_FORMAT_NONE) {
+      p_format = channel_format;
+      /* A view at maxTexelBufferElements would ask for three times the
+       * texture buffer Metal allows; its tail reads as out of range. */
+      width_px = MIN2(width_px * 3u, KK_MAX_TEXEL_BUFFER_ELEMENTS);
+      view->texel_buffer_flags |= KK_TEXEL_BUFFER_RGB32;
+   }
+
    const struct kk_va_format *supported_format = kk_get_va_format(p_format);
 
    /* If we reached here, we support reading at least */
@@ -77,7 +111,7 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       usage |= MTL_TEXTURE_USAGE_SHADER_ATOMIC;
 
    struct kk_image_layout layout = {
-      .width_px = view->vk.elements,
+      .width_px = width_px,
       .height_px = 1u,
       .depth_px = 1u,
       .layers = 1u,
