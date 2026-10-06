@@ -211,6 +211,15 @@ kk_nir_lower_descriptors(nir_shader *nir,
 /* KK_WORKAROUND_18 */
 bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 
+/* kk_root_descriptor_table::draw.xfb_remap: the original draw's topology
+ * (enum mesa_prim, POINTS..TRIANGLE_FAN) in the low bits, its index size in
+ * bytes (0 = non-indexed), and whether the last vertex provokes. */
+#define KK_XFB_REMAP_ON            (1u << 31)
+#define KK_XFB_REMAP_PRIM_MASK     0xfu
+#define KK_XFB_REMAP_INDEX_SHIFT   4
+#define KK_XFB_REMAP_INDEX_MASK    (0x7u << KK_XFB_REMAP_INDEX_SHIFT)
+#define KK_XFB_REMAP_PROVOKE_LAST  (1u << 8)
+
 bool
 kk_nir_lower_xfb(nir_shader *nir);
 
