@@ -41,6 +41,28 @@ struct kk_storage_image_descriptor {
 static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
               "kk_storage_image_descriptor has no holes");
 
+/* Set on a uniform texel buffer of a three-channel 32-bit format, which Metal
+ * cannot describe. The view is a texture buffer of the single-channel format
+ * three times as long, and kk_nir_lower_texel_buffer_rgb32 fetches each channel
+ * on its own. */
+#define KK_TEXEL_BUFFER_RGB32 (1u << 0)
+
+struct kk_texel_buffer_descriptor {
+   /* At the same offset as in the image descriptors: texture lowering reads it
+    * from there for every kind of texture. */
+   uint64_t image_gpu_resource_id;
+   uint32_t flags; /* KK_TEXEL_BUFFER_* */
+   uint32_t pad;
+};
+
+static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
+              "kk_texel_buffer_descriptor has no holes");
+static_assert(offsetof(struct kk_texel_buffer_descriptor,
+                       image_gpu_resource_id) ==
+                 offsetof(struct kk_sampled_image_descriptor,
+                          image_gpu_resource_id),
+              "texture lowering finds every texture id at one offset");
+
 /* This has to match nir_address_format_64bit_bounded_global */
 struct kk_buffer_address {
    uint64_t base_addr;

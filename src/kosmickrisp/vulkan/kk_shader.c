@@ -810,6 +810,8 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
    if (features & KK_FEAT_IMAGE_VIEW_MIN_LOD)
       NIR_PASS(_, nir, kk_nir_lower_image_view_min_lod);
 
+   NIR_PASS(_, nir, kk_nir_lower_texel_buffer_rgb32);
+
    /* Descriptor lowering needs to happen after lowering blend since we will
     * generate a nir_intrinsic_load_blend_const_color_rgba which gets lowered by
     * the lower descriptor pass

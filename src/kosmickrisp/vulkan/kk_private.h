@@ -22,6 +22,7 @@
 #define KK_MAX_SAMPLES                   8
 #define KK_MIN_SSBO_ALIGNMENT            16
 #define KK_MIN_TEXEL_BUFFER_ALIGNMENT    16
+#define KK_MAX_TEXEL_BUFFER_ELEMENTS     (16384u * 16384u)
 #define KK_MIN_UBO_ALIGNMENT             64
 #define KK_MAX_VIEWPORTS                 16
 #define KK_MAX_DESCRIPTOR_SIZE           64

@@ -236,6 +236,7 @@ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
 
 bool kk_nir_lower_custom_border(nir_shader *nir);
 bool kk_nir_lower_image_view_min_lod(nir_shader *nir);
+bool kk_nir_lower_texel_buffer_rgb32(nir_shader *nir);
 
 VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
                                const VkAllocationCallbacks *alloc,

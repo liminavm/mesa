@@ -44,6 +44,9 @@ kk_descriptor_stride_align_for_type(
 
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      *stride = *alignment = sizeof(struct kk_texel_buffer_descriptor);
+      break;
+
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       *stride = *alignment = sizeof(struct kk_storage_image_descriptor);
       break;
