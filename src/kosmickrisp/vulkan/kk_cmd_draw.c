@@ -2345,6 +2345,7 @@ kk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
 
    gfx->xfb.enabled = false;
    gfx->descriptors.root.draw.xfb_active_mask = 0;
+   gfx->descriptors.root.draw.xfb_remap = 0;
    gfx->descriptors.root_dirty = true;
 }
 
@@ -2374,10 +2375,37 @@ kk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
    kk_CmdDraw(commandBuffer, vertexCount, instanceCount, 0, firstInstance);
 }
 
+static uint32_t
+kk_prim_vertices(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_POINTS:
+      return 1;
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINE_LOOP:
+      return 2;
+   default:
+      return 3;
+   }
+}
+
+/* Primitives a direct draw generates, before any unroll rewrites it. */
+static uint32_t
+kk_xfb_gen_prims(const struct kk_draw_command *data, uint32_t draw_id)
+{
+   uint32_t count = data->indexed ? data->indexed_draws[draw_id].indexCount
+                                  : data->draws[draw_id].vertexCount;
+   uint32_t instances = data->indexed
+                           ? data->indexed_draws[draw_id].instanceCount
+                           : data->draws[draw_id].instanceCount;
+   return kk_prims_for_vertices(data->prim, count) * instances;
+}
+
 /* Per-draw transform feedback setup: point the root descriptor's capture
- * base at the current append offsets (pre-folded with firstVertex) and
- * re-upload the root. Only direct, non-indexed, non-tess draws capture —
- * exactly the GLES3-legal surface; everything else masks capture off. */
+ * base at the current append offsets, limit capture to the whole primitives
+ * that fit, and re-upload the root. Only the primitive-vertex lists
+ * kk_xfb_draw issues capture; every other draw masks capture off. */
 static void
 kk_xfb_pre_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
                 uint32_t draw_id, bool *captured, uint32_t *fit_prims,
@@ -2386,87 +2414,81 @@ kk_xfb_pre_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    struct kk_descriptor_state *desc = &gfx->descriptors;
    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-   bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
 
    *captured = false;
    *fit_prims = 0;
    *gen_prims = 0;
 
-   bool capturable = vs && vs->info.vs.has_xfb && !tess && !data->indirect &&
-                     !data->indexed;
+   bool capturable = gfx->xfb.remap.mode && vs && vs->info.vs.has_xfb &&
+                     !data->indirect && !data->indexed;
 
    if (!capturable) {
-      if (!gfx->xfb.warned_indirect && (data->indirect || data->indexed)) {
+      if (!gfx->xfb.warned_indirect && gfx->xfb.enabled && data->indirect) {
          vk_logw(VK_LOG_OBJS(&cmd->vk.base),
-                 "transform feedback capture skipped for indexed/indirect "
-                 "draw (unsupported; GLES3 forbids these during XFB)");
+                 "transform feedback capture skipped for an indirect draw "
+                 "(unsupported)");
          gfx->xfb.warned_indirect = true;
       }
-      if (desc->root.draw.xfb_active_mask) {
+      if (desc->root.draw.xfb_active_mask || desc->root.draw.xfb_remap) {
          desc->root.draw.xfb_active_mask = 0;
+         desc->root.draw.xfb_remap = 0;
          desc->root_dirty = true;
       }
       if (data->indirect)
          return; /* primitive counts unknown */
 
-      uint32_t count = data->indexed ? data->indexed_draws[draw_id].indexCount
-                                     : data->draws[draw_id].vertexCount;
-      uint32_t instances = data->indexed
-                              ? data->indexed_draws[draw_id].instanceCount
-                              : data->draws[draw_id].instanceCount;
-      *gen_prims = kk_prims_for_vertices(data->prim, count) * instances;
+      *gen_prims = kk_xfb_gen_prims(data, draw_id);
       return;
    }
 
    VkDrawIndirectCommand dc = data->draws[draw_id];
+   uint32_t vpp = kk_prim_vertices(data->prim);
    uint32_t prims = kk_prims_for_vertices(data->prim, dc.vertexCount);
    *gen_prims = prims * dc.instanceCount;
 
-   /* Whole-draw fit check: capture all of it or nothing (no partial capture
-    * yet — avoids out-of-bounds GPU stores). */
+   /* GL writes the whole primitives that fit in every bound buffer and
+    * drops the rest; the shader stores only slots below the limit. */
    uint32_t mask = 0;
-   bool fits = true;
+   uint64_t fit_verts = UINT64_MAX;
    u_foreach_bit(b, vs->info.vs.xfb_buffers_written) {
       uint32_t stride = vs->info.vs.xfb_stride_B[b];
       if (!gfx->xfb.buf[b].gpu_base || !stride)
          continue;
-      uint64_t need = (uint64_t)dc.vertexCount * dc.instanceCount * stride;
-      if (gfx->xfb.buf[b].offset_B + need > gfx->xfb.buf[b].size) {
-         fits = false;
-         break;
-      }
+      uint64_t room = gfx->xfb.buf[b].size > gfx->xfb.buf[b].offset_B
+                         ? gfx->xfb.buf[b].size - gfx->xfb.buf[b].offset_B
+                         : 0;
+      fit_verts = MIN2(fit_verts, room / stride);
       mask |= BITFIELD_BIT(b);
    }
+   uint64_t fit = mask ? MIN2(*gen_prims, fit_verts / vpp) : 0;
 
-   if (!fits || !mask) {
-      if (desc->root.draw.xfb_active_mask) {
-         desc->root.draw.xfb_active_mask = 0;
-         desc->root_dirty = true;
-      }
-      return;
-   }
-
+   desc->root.draw.xfb_remap = gfx->xfb.remap.mode;
+   desc->root.draw.xfb_remap_count = gfx->xfb.remap.count;
+   desc->root.draw.xfb_remap_base = gfx->xfb.remap.base;
+   desc->root.draw.xfb_remap_index_addr = gfx->xfb.remap.index_addr;
+   desc->root.draw.xfb_active_mask = fit ? mask : 0;
+   desc->root.draw.xfb_slot_limit = fit * vpp;
    u_foreach_bit(b, mask) {
       uint32_t stride = vs->info.vs.xfb_stride_B[b];
       desc->root.draw.xfb_base[b] = gfx->xfb.buf[b].gpu_base +
                                     gfx->xfb.buf[b].offset_B -
                                     (uint64_t)dc.firstVertex * stride;
    }
-   desc->root.draw.xfb_active_mask = mask;
    desc->root.draw.xfb_verts_per_instance = dc.vertexCount;
    desc->root.draw.xfb_first_instance = dc.firstInstance;
    desc->root_dirty = true;
 
-   *captured = true;
-   *fit_prims = *gen_prims;
+   *captured = fit > 0;
+   *fit_prims = fit;
 
    if (kk_limina_rtlog())
       fprintf(stderr,
-              "[LIMINA-KK-XFB] capture mask=0x%x base0=0x%llx off0=%llu "
-              "verts=%u inst=%u prims=%u\n",
-              mask, (unsigned long long)desc->root.draw.xfb_base[0],
+              "[LIMINA-KK-XFB] capture mask=0x%x remap=0x%x count=%u "
+              "base0=0x%llx off0=%llu verts=%u inst=%u prims=%u fit=%llu\n",
+              mask, gfx->xfb.remap.mode, gfx->xfb.remap.count,
+              (unsigned long long)desc->root.draw.xfb_base[0],
               (unsigned long long)gfx->xfb.buf[0].offset_B, dc.vertexCount,
-              dc.instanceCount, prims);
+              dc.instanceCount, prims, (unsigned long long)fit);
 }
 
 static void
@@ -2478,11 +2500,9 @@ kk_xfb_post_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
 
    if (captured) {
-      VkDrawIndirectCommand dc = data->draws[draw_id];
+      uint64_t verts = (uint64_t)fit_prims * kk_prim_vertices(data->prim);
       u_foreach_bit(b, gfx->descriptors.root.draw.xfb_active_mask) {
-         gfx->xfb.buf[b].offset_B += (uint64_t)dc.vertexCount *
-                                     dc.instanceCount *
-                                     vs->info.vs.xfb_stride_B[b];
+         gfx->xfb.buf[b].offset_B += verts * vs->info.vs.xfb_stride_B[b];
       }
    }
 
@@ -2513,15 +2533,26 @@ kk_draw_impl(struct kk_cmd_buffer *cmd, struct kk_draw_command *data, bool fan_s
       return;
 
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
-
-   /* Unroll geometry. Skip draw if we fail. */
-   if (!fan_static && requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
-      return;
-
-   cmd->limina_draws += data->draw_count;
-
    bool xfb_track =
       unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);
+
+   /* Unroll geometry. Skip draw if we fail. The unroll turns the draw
+    * indirect, so count its primitives for the queries first. */
+   if (!fan_static && requires_unroll(cmd, data)) {
+      if (xfb_track && !data->indirect) {
+         uint64_t gen = 0;
+         for (uint32_t i = 0; i < data->draw_count; i++)
+            gen += kk_xfb_gen_prims(data, i);
+         if (cmd->state.gfx.xfb.tf_pool)
+            cmd->state.gfx.xfb.tf_needed += gen;
+         if (cmd->state.gfx.xfb.pg_pool)
+            cmd->state.gfx.xfb.pg_count += gen;
+      }
+      if (!kk_unroll_geometry(cmd, data))
+         return;
+   }
+
+   cmd->limina_draws += data->draw_count;
 
    for (uint32_t i = 0; i < data->draw_count; i++) {
       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
@@ -2597,9 +2628,96 @@ kk_fan_can_use_static_indices(struct kk_cmd_buffer *cmd,
    return dev->fan_indices != NULL;
 }
 
+/* While transform feedback captures, issue each direct draw as a non-indexed
+ * list of its primitive vertices from vertex 0; the vertex shader maps each
+ * invocation back to the vertex it stands for (kk_nir_lower_xfb.c). That
+ * covers indexed draws, strips, fans and loops, and the last-vertex
+ * provoking convention, without the GPU unroll. Indirect and predicated
+ * draws keep the normal path and do not capture. */
+static bool
+kk_xfb_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+
+   if (!gfx->xfb.enabled || !vs || !vs->info.vs.has_xfb ||
+       cmd->state.shaders[MESA_SHADER_TESS_EVAL] || data->indirect ||
+       data->predicate_count > 0 || data->prim > MESA_PRIM_TRIANGLE_FAN)
+      return false;
+   if (data->indexed && !data->index_buffer.addr)
+      return false;
+
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   bool last = dyn->rs.provoking_vertex != VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+   uint32_t vpp = kk_prim_vertices(data->prim);
+   enum mesa_prim list_prim = vpp == 1   ? MESA_PRIM_POINTS
+                              : vpp == 2 ? MESA_PRIM_LINES
+                                         : MESA_PRIM_TRIANGLES;
+
+   for (uint32_t i = 0; i < data->draw_count; i++) {
+      uint32_t count, instances, first_instance;
+      int32_t base;
+      uint64_t index_addr = 0;
+      if (data->indexed) {
+         const VkDrawIndexedIndirectCommand *d = &data->indexed_draws[i];
+         uint32_t size = data->index_buffer_el_size_B;
+         /* The shader reads the indices itself, so keep it inside the bound
+          * range: a guest-supplied count past the buffer draws fewer. */
+         uint64_t offset = (uint64_t)d->firstIndex * size;
+         uint64_t avail = data->index_buffer.range > offset
+                             ? (data->index_buffer.range - offset) / size
+                             : 0;
+         count = MIN2(d->indexCount, avail);
+         instances = d->instanceCount;
+         first_instance = d->firstInstance;
+         base = d->vertexOffset;
+         index_addr = data->index_buffer.addr + offset;
+      } else {
+         const VkDrawIndirectCommand *d = &data->draws[i];
+         count = d->vertexCount;
+         instances = d->instanceCount;
+         first_instance = d->firstInstance;
+         base = (int32_t)d->firstVertex;
+      }
+
+      uint32_t verts = kk_prims_for_vertices(data->prim, count) * vpp;
+      if (!verts || !instances)
+         continue;
+
+      gfx->xfb.remap.mode = KK_XFB_REMAP_ON | data->prim |
+                            (data->indexed ? data->index_buffer_el_size_B : 0)
+                               << KK_XFB_REMAP_INDEX_SHIFT |
+                            (last ? KK_XFB_REMAP_PROVOKE_LAST : 0);
+      gfx->xfb.remap.count = count;
+      gfx->xfb.remap.base = base;
+      gfx->xfb.remap.index_addr = index_addr;
+
+      struct kk_draw_command list = {
+         .prim = list_prim,
+         .upload_mask = data->upload_mask,
+         .draw_count = 1,
+         .draws[0] = {
+            .vertexCount = verts,
+            .instanceCount = instances,
+            .firstVertex = 0,
+            .firstInstance = first_instance,
+         },
+      };
+      /* No unroll: the list is non-indexed with nothing to restart, and the
+       * shader already puts the provoking vertex first. */
+      kk_draw_impl(cmd, &list, true);
+   }
+
+   gfx->xfb.remap.mode = 0;
+   return true;
+}
+
 static void
 kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
+   if (kk_xfb_draw(cmd, data))
+      return;
+
    if (!kk_fan_can_use_static_indices(cmd, data)) {
       kk_draw_impl(cmd, data, false);
       return;

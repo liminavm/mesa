@@ -56,6 +56,20 @@ struct kk_root_descriptor_table {
           * verts_per_instance + vertex_id. */
          uint32_t xfb_verts_per_instance;
          uint32_t xfb_first_instance;
+         /* Capture stores only slots below this: the whole primitives that
+          * fit in every active buffer. */
+         uint32_t xfb_slot_limit;
+         /* Primitive-vertex remap (kk_nir_lower_xfb.c). While transform
+          * feedback is on, a draw is issued as a non-indexed list of
+          * primitive vertices from vertex 0, and the vertex shader finds its
+          * source vertex from these: the original topology, index size and
+          * provoking convention (KK_XFB_REMAP_*), the original vertex or
+          * index count, firstVertex (non-indexed) or vertexOffset (indexed),
+          * and the address of the draw's first index. 0 = no remap. */
+         uint32_t xfb_remap;
+         uint32_t xfb_remap_count;
+         int32_t xfb_remap_base;
+         uint64_t xfb_remap_index_addr;
       } draw;
       struct {
          uint32_t base_group[3];
@@ -213,9 +227,9 @@ struct kk_graphics_state {
    } tess;
 
    /* Transform feedback state (CPU-tracked; command replay is sequential).
-    * Capture is lowered to vertex-shader global stores, so it is correct
-    * for non-indexed list topologies — exactly the surface GLES3 permits
-    * while transform feedback is active.
+    * Capture is lowered to vertex-shader global stores, and every direct
+    * draw is reissued as a list of primitive vertices while it is on
+    * (kk_xfb_draw); indirect draws do not capture.
     */
    struct {
       bool enabled;
@@ -236,6 +250,15 @@ struct kk_graphics_state {
       uint32_t tf_query;
       uint64_t tf_written, tf_needed;
       bool warned_indirect;
+
+      /* The remap the draw in flight was issued with (kk_xfb_draw); mode 0
+       * outside it. Mirrors the root table's xfb_remap* fields. */
+      struct {
+         uint32_t mode;
+         uint32_t count;
+         int32_t base;
+         uint64_t index_addr;
+      } remap;
    } xfb;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
