@@ -2446,6 +2446,9 @@ zink_set_sampler_views(struct pipe_context *pctx,
          struct zink_sampler_view *b = zink_sampler_view(pview);
 
          if (a == b) {
+            /* the cube bit was cleared above; rebinding the same cube view keeps it */
+            if (b && b->cube_array)
+               ctx->di.cubes[shader_type] |= BITFIELD_BIT(start_slot + i);
             continue;
          }
 
