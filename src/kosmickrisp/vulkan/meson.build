@@ -93,6 +93,7 @@ kk_files = files(
   'kk_nir_lower_custom_border.c',
   'kk_nir_lower_descriptors.c',
   'kk_nir_lower_image_view_min_lod.c',
+  'kk_nir_lower_texel_buffer_rgb32.c',
   'kk_nir_lower_multiview.c',
   'kk_nir_lower_null_images.c',
   'kk_nir_lower_textures.c',

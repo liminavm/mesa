@@ -294,7 +294,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
                        const VkBufferView bufferView, uint32_t binding,
                        uint32_t elem)
 {
-   struct kk_storage_image_descriptor desc = {};
+   struct kk_texel_buffer_descriptor desc = {};
    if (bufferView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
 
@@ -302,6 +302,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
       assert(view->texel_buffer_gpu_id);
 
       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
+      desc.flags = view->texel_buffer_flags;
    }
    write_desc(set, binding, elem, &desc, sizeof(desc));
 }

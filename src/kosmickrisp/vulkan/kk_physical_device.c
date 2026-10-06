@@ -586,7 +586,7 @@ kk_get_device_properties(
       .maxImageDimension3D = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_3D),
       .maxImageDimensionCube = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_2D),
       .maxImageArrayLayers = 2048,
-      .maxTexelBufferElements = 16384 * 16384,
+      .maxTexelBufferElements = KK_MAX_TEXEL_BUFFER_ELEMENTS,
       .maxUniformBufferRange = 65536,
       .maxStorageBufferRange = UINT32_MAX,
       .maxPushConstantsSize = KK_MAX_PUSH_SIZE,
