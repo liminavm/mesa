@@ -218,6 +218,7 @@ struct lower_state {
    struct remap remap;
    nir_instr *raw_vertex_id;
    nir_instr *raw_first_vertex;
+   uint64_t dropped; /* slots that had an xfb-only store removed */
 };
 
 static bool
@@ -258,7 +259,27 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       progress = true;
    }
 
+   /* Capture is done; an output only transform feedback consumed is no
+    * varying at all. Left in, nir_opt_varyings may have packed it into the
+    * free components of a slot the fragment shader reads with another type,
+    * and Metal refuses to link that pair. */
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.no_varying && sem.location >= VARYING_SLOT_VAR0) {
+      state->dropped |= BITFIELD64_BIT(sem.location);
+      nir_instr_remove(&intr->instr);
+      progress = true;
+   }
+
    return progress;
+}
+
+static bool
+gather_written(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_store_output)
+      *(uint64_t *)data |=
+         BITFIELD64_BIT(nir_intrinsic_io_semantics(intr).location);
+   return false;
 }
 
 bool
@@ -269,10 +290,17 @@ kk_nir_lower_xfb(nir_shader *nir)
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_at(nir_before_impl(impl));
 
-   struct lower_state state;
+   struct lower_state state = {0};
    state.remap = build_remap(&b, &state.raw_vertex_id, &state.raw_first_vertex);
 
    nir_shader_intrinsics_pass(nir, lower, nir_metadata_none, &state);
+
+   /* A slot that lost its last store is no longer an output. */
+   if (state.dropped) {
+      uint64_t written = 0;
+      nir_shader_intrinsics_pass(nir, gather_written, nir_metadata_all, &written);
+      nir->info.outputs_written &= ~(state.dropped & ~written);
+   }
 
    BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID);
    BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_FIRST_VERTEX);
