@@ -1093,19 +1093,26 @@ kk_init_fan_indices(const void *data)
    struct kk_device *dev = (struct kk_device *)data;
    const uint32_t tris = KK_FAN_MAX_VERTICES - 2u;
 
-   if (kk_alloc_bo(dev, &dev->vk.base, tris * 3u * sizeof(uint16_t), 0,
+   if (kk_alloc_bo(dev, &dev->vk.base, 2u * tris * 3u * sizeof(uint16_t), 0,
                    &dev->fan_indices) != VK_SUCCESS) {
       dev->fan_indices = NULL;
       return;
    }
 
-   /* Vulkan's (i + 1, i + 2, 0), provoking vertex first -- the order kk_unroll_geometry
-    * produces with flatshade_first, so both paths rasterise a fan identically. */
+   /* Two lists, in the orders kk_unroll_geometry produces, so both paths rasterise a fan
+    * identically. Metal provokes from a triangle's first vertex. The first half is Vulkan's
+    * (i + 1, i + 2, 0) for the first-vertex convention. The second is GL's (0, i + 1, i + 2)
+    * for the last-vertex convention, rotated to (i + 2, 0, i + 1) so the provoking vertex
+    * leads and the winding is kept. */
    uint16_t *idx = dev->fan_indices->cpu;
+   uint16_t *last = idx + 3u * tris;
    for (uint32_t i = 0; i < tris; i++) {
       idx[3u * i + 0u] = i + 1u;
       idx[3u * i + 1u] = i + 2u;
       idx[3u * i + 2u] = 0u;
+      last[3u * i + 0u] = i + 2u;
+      last[3u * i + 1u] = 0u;
+      last[3u * i + 2u] = i + 1u;
    }
 }
 
@@ -2733,6 +2740,11 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    }
 
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   uint32_t first_index =
+      dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
+         ? 0u
+         : 3u * (KK_FAN_MAX_VERTICES - 2u);
    *list = (struct kk_draw_command){
       .prim = MESA_PRIM_TRIANGLES,
       .upload_mask = data->upload_mask,
@@ -2750,7 +2762,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       list->indexed_draws[list->draw_count++] = (VkDrawIndexedIndirectCommand){
          .indexCount = 3u * (d->vertexCount - 2u),
          .instanceCount = d->instanceCount,
-         .firstIndex = 0u,
+         .firstIndex = first_index,
          .vertexOffset = (int32_t)d->firstVertex,
          .firstInstance = d->firstInstance,
       };
