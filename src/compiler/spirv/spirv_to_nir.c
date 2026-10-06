@@ -3934,6 +3934,9 @@ vtn_handle_texture(struct vtn_builder *b, SpvOp opcode,
    case nir_texop_has_custom_border_color_agx:
       vtn_fail("unexpected nir_texop_*_agx");
       break;
+   case nir_texop_texel_buffer_flags_kk:
+      vtn_fail("unexpected nir_texop_*_kk");
+      break;
    case nir_texop_hdr_dim_nv:
    case nir_texop_tex_type_nv:
    case nir_texop_sample_pos_nv:
