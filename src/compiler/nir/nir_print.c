@@ -2008,6 +2008,9 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
    case nir_texop_has_custom_border_color_agx:
       fprintf(fp, "has_custom_border_color_agx ");
       break;
+   case nir_texop_texel_buffer_flags_kk:
+      fprintf(fp, "texel_buffer_flags_kk ");
+      break;
    case nir_texop_custom_border_color_agx:
       fprintf(fp, "custom_border_color_agx ");
       break;
