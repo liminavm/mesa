@@ -82,7 +82,7 @@ struct kk_meta_save {
    } pipeline;
    struct kk_conditional_rendering_state cond_render;
    struct kk_descriptor_set *desc0;
-   struct kk_push_descriptor_set *push_desc0;
+   struct kk_push_descriptor_set push_desc0;
    struct kk_addr_range vb0;
    struct kk_buffer_address desc0_set_addr;
    bool has_push_desc0;
@@ -127,7 +127,7 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
    save->desc0 = desc->sets[0];
    save->has_push_desc0 = desc->push[0];
    if (save->has_push_desc0)
-      save->push_desc0 = desc->push[0];
+      save->push_desc0 = *desc->push[0];
 
    static_assert(sizeof(save->push) == sizeof(desc->root.push),
                  "Size mismatch for push in meta_save");
@@ -158,7 +158,7 @@ kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
       desc->set_sizes[0] = save->desc0->size;
       desc->push_dirty &= ~BITFIELD_BIT(0);
    } else if (save->has_push_desc0) {
-      desc->push[0] = save->push_desc0;
+      *desc->push[0] = save->push_desc0;
       desc->push_dirty |= BITFIELD_BIT(0);
    }
 
