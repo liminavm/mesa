@@ -51,6 +51,15 @@
  * (limina perf/kk-alloc-pool-2026-10-01, spikes/kk-alloc-pool). */
 #define KK_ALLOC_BUDGET_MIB_DEFAULT 16
 #define KK_ALLOC_POOL_WATERMARK 64
+/* The most allocators the pool will hold: four times the watermark, which normal use stays under
+ * (a frame-paced GL client on zink peaks at 13, with up to 11 borrowed at once), and far below the
+ * thousands an unthrottled guest reached before Metal refused an allocation and the worker
+ * aborted. It must stay above the most command buffers clients record at once, or a client that
+ * holds them all waits on itself until its Begin fails. */
+#define KK_ALLOC_CEILING_DEFAULT 256
+/* How long an acquire at the ceiling waits for room before failing. Short: zink retries a failed
+ * vkBeginCommandBuffer itself with its own back-off, and a waiter here stalls a client thread. */
+#define KK_ALLOC_WAIT_MS_DEFAULT 100
 /* Idle-decay before an under-budget allocator counts as surplus. Long enough that a burst which
  * merely paused between frames keeps its working set; short enough that an app exit is reclaimed
  * while the compositor is still drawing (reclaim is acquire-driven, so a fully idle guest holds
@@ -80,12 +89,18 @@ kk_alloc_pool_init(struct kk_device *dev)
 {
    struct kk_alloc_pool *pool = &dev->alloc_pool;
 
-   simple_mtx_init(&pool->mtx, mtx_plain);
+   mtx_init(&pool->mtx, mtx_plain);
+   cnd_init(&pool->room);
    util_dynarray_init(&pool->allocs, NULL);
    pool->budget_bytes =
       kk_env_u64("LIMINA_KK_ALLOC_BUDGET_MIB", KK_ALLOC_BUDGET_MIB_DEFAULT) * 1024u * 1024u;
    pool->decay_ns = kk_env_u64("LIMINA_KK_ALLOC_DECAY_MS", KK_ALLOC_DECAY_MS_DEFAULT) * 1000000ull;
    pool->floor = (uint32_t)kk_env_u64("LIMINA_KK_ALLOC_FLOOR", KK_ALLOC_FLOOR_DEFAULT);
+   pool->ceiling = (uint32_t)kk_env_u64("LIMINA_KK_ALLOC_CEILING", KK_ALLOC_CEILING_DEFAULT);
+   if (pool->ceiling && pool->ceiling <= pool->floor)
+      pool->ceiling = pool->floor + 1;
+   pool->wait_ns = kk_env_u64("LIMINA_KK_ALLOC_WAIT_MS", KK_ALLOC_WAIT_MS_DEFAULT) * 1000000ull;
+   pool->watermark_warned = KK_ALLOC_POOL_WATERMARK;
    pool->destroy_enabled = kk_env_u64("LIMINA_KK_ALLOC_DESTROY", 1) != 0;
    pool->stats_every = kk_env_u64("LIMINA_KK_ALLOC_STATS", 0);
 }
@@ -100,18 +115,21 @@ kk_alloc_pool_finish(struct kk_device *dev)
     * allocator under one is a use-after-free, so give them a bounded moment to land. */
    for (unsigned waited_ms = 0; waited_ms < 2000; ++waited_ms) {
       uint32_t pending = 0;
-      simple_mtx_lock(&pool->mtx);
+      mtx_lock(&pool->mtx);
       util_dynarray_foreach(&pool->allocs, kk_pooled_alloc_ptr, pap)
          pending += (*pap)->pending;
-      simple_mtx_unlock(&pool->mtx);
+      mtx_unlock(&pool->mtx);
       if (pending == 0)
          break;
       os_time_sleep(1000);
    }
 
-   if (pool->destroyed) {
-      fprintf(stderr, "[LIMINA-ALLOC-POOL] teardown: live=%u peak=%u released=%u\n", pool->live,
-              pool->peak_live, pool->destroyed);
+   if (pool->destroyed || pool->ceiling_waits) {
+      fprintf(stderr,
+              "[LIMINA-ALLOC-POOL] teardown: live=%u peak=%u released=%u ceiling-waits=%llu "
+              "ceiling-fails=%llu\n",
+              pool->live, pool->peak_live, pool->destroyed,
+              (unsigned long long)pool->ceiling_waits, (unsigned long long)pool->ceiling_fails);
    }
 
    util_dynarray_foreach(&pool->allocs, kk_pooled_alloc_ptr, pap) {
@@ -119,7 +137,8 @@ kk_alloc_pool_finish(struct kk_device *dev)
       free(*pap);
    }
    util_dynarray_fini(&pool->allocs);
-   simple_mtx_destroy(&pool->mtx);
+   cnd_destroy(&pool->room);
+   mtx_destroy(&pool->mtx);
 }
 
 /* Whether `pa` should leave the pool now. A drained over-budget allocator always goes; an idle
@@ -163,6 +182,24 @@ kk_alloc_pool_stats(struct kk_alloc_pool *pool)
            sum / (1024.0 * 1024.0), max / (1024.0 * 1024.0));
 }
 
+/* Release what a pass of the acquire loop unlinked. Outside the lock on purpose: releasing an
+ * allocator unmaps its heaps in the kernel, and vkBeginCommandBuffer must not serialise behind
+ * that. Measured to return 100% of the heaps (spikes/vrend-region-leak/mtl4-repro/destroy-probe.m). */
+static void
+kk_alloc_pool_release_doomed(mtl_command_allocator **doomed, unsigned *n_doomed)
+{
+   for (unsigned i = 0; i < *n_doomed; i++)
+      mtl_release(doomed[i]);
+   *n_doomed = 0;
+}
+
+static void
+kk_alloc_pool_wake(struct kk_alloc_pool *pool)
+{
+   if (pool->waiters)
+      cnd_broadcast(&pool->room);
+}
+
 struct kk_pooled_alloc *
 kk_alloc_pool_acquire(struct kk_device *dev)
 {
@@ -170,40 +207,98 @@ kk_alloc_pool_acquire(struct kk_device *dev)
    struct kk_pooled_alloc *found = NULL;
    mtl_command_allocator *doomed[KK_ALLOC_RELEASE_BATCH];
    unsigned n_doomed = 0;
-   const uint64_t now = os_time_get_nano();
+   uint64_t deadline = 0;
 
-   simple_mtx_lock(&pool->mtx);
+   mtx_lock(&pool->mtx);
 
-   /* An allocator that is ready as-is: not borrowed, not over budget. Prefer the most recently
-    * used one, so the rest age out under the decay clock instead of being kept warm in rotation. */
-   util_dynarray_foreach(&pool->allocs, kk_pooled_alloc_ptr, pap) {
-      struct kk_pooled_alloc *pa = *pap;
-      if (pa->in_use || pa->draining)
-         continue;
-      if (!found || pa->idle_since > found->idle_since)
-         found = pa;
-   }
+   for (;;) {
+      const uint64_t now = os_time_get_nano();
 
-   /* Unlink the surplus here and release it outside the mutex below. Only alongside a pooled
-    * hand-out for the decay case, so a decay release is never paired with a mint in the same
-    * call: that pairing is exactly the thrash the floor and the decay window exist to avoid. A
-    * drained over-budget allocator is unusable either way, so it goes regardless. */
-   uint32_t live_after = pool->live;
-   for (unsigned i = 0; i < util_dynarray_num_elements(&pool->allocs, kk_pooled_alloc_ptr) &&
-                        n_doomed < KK_ALLOC_RELEASE_BATCH;) {
-      struct kk_pooled_alloc *pa = *util_dynarray_element(&pool->allocs, kk_pooled_alloc_ptr, i);
-      if (pa == found || !kk_alloc_pool_is_surplus(pool, pa, live_after, now) ||
-          (!pa->draining && !found)) {
-         i++;
+      /* An allocator that is ready as-is: not borrowed, not over budget. Prefer the most recently
+       * used one, so the rest age out under the decay clock instead of being kept warm in
+       * rotation. */
+      util_dynarray_foreach(&pool->allocs, kk_pooled_alloc_ptr, pap) {
+         struct kk_pooled_alloc *pa = *pap;
+         if (pa->in_use || pa->draining)
+            continue;
+         if (!found || pa->idle_since > found->idle_since)
+            found = pa;
+      }
+
+      /* Unlink the surplus here and release it outside the mutex. Only alongside a pooled
+       * hand-out for the decay case, so a decay release is never paired with a mint in the same
+       * call: that pairing is exactly the thrash the floor and the decay window exist to avoid. A
+       * drained over-budget allocator is unusable either way, so it goes regardless, and at the
+       * ceiling that is what makes room. */
+      uint32_t live_after = pool->live;
+      for (unsigned i = 0; i < util_dynarray_num_elements(&pool->allocs, kk_pooled_alloc_ptr) &&
+                           n_doomed < KK_ALLOC_RELEASE_BATCH;) {
+         struct kk_pooled_alloc *pa =
+            *util_dynarray_element(&pool->allocs, kk_pooled_alloc_ptr, i);
+         if (pa == found || !kk_alloc_pool_is_surplus(pool, pa, live_after, now) ||
+             (!pa->draining && !found)) {
+            i++;
+            continue;
+         }
+         doomed[n_doomed++] = pa->handle;
+         util_dynarray_delete_unordered(&pool->allocs, kk_pooled_alloc_ptr, pa);
+         free(pa);
+         live_after--;
+      }
+      pool->destroyed += pool->live - live_after;
+      pool->live = live_after;
+
+      if (found || !pool->ceiling || pool->live < pool->ceiling)
+         break;
+
+      /* At the ceiling. A lost device completes nothing, so nothing will ever drain. */
+      if (vk_device_is_lost_no_report(&dev->vk))
+         break;
+
+      if (!deadline) {
+         deadline = now + pool->wait_ns;
+         if (util_is_power_of_two_nonzero64(++pool->ceiling_waits)) {
+            fprintf(stderr,
+                    "[LIMINA-ALLOC-POOL] at its ceiling of %u allocators — waiting up to %llu ms "
+                    "for the GPU (%llu times so far)\n",
+                    pool->ceiling, (unsigned long long)(pool->wait_ns / 1000000ull),
+                    (unsigned long long)pool->ceiling_waits);
+         }
+      } else if (now >= deadline) {
+         if (util_is_power_of_two_nonzero64(++pool->ceiling_fails)) {
+            fprintf(stderr,
+                    "[LIMINA-ALLOC-POOL] still at its ceiling of %u allocators after %llu ms — "
+                    "refusing a command allocator (%llu times so far)\n",
+                    pool->ceiling, (unsigned long long)(pool->wait_ns / 1000000ull),
+                    (unsigned long long)pool->ceiling_fails);
+         }
+         mtx_unlock(&pool->mtx);
+         kk_alloc_pool_release_doomed(doomed, &n_doomed);
+         return NULL;
+      }
+
+      /* Nothing unlinked can still be pending, so freeing it now is safe; do it before
+       * sleeping rather than holding the heaps across the wait. */
+      if (n_doomed) {
+         mtx_unlock(&pool->mtx);
+         kk_alloc_pool_release_doomed(doomed, &n_doomed);
+         mtx_lock(&pool->mtx);
          continue;
       }
-      doomed[n_doomed++] = pa->handle;
-      util_dynarray_delete_unordered(&pool->allocs, kk_pooled_alloc_ptr, pa);
-      free(pa);
-      live_after--;
+
+      struct timespec abs;
+      timespec_get(&abs, TIME_UTC);
+      uint64_t left = deadline - now;
+      abs.tv_sec += left / 1000000000ull;
+      abs.tv_nsec += left % 1000000000ull;
+      if (abs.tv_nsec >= 1000000000l) {
+         abs.tv_sec++;
+         abs.tv_nsec -= 1000000000l;
+      }
+      pool->waiters++;
+      cnd_timedwait(&pool->room, &pool->mtx, &abs);
+      pool->waiters--;
    }
-   pool->destroyed += pool->live - live_after;
-   pool->live = live_after;
 
    if (!found) {
       /* A lost device completes nothing, so an allocator minted after the loss can never drain.
@@ -217,15 +312,13 @@ kk_alloc_pool_acquire(struct kk_device *dev)
             fprintf(stderr, "[LIMINA-KK] device is lost — refusing to mint command allocators\n");
             fflush(stderr);
          }
-         simple_mtx_unlock(&pool->mtx);
-         for (unsigned i = 0; i < n_doomed; i++)
-            mtl_release(doomed[i]);
+         mtx_unlock(&pool->mtx);
+         kk_alloc_pool_release_doomed(doomed, &n_doomed);
          return NULL;
       }
 
-      /* Never block waiting for a drain: stalling vkBeginCommandBuffer on GPU progress invites
-       * jank and priority inversion, and the in-flight depth that drives this is already bounded
-       * by the client's own fencing. Mint instead, and make growth loud. */
+      /* Below the ceiling, never block waiting for a drain: stalling vkBeginCommandBuffer on GPU
+       * progress invites jank and priority inversion. Mint instead, and make growth visible. */
       found = calloc(1, sizeof(*found));
       if (found)
          found->handle = mtl_new_command_allocator(dev->mtl_handle);
@@ -235,21 +328,22 @@ kk_alloc_pool_acquire(struct kk_device *dev)
          if (found && found->handle)
             mtl_release(found->handle);
          free(found);
-         simple_mtx_unlock(&pool->mtx);
-         for (unsigned i = 0; i < n_doomed; i++)
-            mtl_release(doomed[i]);
+         mtx_unlock(&pool->mtx);
+         kk_alloc_pool_release_doomed(doomed, &n_doomed);
          return NULL;
       }
       *slot = found;
       pool->live++;
       if (pool->live > pool->peak_live)
          pool->peak_live = pool->live;
-      if (pool->live > KK_ALLOC_POOL_WATERMARK && pool->live > pool->watermark_warned) {
-         pool->watermark_warned = pool->live;
+      /* A high-water mark, reported at each doubling past the watermark rather than at every new
+       * peak: a runaway used to print one line per allocator, which added load of its own. */
+      if (pool->live > pool->watermark_warned) {
+         pool->watermark_warned *= 2;
          fprintf(stderr,
-                 "[LIMINA-ALLOC-POOL] grew to %u allocators (budget %llu MiB) — in-flight depth "
-                 "is outrunning completion\n",
-                 pool->live, (unsigned long long)(pool->budget_bytes >> 20));
+                 "[LIMINA-ALLOC-POOL] grew to %u allocators (budget %llu MiB, ceiling %u) — "
+                 "in-flight depth is outrunning completion\n",
+                 pool->live, (unsigned long long)(pool->budget_bytes >> 20), pool->ceiling);
       }
    }
 
@@ -259,13 +353,9 @@ kk_alloc_pool_acquire(struct kk_device *dev)
    pool->acquires++;
    if (pool->stats_every && pool->acquires % pool->stats_every == 0)
       kk_alloc_pool_stats(pool);
-   simple_mtx_unlock(&pool->mtx);
+   mtx_unlock(&pool->mtx);
 
-   /* Outside the lock on purpose: releasing an allocator unmaps its heaps in the kernel, and
-    * vkBeginCommandBuffer must not serialise behind that. Measured to return 100% of the heaps
-    * (spikes/vrend-region-leak/mtl4-repro/destroy-probe.m). */
-   for (unsigned i = 0; i < n_doomed; i++)
-      mtl_release(doomed[i]);
+   kk_alloc_pool_release_doomed(doomed, &n_doomed);
 
    return found;
 }
@@ -280,7 +370,7 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa)
    /* Read the size OUTSIDE the lock: this is a Metal call on the recording path. */
    uint64_t size = mtl_command_allocator_allocated_size(pa->handle);
 
-   simple_mtx_lock(&pool->mtx);
+   mtx_lock(&pool->mtx);
    pa->in_use = false;
    pa->idle_since = os_time_get_nano();
    /* Retire on budget when the borrow ends: allocatedSize never shrinks, so an allocator past the
@@ -290,7 +380,8 @@ kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa)
       pool->retired++;
       pool->retired_uses += pa->uses;
    }
-   simple_mtx_unlock(&pool->mtx);
+   kk_alloc_pool_wake(pool);
+   mtx_unlock(&pool->mtx);
 }
 
 void
@@ -298,9 +389,9 @@ kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa)
 {
    if (!pa)
       return;
-   simple_mtx_lock(&dev->alloc_pool.mtx);
+   mtx_lock(&dev->alloc_pool.mtx);
    pa->pending++;
-   simple_mtx_unlock(&dev->alloc_pool.mtx);
+   mtx_unlock(&dev->alloc_pool.mtx);
 }
 
 void
@@ -308,11 +399,14 @@ kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa)
 {
    if (!pa)
       return;
-   simple_mtx_lock(&dev->alloc_pool.mtx);
+   mtx_lock(&dev->alloc_pool.mtx);
    assert(pa->pending > 0);
    if (pa->pending > 0)
       pa->pending--;
-   simple_mtx_unlock(&dev->alloc_pool.mtx);
+   /* A drained over-budget allocator is what frees room at the ceiling. */
+   if (pa->pending == 0 && pa->draining)
+      kk_alloc_pool_wake(&dev->alloc_pool);
+   mtx_unlock(&dev->alloc_pool.mtx);
 }
 
 struct kk_mtl_compiler {
