@@ -1041,6 +1041,29 @@ kk_cmd_buffer_flush_push_descriptors(struct kk_cmd_buffer *cmd,
 }
 
 void
+kk_dispatch_grid(mtl_compute_encoder *encoder, struct kk_grid grid,
+                 struct mtl_size local_size)
+{
+   switch (grid.mode) {
+   case KK_GRID_DIRECT:
+      mtl_dispatch_threads(encoder, grid.size, local_size);
+      break;
+   case KK_GRID_INDIRECT:
+      mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
+                                                     local_size);
+      break;
+   case KK_GRID_INDIRECT_THREADS:
+      /* The GPU has not run yet, so this lands before the kernel that writes
+       * the thread counts next to it. */
+      grid.cpu[3] = local_size.x;
+      grid.cpu[4] = local_size.y;
+      grid.cpu[5] = local_size.z;
+      mtl_dispatch_threads_with_indirect_buffer(encoder, grid.addr);
+      break;
+   }
+}
+
+void
 kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
                     bool pre_gfx, enum libkk_program idx, void *data,
                     size_t data_size)
@@ -1065,11 +1088,7 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
       .z = prog->info.workgroup_size[2],
    };
 
-   if (grid.mode == KK_GRID_DIRECT)
-      mtl_dispatch_threads(encoder, grid.size, local_size);
-   else
-      mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
-                                                     local_size);
+   kk_dispatch_grid(encoder, grid, local_size);
    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
 
