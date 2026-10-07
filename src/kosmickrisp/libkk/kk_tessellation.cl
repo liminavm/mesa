@@ -76,18 +76,21 @@ libkk_tess_setup_indirect(
          poly_index_buffer_range_el(in_index_buffer_range_el, indirect[2]);
    }
 
+   /* Thread counts of three MTLDispatchThreadsIndirectArguments; the
+    * dispatch fills in each threadgroup size (KK_GRID_INDIRECT_THREADS). */
+
    /* VS grid size */
    grids[0] = count;
    grids[1] = instance_count;
    grids[2] = 1;
 
    /* TCS grid size */
-   grids[3] = in_patches * p->output_patch_size;
-   grids[4] = instance_count;
-   grids[5] = 1;
+   grids[6] = in_patches * p->output_patch_size;
+   grids[7] = instance_count;
+   grids[8] = 1;
 
    /* Tess grid size */
-   grids[6] = unrolled_patches;
-   grids[7] = 1;
-   grids[8] = 1;
+   grids[12] = unrolled_patches;
+   grids[13] = 1;
+   grids[14] = 1;
 }

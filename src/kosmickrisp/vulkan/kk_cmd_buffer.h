@@ -457,7 +457,13 @@ bool kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
 
 enum kk_grid_mode {
    KK_GRID_DIRECT = 0u,
+   /* Threadgroup counts at addr (MTLDispatchThreadgroupsIndirectArguments) */
    KK_GRID_INDIRECT,
+   /* Thread counts at addr, written on the GPU, followed by the threadgroup
+    * size, which the dispatch writes through cpu
+    * (MTLDispatchThreadsIndirectArguments). The poly kernels size grids in
+    * threads, as AGX dispatches do. */
+   KK_GRID_INDIRECT_THREADS,
 };
 struct kk_grid {
    enum kk_grid_mode mode;
@@ -465,7 +471,12 @@ struct kk_grid {
       struct mtl_size size;
       uint64_t addr;
    };
+   uint32_t *cpu; /* KK_GRID_INDIRECT_THREADS only */
 };
+
+/* An indirect thread grid takes six words: three of threads, three of
+ * threadgroup size. */
+#define KK_GRID_INDIRECT_THREADS_SIZE_B (6u * sizeof(uint32_t))
 
 static struct kk_grid
 kk_grid_3d(uint32_t x, uint32_t y, uint32_t z)
@@ -496,6 +507,19 @@ kk_grid_indirect(uint64_t addr)
       .addr = addr,
    };
 }
+
+static struct kk_grid
+kk_grid_indirect_threads(uint64_t addr, void *cpu)
+{
+   return (struct kk_grid){
+      .mode = KK_GRID_INDIRECT_THREADS,
+      .addr = addr,
+      .cpu = cpu,
+   };
+}
+
+void kk_dispatch_grid(mtl_compute_encoder *encoder, struct kk_grid grid,
+                      struct mtl_size local_size);
 
 static bool
 kk_grid_is_indirect(struct kk_grid grid)
