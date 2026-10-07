@@ -1228,6 +1228,9 @@ void
 mtl_dispatch_threads_with_indirect_buffer(mtl_compute_encoder *encoder,
                                           uint64_t addr)
 {
+   if (limina_enc_check(encoder, "mtl_dispatch_threads_with_indirect_buffer", NULL) ==
+       LIMINA_ENC_BROKEN)
+      return;
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       [enc dispatchThreadsWithIndirectBuffer:addr];
