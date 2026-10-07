@@ -93,9 +93,12 @@ struct kk_precompiled_cache {
  * The pool bounds and returns it: allocators are borrowed device-wide for the span of one
  * recording, so the count follows concurrency; one that crosses a byte budget leaves service and
  * is released once every command buffer begun on it has completed; and an idle one past a decay
- * window is released above a floor. Nothing is ever reset: reset returns no memory, and reusing a
- * reset allocator faults inside -[IOGPUMetal4CommandBuffer fillCommandBufferArgs:] at commit under
- * upstream's reused-MTL4CommandBuffer model (spikes/kk-alloc-pool/RESULTS.md).
+ * window is released above a floor. The count has a ceiling: an acquire that finds the pool full
+ * waits briefly for a borrow to end or a drained allocator to be released, then fails, because a
+ * guest's in-flight depth is not bounded by anything the host controls. Nothing is ever reset:
+ * reset returns no memory, and reusing a reset allocator faults inside
+ * -[IOGPUMetal4CommandBuffer fillCommandBufferArgs:] at commit under upstream's
+ * reused-MTL4CommandBuffer model (spikes/kk-alloc-pool/RESULTS.md).
  */
 struct kk_pooled_alloc {
    mtl_command_allocator *handle;
@@ -112,17 +115,27 @@ struct kk_pooled_alloc {
 };
 
 struct kk_alloc_pool {
-   simple_mtx_t mtx;
+   mtx_t mtx;
+   /* Signalled by release and discharge, the two events that can make room at the ceiling, and
+    * only while someone waits: the common path takes no extra syscall. */
+   cnd_t room;
+   uint32_t waiters;
    struct util_dynarray allocs; /* struct kk_pooled_alloc * */
    uint64_t budget_bytes;
    uint64_t decay_ns;    /* idle this long before an under-budget allocator is surplus */
    uint32_t floor;       /* never decay below this many (drained over-budget ones always go) */
+   /* Never mint past this many live allocators (0 = no ceiling). At the ceiling an acquire waits
+    * up to wait_ns for a release or a drain, then fails. */
+   uint32_t ceiling;
+   uint64_t wait_ns;
    bool destroy_enabled; /* LIMINA_KK_ALLOC_DESTROY=0 kill switch */
    /* Stats, so neither growth nor reclaim is silent. */
    uint32_t live;
    uint32_t peak_live;
    uint32_t destroyed;
-   uint32_t watermark_warned;
+   uint32_t watermark_warned; /* growth past this warns, and doubles it */
+   uint64_t ceiling_waits;    /* acquires that found the pool at its ceiling */
+   uint64_t ceiling_fails;    /* ... and gave up */
    uint64_t acquires;
    uint64_t stats_every; /* LIMINA_KK_ALLOC_STATS=<n>: a stats line every n acquires; 0 = off */
    uint64_t retired;     /* crossed the budget */
