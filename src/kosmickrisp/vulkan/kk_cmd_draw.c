@@ -1331,8 +1331,8 @@ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
       args.counts = addr + count_offs;
    } else {
       /* Allocate 3x indirect global+local grids for VS/TCS/tess */
-      uint32_t grid_stride = sizeof(uint32_t) * 3;
-      gfx->tess.indirect_ptr = kk_pool_alloc(cmd, grid_stride * 3, 4);
+      gfx->tess.indirect_ptr =
+         kk_pool_alloc(cmd, KK_GRID_INDIRECT_THREADS_SIZE_B * 3, 4);
 
       struct kk_ptr ptr = kk_pool_alloc(cmd, draw_stride_B, 4);
       gfx->tess.out_draws_addr = ptr.gpu;
@@ -2047,11 +2047,7 @@ static void
 kk_dispatch_compute(mtl_compute_encoder *enc, struct kk_grid grid,
                     struct mtl_size local_size)
 {
-   if (grid.mode == KK_GRID_DIRECT)
-      mtl_dispatch_threads(enc, grid.size, local_size);
-   else
-      mtl_dispatch_threadgroups_with_indirect_buffer(enc, grid.addr,
-                                                     local_size);
+   kk_dispatch_grid(enc, grid, local_size);
 }
 
 static struct kk_draw_data
@@ -2089,12 +2085,15 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
 
       libkk_tess_setup_indirect_struct(cmd, kk_grid_1d(1), true, args);
 
-      uint32_t grid_stride = sizeof(uint32_t) * 3;
-      grid_vs = kk_grid_indirect(gfx->tess.indirect_ptr.gpu + 0u * grid_stride);
-      grid_tcs =
-         kk_grid_indirect(gfx->tess.indirect_ptr.gpu + 1u * grid_stride);
-      grid_tess =
-         kk_grid_indirect(gfx->tess.indirect_ptr.gpu + 2u * grid_stride);
+      struct kk_ptr grids = gfx->tess.indirect_ptr;
+      uint32_t *grids_cpu = grids.cpu;
+      const uint32_t grid_words = KK_GRID_INDIRECT_THREADS_SIZE_B / 4u;
+      grid_vs = kk_grid_indirect_threads(grids.gpu, grids_cpu);
+      grid_tcs = kk_grid_indirect_threads(
+         grids.gpu + KK_GRID_INDIRECT_THREADS_SIZE_B, grids_cpu + grid_words);
+      grid_tess = kk_grid_indirect_threads(
+         grids.gpu + 2u * KK_GRID_INDIRECT_THREADS_SIZE_B,
+         grids_cpu + 2u * grid_words);
    } else {
       uint32_t patches = draw.grid.size.x / input_patch_size;
       grid_vs = grid_tcs = kk_grid_2d(draw.grid.size.x, draw.grid.size.y);
