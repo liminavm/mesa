@@ -40,6 +40,10 @@ struct minmax_cache_key {
    GLintptr offset;
    GLuint count;
    unsigned index_size;
+   /* Whether the scan skipped restart indices, and which. The bounds differ
+    * either way, and only a restart scan can say whether one is present. */
+   uint32_t primitive_restart;
+   uint32_t restart_index;
 };
 
 
@@ -47,6 +51,8 @@ struct minmax_cache_entry {
    struct minmax_cache_key key;
    GLuint min;
    GLuint max;
+   /* A restart scan found the restart index in the range. */
+   bool restart_found;
 };
 
 
@@ -62,7 +68,9 @@ vbo_minmax_cache_key_equal(const struct minmax_cache_key *a,
                            const struct minmax_cache_key *b)
 {
    return (a->offset == b->offset) && (a->count == b->count) &&
-          (a->index_size == b->index_size);
+          (a->index_size == b->index_size) &&
+          (a->primitive_restart == b->primitive_restart) &&
+          (a->restart_index == b->restart_index);
 }
 
 
@@ -104,7 +112,9 @@ vbo_delete_minmax_cache(struct gl_buffer_object *bufferObj)
 static GLboolean
 vbo_get_minmax_cached(struct gl_buffer_object *bufferObj,
                       unsigned index_size, GLintptr offset, GLuint count,
-                      GLuint *min_index, GLuint *max_index)
+                      bool primitive_restart, unsigned restart_index,
+                      GLuint *min_index, GLuint *max_index,
+                      bool *restart_found)
 {
    GLboolean found = GL_FALSE;
    struct minmax_cache_key key;
@@ -142,12 +152,15 @@ vbo_get_minmax_cached(struct gl_buffer_object *bufferObj,
    key.index_size = index_size;
    key.offset = offset;
    key.count = count;
+   key.primitive_restart = primitive_restart;
+   key.restart_index = primitive_restart ? restart_index : 0;
    hash = vbo_minmax_cache_hash(&key);
    result = _mesa_hash_table_search_pre_hashed(bufferObj->MinMaxCache, hash, &key);
    if (result) {
       struct minmax_cache_entry *entry = result->data;
       *min_index = entry->min;
       *max_index = entry->max;
+      *restart_found = entry->restart_found;
       found = GL_TRUE;
    }
 
@@ -176,7 +189,8 @@ static void
 vbo_minmax_cache_store(struct gl_context *ctx,
                        struct gl_buffer_object *bufferObj,
                        unsigned index_size, GLintptr offset, GLuint count,
-                       GLuint min, GLuint max)
+                       bool primitive_restart, unsigned restart_index,
+                       GLuint min, GLuint max, bool restart_found)
 {
    struct minmax_cache_entry *entry;
    struct hash_entry *table_entry;
@@ -203,8 +217,11 @@ vbo_minmax_cache_store(struct gl_context *ctx,
    entry->key.offset = offset;
    entry->key.count = count;
    entry->key.index_size = index_size;
+   entry->key.primitive_restart = primitive_restart;
+   entry->key.restart_index = primitive_restart ? restart_index : 0;
    entry->min = min;
    entry->max = max;
+   entry->restart_found = restart_found;
    hash = vbo_minmax_cache_hash(&entry->key);
 
    table_entry = _mesa_hash_table_search_pre_hashed(bufferObj->MinMaxCache,
@@ -228,12 +245,14 @@ out:
 }
 
 
-void
-vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
-                            unsigned restartIndex, bool restart,
-                            const void *indices,
-                            unsigned *min_index, unsigned *max_index)
+static void
+get_minmax_index_mapped(unsigned count, unsigned index_size,
+                        unsigned restartIndex, bool restart,
+                        const void *indices, unsigned *min_index,
+                        unsigned *max_index, bool *restart_found)
 {
+   unsigned restarts = 0;
+
    switch (index_size) {
    case 4: {
       const GLuint *ui_indices = (const GLuint *)indices;
@@ -244,6 +263,8 @@ vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
             if (ui_indices[i] != restartIndex) {
                if (ui_indices[i] > max_ui) max_ui = ui_indices[i];
                if (ui_indices[i] < min_ui) min_ui = ui_indices[i];
+            } else {
+               restarts++;
             }
          }
       }
@@ -272,6 +293,8 @@ vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
             if (us_indices[i] != restartIndex) {
                if (us_indices[i] > max_us) max_us = us_indices[i];
                if (us_indices[i] < min_us) min_us = us_indices[i];
+            } else {
+               restarts++;
             }
          }
       }
@@ -294,6 +317,8 @@ vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
             if (ub_indices[i] != restartIndex) {
                if (ub_indices[i] > max_ub) max_ub = ub_indices[i];
                if (ub_indices[i] < min_ub) min_ub = ub_indices[i];
+            } else {
+               restarts++;
             }
          }
       }
@@ -310,6 +335,20 @@ vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
    default:
       UNREACHABLE("not reached");
    }
+
+   *restart_found = restarts > 0;
+}
+
+
+void
+vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
+                            unsigned restartIndex, bool restart,
+                            const void *indices,
+                            unsigned *min_index, unsigned *max_index)
+{
+   bool restart_found;
+   get_minmax_index_mapped(count, index_size, restartIndex, restart, indices,
+                           min_index, max_index, &restart_found);
 }
 
 
@@ -319,12 +358,12 @@ vbo_get_minmax_index_mapped(unsigned count, unsigned index_size,
  * If primitive restart is enabled, we need to ignore restart
  * indexes when computing min/max.
  */
-void
-vbo_get_minmax_index(struct gl_context *ctx, struct gl_buffer_object *obj,
-                     const void *ptr, GLintptr offset, unsigned count,
-                     unsigned index_size, bool primitive_restart,
-                     unsigned restart_index, GLuint *min_index,
-                     GLuint *max_index)
+static void
+get_minmax_index(struct gl_context *ctx, struct gl_buffer_object *obj,
+                 const void *ptr, GLintptr offset, unsigned count,
+                 unsigned index_size, bool primitive_restart,
+                 unsigned restart_index, GLuint *min_index,
+                 GLuint *max_index, bool *restart_found)
 {
    const char *indices;
 
@@ -333,23 +372,69 @@ vbo_get_minmax_index(struct gl_context *ctx, struct gl_buffer_object *obj,
    } else {
       GLsizeiptr size = MIN2((GLsizeiptr)count * index_size, obj->Size);
 
-      if (vbo_get_minmax_cached(obj, index_size, offset, count, min_index,
-                                max_index))
+      if (vbo_get_minmax_cached(obj, index_size, offset, count,
+                                primitive_restart, restart_index, min_index,
+                                max_index, restart_found))
          return;
 
       indices = _mesa_bufferobj_map_range(ctx, offset, size, GL_MAP_READ_BIT,
                                           obj, MAP_INTERNAL);
    }
 
-   vbo_get_minmax_index_mapped(count, index_size, restart_index,
-                               primitive_restart, indices,
-                               min_index, max_index);
+   get_minmax_index_mapped(count, index_size, restart_index,
+                           primitive_restart, indices, min_index, max_index,
+                           restart_found);
 
    if (obj) {
-      vbo_minmax_cache_store(ctx, obj, index_size, offset, count, *min_index,
-                             *max_index);
+      vbo_minmax_cache_store(ctx, obj, index_size, offset, count,
+                             primitive_restart, restart_index, *min_index,
+                             *max_index, *restart_found);
       _mesa_bufferobj_unmap(ctx, obj, MAP_INTERNAL);
    }
+}
+
+void
+vbo_get_minmax_index(struct gl_context *ctx, struct gl_buffer_object *obj,
+                     const void *ptr, GLintptr offset, unsigned count,
+                     unsigned index_size, bool primitive_restart,
+                     unsigned restart_index, GLuint *min_index,
+                     GLuint *max_index)
+{
+   bool restart_found;
+   get_minmax_index(ctx, obj, ptr, offset, count, index_size,
+                    primitive_restart, restart_index, min_index, max_index,
+                    &restart_found);
+}
+
+/**
+ * Whether any of the draws' index ranges holds the restart index. A driver
+ * that can only emulate restart for some topologies uses it to draw without
+ * restart when there is nothing to restart. The answer is cached with the
+ * range's bounds, so a static index buffer is scanned once.
+ */
+bool
+vbo_draws_have_restart_index(struct gl_context *ctx,
+                             const struct pipe_draw_info *info,
+                             const struct pipe_draw_start_count_bias *draws,
+                             unsigned num_draws)
+{
+   struct gl_buffer_object *buf =
+      info->has_user_indices ? NULL : ctx->Array.VAO->IndexBufferObj;
+
+   for (unsigned i = 0; i < num_draws; i++) {
+      if (!draws[i].count)
+         continue;
+
+      GLuint min, max;
+      bool restart_found;
+      get_minmax_index(ctx, buf, info->index.user,
+                       (GLintptr)draws[i].start * info->index_size,
+                       draws[i].count, info->index_size, true,
+                       info->restart_index, &min, &max, &restart_found);
+      if (restart_found)
+         return true;
+   }
+   return false;
 }
 
 /**

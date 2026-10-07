@@ -238,6 +238,12 @@ vbo_get_minmax_index(struct gl_context *ctx, struct gl_buffer_object *obj,
                      GLuint *max_index);
 
 bool
+vbo_draws_have_restart_index(struct gl_context *ctx,
+                             const struct pipe_draw_info *info,
+                             const struct pipe_draw_start_count_bias *draws,
+                             unsigned num_draws);
+
+bool
 vbo_get_minmax_indices_gallium(struct gl_context *ctx,
                                struct pipe_draw_info *info,
                                const struct pipe_draw_start_count_bias *draws,
