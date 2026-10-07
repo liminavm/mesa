@@ -724,12 +724,15 @@ msl_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances)
    return nir_progress(true, b->impl, nir_metadata_control_flow);
 }
 
-/* Scalarize stores to CLIP_DIST* varyings */
+/* Scalarize stores to, and loads from, CLIP_DIST* varyings: MSL carries them
+ * as one scalar member per component (see msl_iomap.c) */
 static bool
 scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
                                     UNUSED const void *_data)
 {
-   if (intrin->intrinsic != nir_intrinsic_store_output)
+   if (intrin->intrinsic != nir_intrinsic_store_output &&
+       intrin->intrinsic != nir_intrinsic_load_input &&
+       intrin->intrinsic != nir_intrinsic_load_interpolated_input)
       return false;
    nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
    return semantics.location == VARYING_SLOT_CLIP_DIST0 ||
@@ -741,7 +744,8 @@ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
 void
 msl_nir_lower_clip_cull_distance(nir_shader *nir, unsigned num_cull_distances)
 {
-   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out,
+   NIR_PASS(_, nir, nir_lower_io_to_scalar,
+            nir_var_shader_in | nir_var_shader_out,
             scalarize_clip_cull_distance_filter, NULL);
    NIR_PASS(_, nir, nir_separate_merged_clip_cull_io);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
