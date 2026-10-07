@@ -1006,11 +1006,90 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
    return progress;
 }
 
+/* Metal links a vertex output to a fragment input only when their types match
+ * exactly, while Vulkan lets a fragment shader read fewer components than the
+ * vertex shader writes. A transform feedback store keeps all its components
+ * through nir_opt_varyings even when the fragment shader reads fewer; once
+ * capture is lowered they are dead. Trim the user varyings the rasterized
+ * stage writes to the components the fragment shader reads. */
+static bool
+trim_output_to_fs_reads(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const uint8_t *fs_reads = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       !nir_src_is_const(intr->src[1]))
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   unsigned location = sem.location + nir_src_as_uint(intr->src[1]);
+   if (location < VARYING_SLOT_VAR0 || location > VARYING_SLOT_VAR31)
+      return false;
+
+   unsigned first = nir_intrinsic_component(intr);
+   unsigned end = util_last_bit(fs_reads[location]);
+   if (end <= first) {
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   unsigned keep = MIN2(intr->num_components, end - first);
+   if (keep == intr->num_components)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0], nir_trim_vector(b, intr->src[0].ssa, keep));
+   intr->num_components = keep;
+   nir_intrinsic_set_write_mask(intr, nir_intrinsic_write_mask(intr) &
+                                         BITFIELD_MASK(keep));
+   return true;
+}
+
+static void
+kk_trim_outputs_to_fs_reads(nir_shader *nir, const uint8_t *fs_reads)
+{
+   if (fs_reads && nir->info.stage == MESA_SHADER_VERTEX)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, trim_output_to_fs_reads,
+               nir_metadata_control_flow, (void *)fs_reads);
+}
+
+static bool
+gather_fs_reads(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   uint8_t *fs_reads = data;
+   unsigned offset_src;
+
+   if (intr->intrinsic == nir_intrinsic_load_input)
+      offset_src = 0;
+   else if (intr->intrinsic == nir_intrinsic_load_interpolated_input ||
+            intr->intrinsic == nir_intrinsic_load_input_vertex)
+      offset_src = 1;
+   else
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   unsigned location = sem.location;
+   if (nir_src_is_const(intr->src[offset_src]))
+      location += nir_src_as_uint(intr->src[offset_src]);
+   else
+      location = NUM_TOTAL_VARYING_SLOTS; /* indirect: keep everything */
+
+   if (location >= NUM_TOTAL_VARYING_SLOTS) {
+      memset(fs_reads, 0xf, NUM_TOTAL_VARYING_SLOTS);
+      return false;
+   }
+
+   fs_reads[location] |= BITFIELD_RANGE(nir_intrinsic_component(intr),
+                                        intr->def.num_components);
+   return false;
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
                   const struct vk_pipeline_robustness_state *robustness,
                   const struct vk_graphics_pipeline_state *state,
+                  const uint8_t *fs_reads,
                   const VkAllocationCallbacks *pAllocator,
                   struct kk_shader **shader_out)
 {
@@ -1081,6 +1160,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, poly_nir_lower_tes, true);
    }
 
+   kk_trim_outputs_to_fs_reads(nir, fs_reads);
    NIR_PASS(_, nir, kk_nir_lower_poly);
 
    msl_optimize_nir(nir);
@@ -1151,7 +1231,7 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
    struct kk_shader *shader = NULL;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    VkResult result =
-      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, alloc, &shader);
+      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, NULL, alloc, &shader);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1676,11 +1756,23 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    root_bounds[shader_count] =
       offsetof(struct kk_root_descriptor_table, sets);
 
+   /* Components of each varying the fragment shader reads, which bound what
+    * the rasterized stage writes (kk_trim_outputs_to_fs_reads) */
+   uint8_t fs_reads_storage[NUM_TOTAL_VARYING_SLOTS] = {0};
+   const uint8_t *fs_reads = NULL;
+   if (state &&
+       nir_shaders[total_shaders - 1u]->info.stage == MESA_SHADER_FRAGMENT) {
+      nir_shader_intrinsics_pass(nir_shaders[total_shaders - 1u],
+                                 gather_fs_reads, nir_metadata_all,
+                                 fs_reads_storage);
+      fs_reads = fs_reads_storage;
+   }
+
    for (uint32_t i = 0; i < total_shaders; i++) {
       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
       result =
          kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
-                           state, pAllocator, &shaders[i]);
+                           state, fs_reads, pAllocator, &shaders[i]);
 
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
