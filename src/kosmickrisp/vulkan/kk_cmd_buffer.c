@@ -265,6 +265,10 @@ fail_allocator:
    kk_cmd_pool_return_cmd_buf(kk_cmd_buffer_pool(cmd), cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
 fail_cmd:
+   /* limina: the queue's rerecord path hands in an allocator before Begin; return it. */
+   kk_alloc_pool_release(dev, cmd->metal.pa);
+   cmd->metal.pa = NULL;
+   cmd->metal.allocator = NULL;
    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 

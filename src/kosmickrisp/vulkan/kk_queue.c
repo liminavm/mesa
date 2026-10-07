@@ -209,6 +209,13 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    struct kk_cmd_buffer *rerecord;
    VkResult result = VK_SUCCESS;
 
+   /* limina: take the allocator before queue->mutex. An acquire at the pool's ceiling waits for
+    * commits to complete, and rerecord_commit_callback takes queue->mutex, so waiting with it held
+    * could stall the very completions the wait needs. */
+   struct kk_pooled_alloc *pa = kk_alloc_pool_acquire(dev);
+   if (pa == NULL)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
    mtx_lock(&queue->mutex);
@@ -220,11 +227,17 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    } else {
       result = kk_cmd_buffer_ops.create(
          &queue->cmd_pool->vk, VK_COMMAND_BUFFER_LEVEL_PRIMARY, &vk_cmd);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         kk_alloc_pool_release(dev, pa);
          goto unlock;
+      }
    }
 
    rerecord = container_of(vk_cmd, struct kk_cmd_buffer, vk);
+   /* kk_BeginCommandBuffer uses an allocator already in place instead of acquiring one. */
+   assert(rerecord->metal.pa == NULL);
+   rerecord->metal.pa = pa;
+   rerecord->metal.allocator = pa->handle;
    VkCommandBuffer rerecord_handle = kk_cmd_buffer_to_handle(rerecord);
    const VkCommandBufferBeginInfo begin_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
