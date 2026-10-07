@@ -773,7 +773,13 @@ zink_init_screen_caps(struct zink_screen *screen)
          BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
       if (screen->have_triangle_fans)
          modes |= BITFIELD_BIT(MESA_PRIM_TRIANGLE_FAN);
-      if (screen->info.have_EXT_primitive_topology_list_restart) {
+      /* limina: KosmicKrisp restarts a list only by unrolling its indices on
+       * the GPU, a compute dispatch per draw. GLES 3 and WebGL 2 keep restart on
+       * for every indexed draw, so leaving lists out lets the GL frontend drop
+       * restart for draws with no restart index, and only the rest pay for
+       * emulation. */
+      if (screen->info.have_EXT_primitive_topology_list_restart &&
+          zink_driverid(screen) != VK_DRIVER_ID_MESA_KOSMICKRISP) {
          modes |= BITFIELD_BIT(MESA_PRIM_POINTS) |
             BITFIELD_BIT(MESA_PRIM_LINES) |
             BITFIELD_BIT(MESA_PRIM_LINES_ADJACENCY) |
