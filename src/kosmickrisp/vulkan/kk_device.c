@@ -50,13 +50,17 @@
  * while the vrend device still holds ~200 MiB flat across launches
  * (limina perf/kk-alloc-pool-2026-10-01, spikes/kk-alloc-pool). */
 #define KK_ALLOC_BUDGET_MIB_DEFAULT 16
-#define KK_ALLOC_POOL_WATERMARK 64
-/* The most allocators the pool will hold: four times the watermark, which normal use stays under
- * (a frame-paced GL client on zink peaks at 13, with up to 11 borrowed at once), and far below the
- * thousands an unthrottled guest reached before Metal refused an allocation and the worker
- * aborted. It must stay above the most command buffers clients record at once, or a client that
- * holds them all waits on itself until its Begin fails. */
-#define KK_ALLOC_CEILING_DEFAULT 256
+/* Growth past this is reported. The pool is per VkDevice, and the busiest device is the vrend
+ * tier's: host zink's one device serves every guest GL client, and each of its contexts keeps
+ * three command buffers recording. A seated GNOME guest running Firefox WebGL, glmark2 and two
+ * vkcubes peaked at 78 there, ~60 of them borrowed even once the apps had quit; every venus
+ * device (one per guest Vulkan device) peaked at 1. */
+#define KK_ALLOC_POOL_WATERMARK 128
+/* The most allocators one device's pool will hold: over six times that measured peak, and far
+ * below the thousands an unthrottled guest reached before Metal refused an allocation and the
+ * worker aborted. It must stay above the most command buffers a device's clients record at once,
+ * or a client that holds them all waits on itself until its Begin fails. */
+#define KK_ALLOC_CEILING_DEFAULT 512
 /* How long an acquire at the ceiling waits for room before failing. Short: zink retries a failed
  * vkBeginCommandBuffer itself with its own back-off, and a waiter here stalls a client thread. */
 #define KK_ALLOC_WAIT_MS_DEFAULT 100
@@ -124,11 +128,13 @@ kk_alloc_pool_finish(struct kk_device *dev)
       os_time_sleep(1000);
    }
 
-   if (pool->destroyed || pool->ceiling_waits) {
+   /* One line per device, so a high-water mark is on record for every client that came and went
+    * (the pool is per VkDevice: under venus, one per guest Vulkan device). */
+   if (pool->acquires) {
       fprintf(stderr,
-              "[LIMINA-ALLOC-POOL] teardown: live=%u peak=%u released=%u ceiling-waits=%llu "
+              "[LIMINA-ALLOC-POOL] teardown: pool=%p live=%u peak=%u released=%u ceiling-waits=%llu "
               "ceiling-fails=%llu\n",
-              pool->live, pool->peak_live, pool->destroyed,
+              (void *)pool, pool->live, pool->peak_live, pool->destroyed,
               (unsigned long long)pool->ceiling_waits, (unsigned long long)pool->ceiling_fails);
    }
 
@@ -174,10 +180,10 @@ kk_alloc_pool_stats(struct kk_alloc_pool *pool)
       pending += pa->pending;
    }
    fprintf(stderr,
-           "[LIMINA-ALLOC-STATS] pool begins=%llu live=%u peak=%u draining=%u borrowed=%u "
+           "[LIMINA-ALLOC-STATS] pool=%p begins=%llu live=%u peak=%u draining=%u borrowed=%u "
            "pending=%u released=%u retired=%llu mean_uses=%.1f sum=%.1fMiB max=%.1fMiB\n",
-           (unsigned long long)pool->acquires, pool->live, pool->peak_live, draining, borrowed,
-           pending, pool->destroyed, (unsigned long long)pool->retired,
+           (void *)pool, (unsigned long long)pool->acquires, pool->live, pool->peak_live, draining,
+           borrowed, pending, pool->destroyed, (unsigned long long)pool->retired,
            pool->retired ? (double)pool->retired_uses / (double)pool->retired : 0.0,
            sum / (1024.0 * 1024.0), max / (1024.0 * 1024.0));
 }
@@ -259,16 +265,16 @@ kk_alloc_pool_acquire(struct kk_device *dev)
          deadline = now + pool->wait_ns;
          if (util_is_power_of_two_nonzero64(++pool->ceiling_waits)) {
             fprintf(stderr,
-                    "[LIMINA-ALLOC-POOL] at its ceiling of %u allocators — waiting up to %llu ms "
-                    "for the GPU (%llu times so far)\n",
+                    "[LIMINA-ALLOC-POOL] at its ceiling of %u allocators (LIMINA_KK_ALLOC_CEILING) — "
+                    "waiting up to %llu ms for the GPU (%llu times so far)\n",
                     pool->ceiling, (unsigned long long)(pool->wait_ns / 1000000ull),
                     (unsigned long long)pool->ceiling_waits);
          }
       } else if (now >= deadline) {
          if (util_is_power_of_two_nonzero64(++pool->ceiling_fails)) {
             fprintf(stderr,
-                    "[LIMINA-ALLOC-POOL] still at its ceiling of %u allocators after %llu ms — "
-                    "refusing a command allocator (%llu times so far)\n",
+                    "[LIMINA-ALLOC-POOL] still at its ceiling of %u allocators (LIMINA_KK_ALLOC_CEILING) "
+                    "after %llu ms — refusing a command allocator (%llu times so far)\n",
                     pool->ceiling, (unsigned long long)(pool->wait_ns / 1000000ull),
                     (unsigned long long)pool->ceiling_fails);
          }
@@ -341,7 +347,7 @@ kk_alloc_pool_acquire(struct kk_device *dev)
       if (pool->live > pool->watermark_warned) {
          pool->watermark_warned *= 2;
          fprintf(stderr,
-                 "[LIMINA-ALLOC-POOL] grew to %u allocators (budget %llu MiB, ceiling %u) — "
+                 "[LIMINA-ALLOC-POOL] grew to %u allocators (budget %llu MiB, LIMINA_KK_ALLOC_CEILING=%u) — "
                  "in-flight depth is outrunning completion\n",
                  pool->live, (unsigned long long)(pool->budget_bytes >> 20), pool->ceiling);
       }
