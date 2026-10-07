@@ -90,6 +90,19 @@ bool zink_tracing = false;
 #include "MoltenVK/mvk_private_api.h"
 #endif /* __APPLE__ */
 
+#if defined(MVK_VERSION)
+/* MVK_VERSION only says MoltenVK's headers were found at build time; another driver
+ * (KosmicKrisp) can be the one running. LIMINA_ZINK_MVK_WORKAROUNDS=1 applies the
+ * MoltenVK workarounds whatever the driver, as before.
+ */
+static bool
+zink_needs_moltenvk_workarounds(const struct zink_screen *screen)
+{
+   return zink_driverid(screen) == VK_DRIVER_ID_MOLTENVK ||
+          debug_get_bool_option("LIMINA_ZINK_MVK_WORKAROUNDS", false);
+}
+#endif
+
 #ifdef HAVE_LIBDRM
 #include "drm-uapi/dma-buf.h"
 #include <xf86drm.h>
@@ -782,10 +795,10 @@ zink_init_screen_caps(struct zink_screen *screen)
          modes &= ~BITFIELD_BIT(MESA_PRIM_TRIANGLE_FAN);
       caps->supported_prim_modes = modes;
    }
-#if defined(MVK_VERSION)
-   caps->fbfetch = 0;
-#else
    caps->fbfetch = screen->info.have_KHR_dynamic_rendering_local_read;
+#if defined(MVK_VERSION)
+   if (zink_needs_moltenvk_workarounds(screen))
+      caps->fbfetch = 0;
 #endif
    caps->fbfetch_coherent = caps->fbfetch && screen->info.have_EXT_rasterization_order_attachment_access;
 
@@ -2189,6 +2202,9 @@ static bool
 zink_internal_setup_moltenvk(struct zink_screen *screen)
 {
 #if defined(MVK_VERSION)
+   if (!zink_needs_moltenvk_workarounds(screen))
+      return true;
+
    // MoltenVK only supports VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE in newer Metal versions
    // disable unless we can get MoltenVK to confirm it is supported
    screen->have_dynamic_state_vertex_input_binding_stride = false;
