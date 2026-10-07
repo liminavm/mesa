@@ -1084,6 +1084,28 @@ gather_fs_reads(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return false;
 }
 
+static bool
+find_load_primitive_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_load_primitive_id)
+      *(bool *)data = true;
+   return false;
+}
+
+/* The evaluation shader's gl_PrimitiveID, the patch ID, as an output */
+static void
+kk_tes_store_primitive_id(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+
+   nir_store_output(&b, nir_load_primitive_id(&b), nir_imm_int(&b, 0),
+                    .src_type = nir_type_uint32, .write_mask = 0x1,
+                    .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID,
+                    .io_semantics.num_slots = 1);
+   nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID);
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
@@ -1688,6 +1710,17 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       }
    }
 
+   /* After tessellation, the fragment shader's gl_PrimitiveID is the patch ID.
+    * Metal's [[primitive_id]] numbers the rasterized triangles of every
+    * instance instead, so the evaluation shader passes its gl_PrimitiveID down
+    * as a flat varying, only when it is read: done here, before the stages are
+    * linked, so the linker sees both ends. */
+   bool tes_primitive_id = false;
+   nir_shader *last = infos[shader_count - 1u].nir;
+   if (tess && last->info.stage == MESA_SHADER_FRAGMENT)
+      nir_shader_intrinsics_pass(last, find_load_primitive_id, nir_metadata_all,
+                                 &tes_primitive_id);
+
    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
     * optimization. */
    const struct vk_pipeline_robustness_state *vertex_robustness = &rs_none;
@@ -1699,9 +1732,19 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       bool emulated_stage = tess && (nir->info.stage == MESA_SHADER_VERTEX ||
                                      nir->info.stage == MESA_SHADER_TESS_CTRL);
 
+      if (tes_primitive_id && nir->info.stage == MESA_SHADER_FRAGMENT) {
+         const nir_lower_sysvals_to_varyings_options sysvals = {
+            .primitive_id = true,
+         };
+         NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals);
+      }
+
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
                    info->set_layout_count, info->set_layouts, state, features);
+
+      if (tes_primitive_id && nir->info.stage == MESA_SHADER_TESS_EVAL)
+         kk_tes_store_primitive_id(nir);
 
       if (nir->info.stage == MESA_SHADER_VERTEX)
          vertex_robustness = info->robustness;
