@@ -146,6 +146,17 @@ st_prepare_index_bounds(struct gl_context *ctx,
                         const struct pipe_draw_start_count_bias *draws,
                         unsigned num_draws)
 {
+   /* A topology the driver can restart only by emulation (u_vbuf rewrites the
+    * indices on the CPU): draw without restart when no index range holds the
+    * restart index. Common with GLES 3 and WebGL 2, which keep fixed-index
+    * restart on for every indexed draw. */
+   if (info->index_size && !indirect &&
+       info->primitive_restart && info->mode != MESA_PRIM_PATCHES &&
+       !(ctx->screen->caps.supported_prim_modes_with_restart &
+         BITFIELD_BIT(info->mode)) &&
+       !vbo_draws_have_restart_index(ctx, info, draws, num_draws))
+      info->primitive_restart = false;
+
    if (likely(!info->index_size || info->index_bounds_valid || indirect ||
               !ctx->st->draw_needs_minmax_index))
       return true;
