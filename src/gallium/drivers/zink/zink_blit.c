@@ -595,6 +595,13 @@ zink_blit(struct pipe_context *pctx,
       ctx->gfx_pipeline_state.dirty |= (ctx->gfx_pipeline_state.rp_state != rp_state);
       ctx->gfx_pipeline_state.rp_state = rp_state;
       ctx->rp_changed = rp_changed;
+      /* The blit's renderpass rebuilt dynamic_fb.info for the blit's framebuffer: the
+       * depth/stencil attachment pointers and the load/store ops. Restoring rp_changed alone would
+       * let the next renderpass begin with those, e.g. a stencil attachment against a depth-only
+       * framebuffer's UNDEFINED stencil format. Have the next begin rebuild them; a renderpass
+       * still open on the main cmdbuf only restarts if its attachments really changed.
+       */
+      ctx->rp_layout_changed = true;
       ctx->rp_tc_info_updated |= rp_tc_info_updated;
       ctx->queries_disabled = queries_disabled;
       ctx->dynamic_fb.tc_info.data = tc_data;
