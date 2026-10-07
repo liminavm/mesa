@@ -77,7 +77,11 @@ end_recording(struct kk_cmd_buffer *cmd)
       return;
 
    cs_end(cmd);
-   mtl_end_command_buffer(cmd->metal.cmd_buf);
+   /* limina: a Metal command buffer is begun exactly when it holds an allocator. A Begin that
+    * found no allocator leaves this command buffer RECORDING with none begun, and ending a Metal 4
+    * command buffer that was never begun asserts in IOGPUMetal4CommandBuffer. */
+   if (cmd->metal.pa)
+      mtl_end_command_buffer(cmd->metal.cmd_buf);
    /* limina: reuse is legal the moment the command buffer ends (Apple: "You can safely reuse
     * command allocators after ending the command buffer"); only releasing one needs GPU completion,
     * which the pool gates on the charge taken at begin. So the borrow goes back now. */
