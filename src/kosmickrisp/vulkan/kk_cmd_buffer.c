@@ -1061,12 +1061,8 @@ kk_dispatch_grid(mtl_compute_encoder *encoder, struct kk_grid grid,
                                                      local_size);
       break;
    case KK_GRID_INDIRECT_THREADS:
-      /* The GPU has not run yet, so this lands before the kernel that writes
-       * the thread counts next to it. */
-      grid.cpu[3] = local_size.x;
-      grid.cpu[4] = local_size.y;
-      grid.cpu[5] = local_size.z;
-      mtl_dispatch_threads_with_indirect_buffer(encoder, grid.addr);
+      mtl_dispatch_threadgroups_with_indirect_buffer(
+         encoder, grid.addr + 3u * sizeof(uint32_t), local_size);
       break;
    }
 }
