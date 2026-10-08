@@ -17,7 +17,10 @@ libkk_tess_setup_indirect(
    uint32_t in_index_size_B, uint64_t vertex_outputs /* bitfield */,
 
    /* Tess control invocation counter if active, else zero */
-   global uint32_t *tcs_statistic)
+   global uint32_t *tcs_statistic,
+
+   /* Threadgroup size the vertex shader is dispatched with */
+   uint32_t vs_local_size)
 {
    uint count = indirect[0], instance_count = indirect[1];
    unsigned in_patches = count / p->input_patch_size;
@@ -76,21 +79,31 @@ libkk_tess_setup_indirect(
          poly_index_buffer_range_el(in_index_buffer_range_el, indirect[2]);
    }
 
-   /* Thread counts of three MTLDispatchThreadsIndirectArguments; the
-    * dispatch fills in each threadgroup size (KK_GRID_INDIRECT_THREADS). */
+   /* Three KK_GRID_INDIRECT_THREADS grids: thread counts, then the
+    * threadgroups that cover them. */
 
-   /* VS grid size */
+   /* VS grid: the software vertex shader bounds-checks the partial last
+    * threadgroup against verts_per_instance. */
    grids[0] = count;
    grids[1] = instance_count;
    grids[2] = 1;
+   grids[3] = (count + vs_local_size - 1) / vs_local_size;
+   grids[4] = instance_count;
+   grids[5] = 1;
 
-   /* TCS grid size */
+   /* TCS grid: one threadgroup per patch, of output_patch_size threads */
    grids[6] = in_patches * p->output_patch_size;
    grids[7] = instance_count;
    grids[8] = 1;
+   grids[9] = in_patches;
+   grids[10] = instance_count;
+   grids[11] = 1;
 
-   /* Tess grid size */
+   /* Tess grid: the tessellator runs one thread per threadgroup */
    grids[12] = unrolled_patches;
    grids[13] = 1;
    grids[14] = 1;
+   grids[15] = unrolled_patches;
+   grids[16] = 1;
+   grids[17] = 1;
 }
