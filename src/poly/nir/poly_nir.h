@@ -48,9 +48,24 @@ struct poly_gs_info {
    uint8_t topology[64];
 };
 
+struct poly_gs_options {
+   /* The rasterizer only provokes from the first vertex of a primitive. When
+    * the last vertex provokes (load_provoking_last), each rasterized vertex
+    * carries the flat outputs (load_flat_mask) of the vertex that provokes the
+    * strip primitive it starts, so first-vertex flat shading gives the
+    * last-vertex result. */
+   bool emulate_provoking_last;
+};
+
 bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
                        struct poly_gs_info *info);
+
+bool poly_nir_lower_gs_opts(struct nir_shader *gs, struct nir_shader **gs_count,
+                            struct nir_shader **gs_copy,
+                            struct nir_shader **pre_gs,
+                            struct poly_gs_info *info,
+                            const struct poly_gs_options *opts);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);
