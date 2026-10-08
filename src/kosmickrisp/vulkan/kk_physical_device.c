@@ -1168,6 +1168,13 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
       settings->disabled_workarounds |= BITFIELD64_BIT(10);
       settings->disabled_workarounds |= BITFIELD64_BIT(19);
    }
+   /* Workaround 19 keeps dispatchThreadsWithIndirectBuffer from reading spilled values back as
+    * zero on M1/M2. Nothing dispatches that way any more: indirect tessellation and geometry
+    * grids go through dispatchThreadgroupsWithIndirectBuffer, on every family. What it would still
+    * add is a threadgroup argument to the shaders feeding a geometry shader, whose length the
+    * limina bridge has no way to set.
+    */
+   settings->disabled_workarounds |= BITFIELD64_BIT(19);
 }
 
 VkResult

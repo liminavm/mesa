@@ -1062,16 +1062,9 @@ kk_dispatch_grid(mtl_compute_encoder *encoder, struct kk_grid grid,
       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
                                                      local_size);
       break;
-   case KK_GRID_INDIRECT_LOCAL:
-      mtl_dispatch_threads_with_indirect_buffer(encoder, grid.addr);
-      break;
    case KK_GRID_INDIRECT_THREADS:
-      /* The GPU has not run yet, so this lands before the kernel that writes
-       * the thread counts next to it. */
-      grid.cpu[3] = local_size.x;
-      grid.cpu[4] = local_size.y;
-      grid.cpu[5] = local_size.z;
-      mtl_dispatch_threads_with_indirect_buffer(encoder, grid.addr);
+      mtl_dispatch_threadgroups_with_indirect_buffer(
+         encoder, grid.addr + 3u * sizeof(uint32_t), local_size);
       break;
    }
 }
@@ -1081,9 +1074,6 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
                     bool pre_gfx, enum libkk_program idx, void *data,
                     size_t data_size)
 {
-   /* KK_WORKAROUND_19 */
-   assert(grid.mode != KK_GRID_INDIRECT_LOCAL);
-
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    struct kk_precompiled_shader *prog = &dev->precompiled_cache.shaders[idx];
 

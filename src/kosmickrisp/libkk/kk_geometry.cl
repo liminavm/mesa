@@ -43,6 +43,18 @@ libkk_prefix_sum_tess(global struct poly_tess_params *p)
    desc[4] = 0;                  /* start_instance */
 }
 
+/* Replaces the threadgroup size poly leaves after a grid's thread counts with
+ * the threadgroup counts that cover them (KK_GRID_INDIRECT_THREADS). */
+static void
+libkk_grid_threadgroups(global uint32_t *grid, uint32_t local_size_x)
+{
+   grid[3] = (grid[0] + local_size_x - 1) / local_size_x;
+   grid[4] = grid[1];
+   grid[5] = grid[2];
+}
+
+/* The grids it writes are KK_GRID_INDIRECT_THREADS: the kernels they dispatch
+ * bounds-check the partial last threadgroup. */
 KERNEL(1)
 libkk_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
                         global struct poly_vertex_params *vp,
@@ -50,10 +62,14 @@ libkk_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
                         global struct poly_heap *heap, uint64_t vs_outputs,
                         uint32_t index_size_B, uint32_t index_buffer_range_el,
                         uint32_t prim, uint32_t max_indices,
-                        enum poly_gs_shape shape)
+                        enum poly_gs_shape shape, uint32_t vs_local_size,
+                        uint32_t gs_local_size)
 {
    /* Prefix summing only serves transform feedback */
    poly_gs_setup_indirect(index_buffer, draw, vp, p, heap, vs_outputs,
                           index_size_B, index_buffer_range_el, prim,
                           false /* is_prefix_summing */, max_indices, shape);
+
+   libkk_grid_threadgroups(vp->grid, vs_local_size);
+   libkk_grid_threadgroups(p->grid, gs_local_size);
 }
