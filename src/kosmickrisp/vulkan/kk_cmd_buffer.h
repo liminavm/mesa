@@ -459,10 +459,16 @@ enum kk_grid_mode {
    KK_GRID_DIRECT = 0u,
    /* Threadgroup counts at addr (MTLDispatchThreadgroupsIndirectArguments) */
    KK_GRID_INDIRECT,
-   /* Thread counts at addr, written on the GPU, followed by the threadgroup
-    * size, which the dispatch writes through cpu
-    * (MTLDispatchThreadsIndirectArguments). The poly kernels size grids in
-    * threads, as AGX dispatches do. */
+   /* Thread counts at addr, followed by the threadgroup counts that cover them
+    * (MTLDispatchThreadgroupsIndirectArguments), both written on the GPU. The
+    * poly kernels size grids in threads, as AGX dispatches do; the dispatch
+    * reads the threadgroup counts, and a kernel whose thread count is not a
+    * multiple of its threadgroup bounds-checks its own invocations.
+    *
+    * Not MTLDispatchThreadsIndirectArguments: under
+    * dispatchThreadsWithIndirectBuffer, a kernel whose private array spills to
+    * stack memory loses stores on the threads past the first two of each
+    * threadgroup. */
    KK_GRID_INDIRECT_THREADS,
 };
 struct kk_grid {
@@ -471,12 +477,14 @@ struct kk_grid {
       struct mtl_size size;
       uint64_t addr;
    };
-   uint32_t *cpu; /* KK_GRID_INDIRECT_THREADS only */
 };
 
 /* An indirect thread grid takes six words: three of threads, three of
- * threadgroup size. */
+ * threadgroups. */
 #define KK_GRID_INDIRECT_THREADS_SIZE_B (6u * sizeof(uint32_t))
+
+/* Threadgroup size of the software vertex shader that feeds tessellation. */
+#define KK_SW_VS_LOCAL_SIZE 64u
 
 static struct kk_grid
 kk_grid_3d(uint32_t x, uint32_t y, uint32_t z)
@@ -509,12 +517,11 @@ kk_grid_indirect(uint64_t addr)
 }
 
 static struct kk_grid
-kk_grid_indirect_threads(uint64_t addr, void *cpu)
+kk_grid_indirect_threads(uint64_t addr)
 {
    return (struct kk_grid){
       .mode = KK_GRID_INDIRECT_THREADS,
       .addr = addr,
-      .cpu = cpu,
    };
 }
 

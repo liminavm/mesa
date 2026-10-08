@@ -25,6 +25,7 @@
 #include "nir_lower_blend.h"
 #include "nir_xfb_info.h"
 
+#include "poly/geometry.h"
 #include "poly/nir/poly_nir.h"
 
 #include "vk_blend.h"
@@ -1106,6 +1107,33 @@ kk_tes_store_primitive_id(nir_shader *nir)
    nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID);
 }
 
+/* An indirect draw dispatches the software vertex shader in whole
+ * threadgroups (KK_GRID_INDIRECT_THREADS), so the last one can run past the
+ * vertex count: run the shader only for the invocations that have a vertex.
+ */
+static bool
+kk_nir_bound_sw_vs(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *vertex = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *vp = nir_load_vertex_param_buffer_poly(&b);
+   nir_def *verts = nir_load_global_constant(
+      &b, 1, 32,
+      nir_iadd_imm(&b, vp,
+                   offsetof(struct poly_vertex_params, verts_per_instance)),
+      .align_mul = 4);
+   nir_push_if(&b, nir_ult(&b, vertex, verts));
+   nir_cf_reinsert(&body, b.cursor);
+   nir_pop_if(&b, NULL);
+
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
@@ -1149,6 +1177,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
          memset(&nir->info.cs, 0, sizeof(nir->info.cs));
          nir->xfb_info = NULL;
          NIR_PASS(_, nir, poly_nir_lower_sw_vs);
+         NIR_PASS(_, nir, kk_nir_bound_sw_vs);
       } else {
          /* Metal's instance_id contains base_instance. When the emulation path
           * is taken, since we launch compute, they correctly get translated.
