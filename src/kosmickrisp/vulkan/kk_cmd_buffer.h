@@ -114,6 +114,18 @@ struct kk_per_draw_data {
 
    uint64_t base_vertex_addr;
    uint64_t base_instance_addr;
+
+   /* Address of geometry param buffer if a geometry shader is bound, else 0 */
+   uint64_t geometry_params;
+
+   /* Writable scratch for the geometry shader's counters nothing reads: the
+    * statistics, primitives-generated and overflow counters of inactive
+    * queries. */
+   uint64_t gs_sink;
+
+   /* Nonzero when the last vertex of a primitive is its provoking vertex. */
+   uint32_t provoking_last;
+   uint32_t pad;
 };
 
 struct kk_attachment {
@@ -226,6 +238,30 @@ struct kk_graphics_state {
       enum mesa_prim prim;
    } tess;
 
+   /* Geometry shader state of the draw being recorded */
+   struct {
+      /* Input topology and provoking convention of the API draw */
+      enum mesa_prim in_prim;
+      bool flatshade_first;
+
+      /* Parameter buffers; their CPU view is where an indirect dispatch fills
+       * in its threadgroup size (KK_GRID_INDIRECT_THREADS). */
+      struct kk_ptr params;
+      struct kk_ptr vertex_params;
+
+      /* Index buffer of the rasterization draw, if it is indexed */
+      uint64_t index_buffer;
+      uint32_t index_buffer_range_B;
+
+      /* Rasterization draw size, for a direct draw */
+      uint32_t index_count;
+      uint32_t instance_count;
+
+      /* Primitives generated and written by the draw (uint32_t[2]) when
+       * queries are active, else 0 */
+      uint64_t counts;
+   } gs;
+
    /* Transform feedback state (CPU-tracked; command replay is sequential).
     * Capture is lowered to vertex-shader global stores, and every direct
     * draw is reissued as a list of primitive vertices while it is on
@@ -250,6 +286,15 @@ struct kk_graphics_state {
       uint32_t tf_query;
       uint64_t tf_written, tf_needed;
       bool warned_indirect;
+
+      /* Geometry shader draws count primitives and append captured vertices
+       * on the GPU (poly's pre-GS program). Once a session or query has seen
+       * one, its values continue in these GPU words; the CPU fields above
+       * hold only what other draws added. 0 = not on the GPU. */
+      uint64_t gpu_offsets; /* uint32_t[4] append offsets, by buffer */
+      uint64_t pg_gpu;      /* uint32_t primitives generated */
+      uint64_t tf_gpu;      /* uint32_t[2] primitives written, needed */
+      bool warned_gpu_offsets;
 
       /* The remap the draw in flight was issued with (kk_xfb_draw); mode 0
        * outside it. Mirrors the root table's xfb_remap* fields. */
