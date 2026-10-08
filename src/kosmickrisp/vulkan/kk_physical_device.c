@@ -231,6 +231,15 @@ kk_get_device_extensions(const struct kk_instance *instance,
    };
 }
 
+/* limina: geometry shaders run on poly's compute emulation;
+ * LIMINA_KK_GEOMETRY_SHADER=0 stops advertising them. */
+static bool
+kk_limina_geometry_shader(void)
+{
+   const char *e = getenv("LIMINA_KK_GEOMETRY_SHADER");
+   return !e || e[0] != '0';
+}
+
 static void
 kk_get_device_features(
    const struct kk_physical_device *pdev,
@@ -247,7 +256,7 @@ kk_get_device_features(
       .dualSrcBlend = true,
       .fragmentStoresAndAtomics = true,
       .fullDrawIndexUint32 = true,
-      .geometryShader = true,
+      .geometryShader = kk_limina_geometry_shader(),
       .imageCubeArray = true,
       .independentBlend = true,
       .inheritedQueries = true,
