@@ -827,6 +827,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       kk_destroy_bo(dev, dev->heap);
    if (dev->fan_indices)
       kk_destroy_bo(dev, dev->fan_indices);
+   if (dev->gs_sink)
+      kk_destroy_bo(dev, dev->gs_sink);
 
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);

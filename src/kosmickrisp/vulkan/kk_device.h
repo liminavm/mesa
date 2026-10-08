@@ -188,6 +188,10 @@ struct kk_device {
    struct kk_bo *fan_indices;
    util_once_flag fan_indices_once;
 
+   /* Writable scratch for geometry shader counters nothing reads */
+   struct kk_bo *gs_sink;
+   util_once_flag gs_sink_once;
+
    /* Transform feedback counter-buffer shadow: command replay is sequential
     * on the queue thread and zink only consumes counter values through
     * vkCmdBeginTransformFeedbackEXT resume / vkCmdDrawIndirectByteCountEXT,

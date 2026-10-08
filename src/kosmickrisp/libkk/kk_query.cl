@@ -94,3 +94,16 @@ libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
       vk_write_query(dst, reports_per_query, flags, available);
    }
 }
+
+/* Writes a query result made of a CPU-known part and a part geometry shader
+ * draws accumulated on the GPU, and makes the query available. */
+KERNEL(1)
+libkk_write_query_sum(global uint64_t *report, global uint32_t *available,
+                      constant uint32_t *gpu, uint64_t cpu0, uint64_t cpu1,
+                      uint32_t count)
+{
+   report[0] = cpu0 + gpu[0];
+   if (count > 1)
+      report[1] = cpu1 + gpu[1];
+   *available = 1;
+}

@@ -62,8 +62,9 @@ static const struct {
 } VARYING_SLOT_INFO[NUM_TOTAL_VARYING_SLOTS] = {
    [VARYING_SLOT_POS] = {"position"},
    [VARYING_SLOT_PSIZ] = {"point_size"},
-   /* Written by the stage before the fragment shader when Metal's own
-    * [[primitive_id]] is not the one the API defines (after tessellation) */
+   /* Written by a geometry shader's rasterization program, or after
+    * tessellation by the stage before the fragment shader, when Metal's own
+    * [[primitive_id]] is not the one the API defines */
    [VARYING_SLOT_PRIMITIVE_ID] = {"primitive_id", .user = true},
    [VARYING_SLOT_LAYER] = {"render_target_array_index"},
    [VARYING_SLOT_VIEWPORT] = {"viewport_array_index"},

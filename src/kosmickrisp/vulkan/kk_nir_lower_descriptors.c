@@ -398,23 +398,13 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* System values of the vertex shader that feeds the rasterizer
+ * (kk_lower_hw_vs). Also lowered by kk_nir_lower_poly, for a geometry shader's
+ * rasterization program, which poly creates after descriptor lowering. */
 static bool
-try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
-                 const struct lower_descriptors_ctx *ctx)
+lower_hw_vs_sysval(nir_builder *b, nir_intrinsic_instr *intrin)
 {
    switch (intrin->intrinsic) {
-   case nir_intrinsic_load_vulkan_descriptor:
-      return try_lower_load_vulkan_descriptor(b, intrin, ctx);
-
-   case nir_intrinsic_load_workgroup_size:
-      UNREACHABLE("Should have been lowered by nir_lower_cs_intrinsics()");
-
-   case nir_intrinsic_load_base_workgroup_id:
-      return lower_sysval_to_root_table(b, intrin, cs.base_group);
-
-   case nir_intrinsic_load_blend_const_color_rgba:
-      return lower_sysval_to_root_table(b, intrin, draw.blend_constant);
-
    case nir_intrinsic_load_clip_z_coeff:
       return lower_sysval_to_root_table(b, intrin, draw.clip_z_coeff);
 
@@ -445,6 +435,34 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_def_rewrite_uses(&intrin->def, val);
       return true;
    }
+
+   default:
+      return false;
+   }
+}
+
+static bool
+try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+                 const struct lower_descriptors_ctx *ctx)
+{
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_vulkan_descriptor:
+      return try_lower_load_vulkan_descriptor(b, intrin, ctx);
+
+   case nir_intrinsic_load_workgroup_size:
+      UNREACHABLE("Should have been lowered by nir_lower_cs_intrinsics()");
+
+   case nir_intrinsic_load_base_workgroup_id:
+      return lower_sysval_to_root_table(b, intrin, cs.base_group);
+
+   case nir_intrinsic_load_blend_const_color_rgba:
+      return lower_sysval_to_root_table(b, intrin, draw.blend_constant);
+
+   case nir_intrinsic_load_clip_z_coeff:
+   case nir_intrinsic_load_is_depth_clamp_emulated_kk:
+   case nir_intrinsic_load_is_viewport_z_transform_emulated_kk:
+   case nir_intrinsic_load_viewport_z_range_kk:
+      return lower_hw_vs_sysval(b, intrin);
 
    case nir_intrinsic_load_push_constant:
       return lower_load_push_constant(b, intrin, ctx);
@@ -833,6 +851,36 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       return lower_sysval_to_per_draw(b, intrin, tess_params);
    case nir_intrinsic_load_index_size_poly:
       return lower_sysval_to_per_draw(b, intrin, index_size);
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      return lower_sysval_to_per_draw(b, intrin, geometry_params);
+   case nir_intrinsic_load_stat_query_address_poly:
+      return lower_sysval_to_per_draw(b, intrin, gs_sink);
+   case nir_intrinsic_load_provoking_last: {
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def *val = load_per_draw(
+         b, 1, 32, nir_imm_int(b, kk_per_draw_offset(provoking_last)), 4);
+      nir_def *last = nir_ine_imm(b, val, 0);
+      if (intrin->def.bit_size != 1)
+         last = nir_b2bN(b, last, intrin->def.bit_size);
+      nir_def_rewrite_uses(&intrin->def, last);
+      return true;
+   }
+   case nir_intrinsic_load_rasterization_stream:
+      /* Only stream 0 is rasterized (no rasterizationStreamSelect). */
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def_rewrite_uses(&intrin->def,
+                           nir_imm_intN_t(b, 0, intrin->def.bit_size));
+      return true;
+   case nir_intrinsic_load_clip_z_coeff:
+   case nir_intrinsic_load_is_depth_clamp_emulated_kk:
+   case nir_intrinsic_load_is_viewport_z_transform_emulated_kk:
+   case nir_intrinsic_load_viewport_z_range_kk:
+      return lower_hw_vs_sysval(b, intrin);
+   case nir_intrinsic_ro_to_rw_poly:
+      /* The driver never hands poly a read-only sink: every counter it may
+       * write points at writable memory (kk_upload_geometry_params). */
+      nir_def_replace(&intrin->def, intrin->src[0].ssa);
+      return true;
    case nir_intrinsic_load_first_vertex:
       /* Lower only compute shaders */
       if (*(bool *)data) {
