@@ -2229,6 +2229,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
          .vp = gfx->per_draw_data.vertex_params,
          .vertex_outputs = vs->info.outputs_written,
          .tcs_statistic = 0,
+         .vs_local_size = KK_SW_VS_LOCAL_SIZE,
       };
 
       if (draw.index.el_size_B) {
@@ -2240,15 +2241,12 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
 
       libkk_tess_setup_indirect_struct(cmd, kk_grid_1d(1), true, args);
 
-      struct kk_ptr grids = gfx->tess.indirect_ptr;
-      uint32_t *grids_cpu = grids.cpu;
-      const uint32_t grid_words = KK_GRID_INDIRECT_THREADS_SIZE_B / 4u;
-      grid_vs = kk_grid_indirect_threads(grids.gpu, grids_cpu);
-      grid_tcs = kk_grid_indirect_threads(
-         grids.gpu + KK_GRID_INDIRECT_THREADS_SIZE_B, grids_cpu + grid_words);
-      grid_tess = kk_grid_indirect_threads(
-         grids.gpu + 2u * KK_GRID_INDIRECT_THREADS_SIZE_B,
-         grids_cpu + 2u * grid_words);
+      uint64_t grids = gfx->tess.indirect_ptr.gpu;
+      grid_vs = kk_grid_indirect_threads(grids);
+      grid_tcs =
+         kk_grid_indirect_threads(grids + KK_GRID_INDIRECT_THREADS_SIZE_B);
+      grid_tess =
+         kk_grid_indirect_threads(grids + 2u * KK_GRID_INDIRECT_THREADS_SIZE_B);
    } else {
       uint32_t patches = draw.grid.size.x / input_patch_size;
       grid_vs = grid_tcs = kk_grid_2d(draw.grid.size.x, draw.grid.size.y);
@@ -2262,7 +2260,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
    mtl_compute_encoder *enc = cs_get_compute(cmd);
    {
       mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
-      struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+      struct mtl_size local_size = {KK_SW_VS_LOCAL_SIZE, 1, 1};
       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                        MTL_STAGE_DISPATCH);
       mtl_compute_set_pipeline_state(enc, pipeline);
@@ -2362,6 +2360,8 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          .prim = mode,
          .max_indices = gs->info.gs.max_indices,
          .shape = shape,
+         .vs_local_size = KK_POLY_WG_SIZE,
+         .gs_local_size = KK_POLY_WG_SIZE,
       };
 
       if (draw.index.el_size_B) {
@@ -2372,9 +2372,11 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
 
       libkk_gs_setup_indirect_struct(cmd, kk_grid_1d(1u), true, args);
 
-      grid_vs = kk_grid_indirect_local(
+      /* In threadgroups, as indirect tessellation dispatches: the stage
+       * feeding the GS and the GS bound-check their partial last group */
+      grid_vs = kk_grid_indirect_threads(
          vertex_params + offsetof(struct poly_vertex_params, grid));
-      grid_gs = kk_grid_indirect_local(
+      grid_gs = kk_grid_indirect_threads(
          geometry_params + offsetof(struct poly_geometry_params, grid));
    } else {
       grid_vs = grid_gs = kk_grid_2d(draw.grid.size.x, draw.grid.size.y);
