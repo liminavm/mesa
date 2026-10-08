@@ -556,10 +556,52 @@ kk_GetPhysicalDeviceSparseImageFormatProperties2(
    return;
 }
 
+/* Whether the create info stays inside what KK advertises. Metal asserts on a
+ * texture descriptor past its limits, and KK's layout keeps per-level arrays of
+ * KK_MAX_MIP_LEVELS entries, one more than the levels they describe. Invalid
+ * usage reaches both, and under venus a guest sends it unchecked. */
+static bool
+kk_image_create_info_is_valid(const struct kk_physical_device *pdev,
+                              const VkImageCreateInfo *pCreateInfo)
+{
+   if (pCreateInfo->imageType != VK_IMAGE_TYPE_1D &&
+       pCreateInfo->imageType != VK_IMAGE_TYPE_2D &&
+       pCreateInfo->imageType != VK_IMAGE_TYPE_3D)
+      return false;
+
+   const VkExtent3D *extent = &pCreateInfo->extent;
+   const uint32_t max_dim =
+      kk_image_max_dimension(pdev, pCreateInfo->imageType);
+   if (extent->width == 0 || extent->height == 0 || extent->depth == 0 ||
+       extent->width > max_dim || extent->height > max_dim ||
+       extent->depth > max_dim)
+      return false;
+
+   if (pCreateInfo->arrayLayers == 0 || pCreateInfo->arrayLayers > 2048)
+      return false;
+
+   const uint32_t full_chain =
+      util_logbase2(MAX3(extent->width, extent->height, extent->depth)) + 1;
+   if (pCreateInfo->mipLevels == 0 || pCreateInfo->mipLevels > full_chain ||
+       pCreateInfo->mipLevels >= KK_MAX_MIP_LEVELS)
+      return false;
+
+   return true;
+}
+
 static VkResult
 kk_image_init(struct kk_device *dev, struct kk_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
+   if (!kk_image_create_info_is_valid(kk_device_physical(dev), pCreateInfo)) {
+      mesa_loge("kk: refusing a %ux%ux%u image with %u levels and %u layers, "
+                "outside what KK advertises",
+                pCreateInfo->extent.width, pCreateInfo->extent.height,
+                pCreateInfo->extent.depth, pCreateInfo->mipLevels,
+                pCreateInfo->arrayLayers);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
 
    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -876,11 +918,12 @@ kk_GetDeviceImageMemoryRequirements(VkDevice device,
                                     VkMemoryRequirements2 *pMemoryRequirements)
 {
    VK_FROM_HANDLE(kk_device, dev, device);
-   ASSERTED VkResult result;
    struct kk_image image = {0};
 
-   result = kk_image_init(dev, &image, pInfo->pCreateInfo);
-   assert(result == VK_SUCCESS);
+   if (kk_image_init(dev, &image, pInfo->pCreateInfo) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){0};
+      return;
+   }
 
    const VkImageAspectFlags aspects =
       image.disjoint ? pInfo->planeAspect : image.vk.aspects;
@@ -959,11 +1002,12 @@ kk_GetDeviceImageSubresourceLayoutKHR(
    VkSubresourceLayout2KHR *pLayout)
 {
    VK_FROM_HANDLE(kk_device, dev, device);
-   ASSERTED VkResult result;
    struct kk_image image = {0};
 
-   result = kk_image_init(dev, &image, pInfo->pCreateInfo);
-   assert(result == VK_SUCCESS);
+   if (kk_image_init(dev, &image, pInfo->pCreateInfo) != VK_SUCCESS) {
+      pLayout->subresourceLayout = (VkSubresourceLayout){0};
+      return;
+   }
 
    kk_get_image_subresource_layout(dev, &image, pInfo->pSubresource, pLayout);
 
