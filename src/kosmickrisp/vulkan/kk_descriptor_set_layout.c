@@ -105,6 +105,105 @@ kk_descriptor_get_type_list(VkDescriptorType type,
    return type_list;
 }
 
+static bool
+kk_descriptor_type_is_known(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+   case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Whether KK can lay this create info out at all. Binding numbers index a
+ * dense array sized by the largest one, dynamic buffers live in fixed arrays of
+ * KK_MAX_DYNAMIC_BUFFERS, and the per-binding arrays of the pNext structs are
+ * indexed by binding. Invalid usage breaks every one of those, and under venus
+ * the create info comes from a guest, so this runs before anything is sized or
+ * indexed from it. On success, *num_bindings_out is the binding array's
+ * length. */
+static bool
+kk_descriptor_set_layout_is_valid(
+   const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+   uint32_t *num_bindings_out)
+{
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+   const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
+
+   if (binding_flags && binding_flags->bindingCount != 0 &&
+       binding_flags->bindingCount != pCreateInfo->bindingCount)
+      return false;
+
+   uint32_t num_bindings = 0;
+   uint64_t dynamic_buffer_count = 0;
+   bool has_variable = false;
+   uint32_t variable_binding = 0;
+   for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
+      const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[i];
+
+      if (binding->binding >= KK_MAX_DESCRIPTORS)
+         return false;
+      num_bindings = MAX2(num_bindings, binding->binding + 1);
+
+      if (!kk_descriptor_type_is_known(binding->descriptorType))
+         return false;
+
+      if (binding->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+         if (mutable_info == NULL ||
+             i >= mutable_info->mutableDescriptorTypeListCount)
+            return false;
+         const VkMutableDescriptorTypeListEXT *list =
+            &mutable_info->pMutableDescriptorTypeLists[i];
+         for (uint32_t t = 0; t < list->descriptorTypeCount; t++) {
+            if (list->pDescriptorTypes[t] == VK_DESCRIPTOR_TYPE_MUTABLE_EXT ||
+                !kk_descriptor_type_is_known(list->pDescriptorTypes[t]))
+               return false;
+         }
+      }
+
+      if (binding->descriptorType ==
+             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+         dynamic_buffer_count += binding->descriptorCount;
+
+      if (binding_flags && binding_flags->bindingCount != 0 &&
+          (binding_flags->pBindingFlags[i] &
+           VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
+         if (has_variable)
+            return false;
+         has_variable = true;
+         variable_binding = binding->binding;
+      }
+   }
+
+   if (dynamic_buffer_count > KK_MAX_DYNAMIC_BUFFERS)
+      return false;
+
+   /* The variable-count binding is laid out last */
+   if (has_variable && variable_binding != num_bindings - 1)
+      return false;
+
+   *num_bindings_out = num_bindings;
+   return true;
+}
+
 static void
 kk_descriptor_set_layout_destroy(struct vk_device *vk_dev,
                                  struct vk_descriptor_set_layout *vk_layout)
@@ -124,11 +223,17 @@ kk_CreateDescriptorSetLayout(VkDevice device,
 {
    VK_FROM_HANDLE(kk_device, dev, device);
 
-   uint32_t num_bindings = 0;
+   uint32_t num_bindings;
+   if (!kk_descriptor_set_layout_is_valid(pCreateInfo, &num_bindings)) {
+      mesa_loge("kk: refusing a descriptor set layout KK cannot lay out "
+                "(binding number, descriptor type, dynamic buffer count or "
+                "per-binding pNext arrays out of range)");
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
    uint32_t immutable_sampler_count = 0;
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];
-      num_bindings = MAX2(num_bindings, binding->binding + 1);
 
       /* From the Vulkan 1.1.97 spec for VkDescriptorSetLayoutBinding:
        *
@@ -176,9 +281,9 @@ kk_CreateDescriptorSetLayout(VkDevice device,
       vk_find_struct_const(pCreateInfo->pNext,
                            MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
 
-   uint32_t buffer_size = 0;
-   uint32_t max_variable_descriptor_size = 0;
-   uint8_t dynamic_buffer_count = 0;
+   uint64_t buffer_size = 0;
+   uint64_t max_variable_descriptor_size = 0;
+   uint32_t dynamic_buffer_count = 0;
    for (uint32_t b = 0; b < num_bindings; b++) {
       /* We stashed the pCreateInfo->pBindings[] index (plus one) in the
        * immutable_samplers pointer.  Check for NULL (empty binding) and then
@@ -274,15 +379,29 @@ kk_CreateDescriptorSetLayout(VkDevice device,
              */
             assert(b == num_bindings - 1);
             assert(max_variable_descriptor_size == 0);
-            max_variable_descriptor_size = stride * binding->descriptorCount;
+            max_variable_descriptor_size =
+               (uint64_t)stride * binding->descriptorCount;
          } else {
             /* the allocation size will be computed at descriptor allocation,
              * but the buffer size will be already aligned as this binding will
              * be the last
              */
-            buffer_size += stride * binding->descriptorCount;
+            buffer_size += (uint64_t)stride * binding->descriptorCount;
          }
       }
+   }
+
+   const uint32_t max_buffer_size =
+      (pCreateInfo->flags &
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+         ? KK_PUSH_DESCRIPTOR_SET_SIZE
+         : KK_MAX_DESCRIPTOR_SET_SIZE;
+   if (buffer_size + max_variable_descriptor_size > max_buffer_size) {
+      mesa_loge("kk: refusing a descriptor set layout of %" PRIu64
+                " bytes, past the %u a set may hold",
+                buffer_size + max_variable_descriptor_size, max_buffer_size);
+      kk_descriptor_set_layout_destroy(&dev->vk, &layout->vk);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
    layout->non_variable_descriptor_buffer_size = buffer_size;
@@ -363,6 +482,12 @@ kk_GetDescriptorSetLayoutSupport(
    VkDevice device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
    VkDescriptorSetLayoutSupport *pSupport)
 {
+   uint32_t num_bindings;
+   if (!kk_descriptor_set_layout_is_valid(pCreateInfo, &num_bindings)) {
+      pSupport->supported = false;
+      return;
+   }
+
    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
       vk_find_struct_const(pCreateInfo->pNext,
                            MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
@@ -389,7 +514,7 @@ kk_GetDescriptorSetLayoutSupport(
    uint64_t non_variable_size = 0;
    uint32_t variable_stride = 0;
    uint32_t variable_count = 0;
-   uint8_t dynamic_buffer_count = 0;
+   uint32_t dynamic_buffer_count = 0;
    bool variable_is_inline_uniform_block = false;
 
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
@@ -438,7 +563,7 @@ kk_GetDescriptorSetLayoutSupport(
              * check for whether or not the max buffer size is big enough, we
              * keep non_variable_size aligned to max_align.
              */
-            non_variable_size += stride * binding->descriptorCount;
+            non_variable_size += (uint64_t)stride * binding->descriptorCount;
             non_variable_size = align64(non_variable_size, max_align);
          }
       }
@@ -446,7 +571,7 @@ kk_GetDescriptorSetLayoutSupport(
 
    uint64_t buffer_size = non_variable_size;
    if (variable_stride > 0) {
-      buffer_size += variable_stride * variable_count;
+      buffer_size += (uint64_t)variable_stride * variable_count;
       buffer_size = align64(buffer_size, max_align);
    }
 
