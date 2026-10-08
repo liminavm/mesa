@@ -843,6 +843,17 @@ kk_push_descriptor_set(struct kk_cmd_buffer *cmd,
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
 
+   /* info->set indexes pipeline_layout->set_layouts[] and desc->push[], both of
+    * KK_MAX_SETS; a set past the layout or that array overruns one or the
+    * other. Under venus a guest sends the push unchecked. */
+   if (info->set >= KK_MAX_SETS || info->set >= pipeline_layout->set_count ||
+       pipeline_layout->set_layouts[info->set] == NULL) {
+      mesa_loge("kk: refusing a push to descriptor set %u, past the %u the "
+                "pipeline layout holds (max %u)",
+                info->set, pipeline_layout->set_count, KK_MAX_SETS);
+      return;
+   }
+
    struct kk_descriptor_set_layout *set_layout =
       vk_to_kk_descriptor_set_layout(pipeline_layout->set_layouts[info->set]);
 
@@ -1141,10 +1152,23 @@ kk_CmdPushDescriptorSetWithTemplate2KHR(
 
    struct kk_descriptor_state *desc =
       kk_get_descriptors_state(cmd, template->bind_point);
-   struct kk_descriptor_set_layout *set_layout = vk_to_kk_descriptor_set_layout(
-      pipeline_layout->set_layouts[pPushDescriptorSetWithTemplateInfo->set]);
-   struct kk_push_descriptor_set *push_set = kk_cmd_push_descriptors(
-      cmd, desc, set_layout, pPushDescriptorSetWithTemplateInfo->set);
+
+   /* The set index indexes pipeline_layout->set_layouts[] and desc->push[],
+    * both of KK_MAX_SETS; bound it as the plain push does. */
+   const uint32_t set = pPushDescriptorSetWithTemplateInfo->set;
+   if (set >= KK_MAX_SETS || set >= pipeline_layout->set_count ||
+       pipeline_layout->set_layouts[set] == NULL) {
+      mesa_loge(
+         "kk: refusing a template push to descriptor set %u, past the %u "
+         "the pipeline layout holds (max %u)",
+         set, pipeline_layout->set_count, KK_MAX_SETS);
+      return;
+   }
+
+   struct kk_descriptor_set_layout *set_layout =
+      vk_to_kk_descriptor_set_layout(pipeline_layout->set_layouts[set]);
+   struct kk_push_descriptor_set *push_set =
+      kk_cmd_push_descriptors(cmd, desc, set_layout, set);
    if (unlikely(push_set == NULL))
       return;
 
