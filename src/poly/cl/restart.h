@@ -163,6 +163,10 @@ poly_setup_unroll_for_draw(global struct poly_heap *heap,
    return (global uchar *)heap->base + old_heap_bottom_B;
 }
 
+/* Unrolls a draw into a list of its decomposed primitives. With
+ * drop_adjacency, the adjacent vertices of an adjacency topology are left out:
+ * a line keeps vertices 1 and 2 of its four, a triangle 0, 2 and 4 of its six.
+ */
 static inline void
 poly_unroll_geometry(global uint32_t *out_draw,
                      global struct poly_heap *heap,
@@ -174,6 +178,7 @@ poly_unroll_geometry(global uint32_t *out_draw,
                      uint32_t restart_index,
                      uint32_t flatshade_first,
                      uint32_t emulate_flatshade_last,
+                     uint32_t drop_adjacency,
                      enum mesa_prim mode,
                      local void *scratch)
 {
@@ -201,9 +206,14 @@ poly_unroll_geometry(global uint32_t *out_draw,
    uint in_range_el = poly_index_buffer_range_el(
       index_buffer_range_el, in_draw[2]);
 
+   enum mesa_prim out_mode =
+      drop_adjacency ? poly_prim_without_adjacency(mode) : mode;
+   bool lines_adj = out_mode == MESA_PRIM_LINES && out_mode != mode;
+   bool tris_adj = out_mode == MESA_PRIM_TRIANGLES && out_mode != mode;
+
    uint out_prims = 0;
    uint needle = 0;
-   uint per_prim = mesa_vertices_per_prim(mode);
+   uint per_prim = mesa_vertices_per_prim(out_mode);
    while (needle < count) {
       /* Search for next restart or the end. Lanes load in parallel. */
       uint next_restart = needle;
@@ -226,12 +236,13 @@ poly_unroll_geometry(global uint32_t *out_draw,
       uint out_prims_base = out_prims;
       for (uint i = tid; i < subprims; i += cl_local_size.x) {
          for (uint vtx = 0; vtx < per_prim; ++vtx) {
+            uint in_vtx = lines_adj ? vtx + 1 : tris_adj ? vtx * 2 : vtx;
             uint id = poly_vertex_id_for_topology(mode, flatshade_first, i,
-                                                  vtx, subprims);
+                                                  in_vtx, subprims);
             uint offset = needle + id;
 
             uint vtx_out = poly_output_vertex_id_for_topology(
-               mode, flatshade_first, emulate_flatshade_last, vtx);
+               out_mode, flatshade_first, emulate_flatshade_last, vtx);
             uint x = ((out_prims_base + i) * per_prim) + vtx_out;
             uint y = poly_load_index(in_ptr, in_range_el, offset,
                                      in_index_size_B);
@@ -262,7 +273,8 @@ poly_unroll_restart(global uint32_t *out_draw,
 {
    poly_unroll_geometry(out_draw, heap, in_draw, index_buffer,
                         index_buffer_range_el, index_size_B, index_size_B,
-                        restart_index, flatshade_first, false, mode, scratch);
+                        restart_index, flatshade_first, false, false, mode,
+                        scratch);
 }
 
 static inline uint32_t
