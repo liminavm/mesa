@@ -725,11 +725,22 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
     * it changes set_dynamic_buffer_start[s], this binding is implicitly
     * invalidated.
     */
-   uint8_t dyn_buffer_start =
+   /* Sets past KK_MAX_SETS, dynamic buffers past KK_MAX_DYNAMIC_BUFFERS and
+    * offsets past dynamicOffsetCount are invalid usage. Under venus a guest
+    * sends them unchecked, so they are dropped here rather than indexed. */
+   if (info->firstSet >= KK_MAX_SETS) {
+      mesa_loge("kk: binding descriptor set %u, past the %u sets KK holds",
+                info->firstSet, KK_MAX_SETS);
+      return;
+   }
+   const uint32_t set_count =
+      MIN2(info->descriptorSetCount, KK_MAX_SETS - info->firstSet);
+
+   uint32_t dyn_buffer_start =
       pipeline_layout->dynamic_descriptor_offset[info->firstSet];
 
    uint32_t next_dyn_offset = 0;
-   for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
+   for (uint32_t i = 0; i < set_count; ++i) {
       unsigned s = i + info->firstSet;
       VK_FROM_HANDLE(kk_descriptor_set, set, info->pDescriptorSets[i]);
 
@@ -752,13 +763,22 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
             vk_to_kk_descriptor_set_layout(pipeline_layout->set_layouts[s]);
 
          if (set != NULL && set_layout->vk.dynamic_descriptor_count > 0) {
-            for (uint32_t j = 0; j < set_layout->vk.dynamic_descriptor_count;
-                 j++) {
+            const uint32_t count = set_layout->vk.dynamic_descriptor_count;
+            if (set->layout->vk.dynamic_descriptor_count != count ||
+                (uint64_t)dyn_buffer_start + count > KK_MAX_DYNAMIC_BUFFERS ||
+                (uint64_t)next_dyn_offset + count > info->dynamicOffsetCount) {
+               mesa_loge("kk: set %u's %u dynamic buffers at %u do not fit "
+                         "the %u KK holds or the %u offsets given",
+                         s, count, dyn_buffer_start, KK_MAX_DYNAMIC_BUFFERS,
+                         info->dynamicOffsetCount);
+               return;
+            }
+            for (uint32_t j = 0; j < count; j++) {
                struct kk_buffer_address addr = set->dynamic_buffers[j];
                addr.base_addr += info->pDynamicOffsets[next_dyn_offset + j];
                desc->root.dynamic_buffers[dyn_buffer_start + j] = addr;
             }
-            next_dyn_offset += set->layout->vk.dynamic_descriptor_count;
+            next_dyn_offset += count;
          }
 
          dyn_buffer_start += set_layout->vk.dynamic_descriptor_count;
@@ -766,8 +786,6 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
          assert(set == NULL);
       }
    }
-   assert(dyn_buffer_start <= KK_MAX_DYNAMIC_BUFFERS);
-   assert(next_dyn_offset <= info->dynamicOffsetCount);
 
    desc->root_dirty = true;
 }
