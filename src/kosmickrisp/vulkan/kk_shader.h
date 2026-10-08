@@ -13,6 +13,7 @@
 #include "kk_private.h"
 
 #include "kosmickrisp/bridge/mtl_format.h"
+#include "poly/nir/poly_nir.h"
 
 #include "vk_pipeline_cache.h"
 
@@ -45,6 +46,16 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
    memcpy(&out, &x, sizeof(out));
    return out;
 }
+
+/* A geometry shader runs as compute programs before the draw, plus a vertex
+ * shader that rasterizes their output (kept in msl_data[MESA_SHADER_GEOMETRY]
+ * so the render pipeline is built like any other last pre-raster stage). */
+enum kk_gs_variant {
+   KK_GS_VARIANT_MAIN,
+   KK_GS_VARIANT_COUNT,
+   KK_GS_VARIANT_PRE,
+   KK_GS_VARIANTS,
+};
 
 struct kk_shader_info {
    mesa_shader_stage stage;
@@ -106,6 +117,10 @@ struct kk_shader_info {
       struct {
          uint64_t tcs_per_vertex_outputs;
          uint32_t tcs_output_stride;
+
+         /* Outputs of an evaluation shader that runs before a geometry
+          * shader, which reads them from memory */
+         uint64_t tes_outputs_written;
          uint8_t tcs_output_patch_size;
          uint8_t tcs_nr_patch_outputs;
 
@@ -113,7 +128,13 @@ struct kk_shader_info {
       } tess;
 
       struct {
+         struct poly_gs_info poly;
+      } gs;
+
+      struct {
          bool uses_flat_varyings;
+         /* Varying slots read flat */
+         uint64_t flat_inputs;
       } fs;
 
       struct {
@@ -133,6 +154,8 @@ struct kk_pipeline_handles {
          uint32_t pre_render_count;
       } gfx;
       mtl_compute_pipeline_state *cs;
+      /* Geometry shader programs; NULL for a variant poly did not create. */
+      mtl_compute_pipeline_state *gs[KK_GS_VARIANTS];
    };
 };
 
@@ -147,12 +170,15 @@ struct kk_shader {
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;
    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+   struct msl_compile_data msl_gs[KK_GS_VARIANTS];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
                                VK_OBJECT_TYPE_SHADER_EXT);
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
+
+extern const uint32_t kk_gs_variant_local_size[KK_GS_VARIANTS];
 
 /* limina A/B sizing knob: LIMINA_KK_NOROBUST=1 drops ALL robust-access lowering
  * (bounded UBO/SSBO loads, vertex-attrib clamps). NOT spec-conformant — for

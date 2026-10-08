@@ -427,12 +427,14 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
       cmd->state.gfx.xfb.pg_pool = pool;
       cmd->state.gfx.xfb.pg_query = query;
       cmd->state.gfx.xfb.pg_count = 0;
+      cmd->state.gfx.xfb.pg_gpu = 0;
       return;
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
       cmd->state.gfx.xfb.tf_pool = pool;
       cmd->state.gfx.xfb.tf_query = query;
       cmd->state.gfx.xfb.tf_written = 0;
       cmd->state.gfx.xfb.tf_needed = 0;
+      cmd->state.gfx.xfb.tf_gpu = 0;
       if (getenv("LIMINA_KK_RTLOG"))
          fprintf(stderr, "[LIMINA-KK-XFB] BeginQuery(tf) q=%u\n", query);
       return;
@@ -477,6 +479,22 @@ kk_query_write_cpu_result(struct kk_cmd_buffer *cmd,
    kk_cmd_write(cmd, (struct libkk_imm_write){addr, 1});
 }
 
+/* Write a result that geometry shader draws added to on the GPU: the CPU-known
+ * values plus the GPU accumulators at gpu. */
+static void
+kk_query_write_gpu_sum(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+                       uint32_t query, uint64_t gpu, const uint64_t *values,
+                       uint32_t value_count)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   assert(value_count == kk_reports_per_query(pool));
+   libkk_write_query_sum(cmd, kk_grid_1d(1u), true,
+                         kk_query_report_addr(dev, pool, query),
+                         kk_query_available_addr(pool, query), gpu, values[0],
+                         value_count > 1 ? values[1] : 0u, value_count);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                uint32_t query)
@@ -487,14 +505,24 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
       uint64_t value = cmd->state.gfx.xfb.pg_count;
-      kk_query_write_cpu_result(cmd, pool, query, &value, 1);
+      if (cmd->state.gfx.xfb.pg_gpu)
+         kk_query_write_gpu_sum(cmd, pool, query, cmd->state.gfx.xfb.pg_gpu,
+                                &value, 1);
+      else
+         kk_query_write_cpu_result(cmd, pool, query, &value, 1);
       cmd->state.gfx.xfb.pg_pool = NULL;
+      cmd->state.gfx.xfb.pg_gpu = 0;
       return;
    }
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
       uint64_t values[2] = {cmd->state.gfx.xfb.tf_written,
                             cmd->state.gfx.xfb.tf_needed};
-      kk_query_write_cpu_result(cmd, pool, query, values, 2);
+      if (cmd->state.gfx.xfb.tf_gpu)
+         kk_query_write_gpu_sum(cmd, pool, query, cmd->state.gfx.xfb.tf_gpu,
+                                values, 2);
+      else
+         kk_query_write_cpu_result(cmd, pool, query, values, 2);
+      cmd->state.gfx.xfb.tf_gpu = 0;
       if (getenv("LIMINA_KK_RTLOG"))
          fprintf(stderr, "[LIMINA-KK-XFB] EndQuery(tf) q=%u written=%llu needed=%llu\n",
                  query, (unsigned long long)values[0],

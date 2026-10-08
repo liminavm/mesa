@@ -77,7 +77,8 @@ libkk_unroll_geometry(
    constant uint32_t *in_draw, global uint32_t *out_draw,
    uint32_t in_draw_stride_el, uint32_t restart_index,
    uint32_t index_buffer_size_el, uint32_t in_el_size_B,
-   uint32_t out_el_size_B, uint32_t flatshade_first, uint32_t mode)
+   uint32_t out_el_size_B, uint32_t flatshade_first,
+   uint32_t emulate_flatshade_last, uint32_t drop_adjacency, uint32_t mode)
 {
    uint gid = cl_group_id.x;
    in_draw += gid * in_draw_stride_el;
@@ -86,5 +87,6 @@ libkk_unroll_geometry(
    POLY_DECL_UNROLL_RESTART_SCRATCH(scratch, 1024);
    poly_unroll_geometry(out_draw, heap, in_draw, index_buffer,
                         index_buffer_size_el, in_el_size_B, out_el_size_B,
-                        restart_index, flatshade_first, true, false, mode, scratch);
+                        restart_index, flatshade_first, emulate_flatshade_last,
+                        drop_adjacency, mode, scratch);
 }
