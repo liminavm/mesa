@@ -792,7 +792,8 @@ zink_init_screen_caps(struct zink_screen *screen)
    }
    {
       uint32_t modes = BITFIELD_MASK(MESA_PRIM_COUNT);
-      if (!screen->have_triangle_fans || !screen->info.feats.features.geometryShader)
+      if (!screen->have_triangle_fans || !screen->info.feats.features.geometryShader ||
+          screen->driver_workarounds.no_gs_emulation)
          modes &= ~BITFIELD_BIT(MESA_PRIM_QUADS);
       modes &= ~BITFIELD_BIT(MESA_PRIM_QUAD_STRIP);
       modes &= ~BITFIELD_BIT(MESA_PRIM_POLYGON);
@@ -2989,6 +2990,13 @@ zink_get_sample_pixel_grid(struct pipe_screen *pscreen, unsigned sample_count,
 static void
 init_driver_workarounds(struct zink_screen *screen)
 {
+   /* KosmicKrisp runs geometry shaders as compute programs before the draw;
+    * the primitive emulations zink builds on them cost a compute pass per
+    * draw, so keep those primitives on their non-GS lowering. */
+   screen->driver_workarounds.no_gs_emulation =
+      zink_driverid(screen) == VK_DRIVER_ID_MESA_KOSMICKRISP &&
+      !getenv("LIMINA_ZINK_GS_EMULATION");
+
    /* enable implicit sync for all non-mesa drivers */
    screen->driver_workarounds.implicit_sync = !zink_driver_is_venus(screen);
    switch (zink_driverid(screen)) {
@@ -3067,6 +3075,7 @@ init_driver_workarounds(struct zink_screen *screen)
    if ((!screen->info.have_EXT_line_rasterization ||
         !screen->info.line_rast_feats.stippledBresenhamLines) &&
        screen->info.feats.features.geometryShader &&
+       !screen->driver_workarounds.no_gs_emulation &&
        screen->info.feats.features.sampleRateShading) {
       /* we're using stippledBresenhamLines as a proxy for all of these, to
        * avoid accidentally changing behavior on VK-drivers where we don't

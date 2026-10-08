@@ -1554,6 +1554,9 @@ struct zink_screen {
       bool track_renderpasses;
       bool no_linestipple;
       bool no_linesmooth;
+      /* Geometry shaders are emulated in compute: keep quads, edge flags,
+       * line stipple and the other primitive emulations off them. */
+      bool no_gs_emulation;
       bool can_do_invalid_linear_modifier;
       bool inconsistent_interpolation;
       bool can_2d_view_sparse;

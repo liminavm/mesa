@@ -2836,7 +2836,8 @@ void
 zink_set_primitive_emulation_keys(struct zink_context *ctx)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
-   if (!screen->info.feats.features.geometryShader)
+   if (!screen->info.feats.features.geometryShader ||
+       screen->driver_workarounds.no_gs_emulation)
       return;
 
    bool lower_line_stipple = false, lower_line_smooth = false;
