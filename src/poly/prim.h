@@ -102,6 +102,23 @@ poly_vertex_id_for_tri_strip_adj(uint32_t prim, uint32_t vert,
    return (prim * 2) + offset;
 }
 
+/* The primitive type an adjacency topology rasterizes as when no geometry
+ * shader consumes the adjacent vertices */
+static inline enum mesa_prim
+poly_prim_without_adjacency(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_LINES_ADJACENCY:
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return MESA_PRIM_LINES;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return MESA_PRIM_TRIANGLES;
+   default:
+      return mode;
+   }
+}
+
 static inline uint32_t
 poly_vertex_id_for_topology(enum mesa_prim mode, bool flatshade_first,
                             uint32_t prim, uint32_t vert, uint32_t num_prims)
