@@ -732,10 +732,26 @@ kk_AllocateDescriptorSets(VkDevice device,
       /* If descriptorSetCount is zero or this structure is not included in
        * the pNext chain, then the variable lengths are considered to be zero.
        */
-      const uint32_t variable_count =
-         var_desc_count && var_desc_count->descriptorSetCount > 0
-            ? var_desc_count->pDescriptorCounts[i]
-            : 0;
+      const struct kk_descriptor_set_binding_layout *last =
+         layout->binding_count > 0 ? &layout->binding[layout->binding_count - 1]
+                                   : NULL;
+      uint32_t variable_count = 0;
+      if (last &&
+          (last->flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) &&
+          var_desc_count && var_desc_count->descriptorSetCount > 0) {
+         /* A count past the binding's descriptorCount, or one missing from a
+          * short array, would size the set beyond what the layout bounds. */
+         if (var_desc_count->descriptorSetCount !=
+                pAllocateInfo->descriptorSetCount ||
+             var_desc_count->pDescriptorCounts[i] > last->array_size) {
+            mesa_loge("kk: refusing a variable descriptor count past its "
+                      "binding's %u, or missing",
+                      last->array_size);
+            result = vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
+            break;
+         }
+         variable_count = var_desc_count->pDescriptorCounts[i];
+      }
 
       result =
          kk_descriptor_set_create(dev, pool, layout, variable_count, &set);
