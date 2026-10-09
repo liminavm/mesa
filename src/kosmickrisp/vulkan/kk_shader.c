@@ -2192,6 +2192,25 @@ kk_msl_read(struct blob_reader *blob, struct msl_compile_data *data)
 {
    const uint32_t entrypoint_length = blob_read_uint32(blob);
    const uint32_t code_length = blob_read_uint32(blob);
+   if (blob->overrun)
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+
+   /* limina: these lengths are attacker-controlled. This serialized shader
+    * reaches us from guest-supplied VkPipelineCache data: an unrecognised
+    * cache entry is kept as a raw object and re-deserialized through the
+    * shader ops at pipeline-creation lookup (vk_pipeline_cache_lookup_object),
+    * a path with no header or hash to vet it. Reject lengths that cannot fit
+    * the bytes still in the blob BEFORE allocating, so a hostile length can't
+    * drive an unbounded ralloc; the subtraction is safe because the first
+    * term is already bounded by `remaining`. kk_msl_write emits strlen()+1,
+    * so both strings are non-empty and NUL-terminated — require that too, or
+    * the MSL compiler reads past the buffer. */
+   const size_t remaining = blob->end - blob->current;
+   if (entrypoint_length == 0 || code_length == 0 ||
+       entrypoint_length > remaining ||
+       code_length > remaining - entrypoint_length)
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+
    data->entrypoint_name = ralloc_array(NULL, char, entrypoint_length);
    if (data->entrypoint_name == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -2204,6 +2223,10 @@ kk_msl_read(struct blob_reader *blob, struct msl_compile_data *data)
    blob_copy_bytes(blob, (void *)data->code, code_length);
 
    if (blob->overrun)
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+
+   if (data->entrypoint_name[entrypoint_length - 1] != '\0' ||
+       data->code[code_length - 1] != '\0')
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
    return VK_SUCCESS;
@@ -2229,6 +2252,12 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    if (blob->overrun)
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
+   /* limina: info.stage is attacker-controlled (see kk_msl_read) and is used
+    * immediately to index msl_data[MESA_SHADER_STAGES]; reject anything out of
+    * range before it reaches vk_shader_zalloc or kk_msl_deserialize. */
+   if ((unsigned)info.stage >= MESA_SHADER_STAGES)
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+
    struct kk_shader *shader = vk_shader_zalloc(
       &dev->vk, &kk_shader_ops, info.stage, pAllocator, sizeof(*shader));
    if (shader == NULL)
@@ -2242,6 +2271,12 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
 
    if (shader->info.stage == MESA_SHADER_VERTEX) {
       u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
+         /* limina: additional_stages_bits is attacker-controlled; a bit past
+          * the stage table would make kk_msl_deserialize index out of bounds. */
+         if ((unsigned)stage >= MESA_SHADER_STAGES) {
+            result = vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+            goto fail;
+         }
          result = kk_msl_deserialize(blob, stage, shader);
          if (result != VK_SUCCESS)
             goto fail;
