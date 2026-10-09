@@ -855,6 +855,25 @@ msl_src_as_const(struct nir_to_msl_ctx *ctx, nir_src *src)
    }
 }
 
+static bool
+default_untyped_src(nir_src *src, void *state)
+{
+   struct hash_table *types = state;
+   /* Control-flow conditions are always live and typed; leave them alone. */
+   if (nir_src_is_if(src))
+      return true;
+   if (get_type(types, src) != TYPE_NONE)
+      return true;
+   /* Inherit the def's type whenever it has one (including TYPE_TEXTURE /
+    * TYPE_SAMPLER), so a defaulted src meeting a typed def does not trigger a
+    * spurious as_type<> bitcast in msl_bitcast_for_src -- which, for a texture
+    * def, would emit an illegal "as_type<ulong>(texture2d<...>)". Fall back to
+    * opaque data only when the def is itself untyped. */
+   ti_type def_type = get_type(types, src->ssa);
+   set_type(types, src, def_type != TYPE_NONE ? def_type : TYPE_GENERIC_DATA);
+   return true;
+}
+
 struct hash_table *
 msl_infer_types(nir_shader *shader)
 {
@@ -879,6 +898,29 @@ msl_infer_types(nir_shader *shader)
          }
       }
    } while (progress);
+
+   /* Type inference is use-driven: a value that reached a concrete sink is
+    * typed, so anything still TYPE_NONE after the fixpoint has no concrete
+    * consumer (it is dead, or only feeds other dead values). Default such
+    * residual values to opaque data (emitted as uint) instead of leaving them
+    * untyped: ti_type_to_msl_type returns NULL for TYPE_NONE, so predeclare_
+    * ssa_values would skip the declaration (msl_type_for_def == NULL) while the
+    * body still references the value, and msl_src_as_const would print
+    * "(null)"/"UNTYPED!" for its operands -- MSL that fails to compile.
+    * Defaults defs first so each src can inherit its def's type. */
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_def *def = nir_instr_def(instr);
+            if (def && get_type(types, def) == TYPE_NONE)
+               set_type(types, def, TYPE_GENERIC_DATA);
+         }
+      }
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            nir_foreach_src(instr, default_untyped_src, types);
+      }
+   }
    return types;
 }
 
