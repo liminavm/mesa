@@ -456,8 +456,12 @@ vk_tessellation_state_init(struct vk_tessellation_state *ts,
       return;
 
    if (!IS_DYNAMIC(TS_PATCH_CONTROL_POINTS)) {
-      assert(ts_info->patchControlPoints <= UINT8_MAX);
-      ts->patch_control_points = ts_info->patchControlPoints;
+      /* A patch size too wide for the uint8_t is invalid; store 0, which is
+       * never a valid patch size, rather than wrap into one that looks valid.
+       */
+      ts->patch_control_points = ts_info->patchControlPoints <= UINT8_MAX
+                                    ? ts_info->patchControlPoints
+                                    : 0;
    }
 
    if (!IS_DYNAMIC(TS_DOMAIN_ORIGIN)) {
@@ -2573,8 +2577,9 @@ vk_common_CmdSetPatchControlPointsEXT(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
    struct vk_dynamic_graphics_state *dyn = &cmd->dynamic_graphics_state;
 
-   SET_DYN_VALUE(dyn, TS_PATCH_CONTROL_POINTS,
-                 ts.patch_control_points, patchControlPoints);
+   /* As for the pipeline's patch size: one too wide to store is stored as 0. */
+   SET_DYN_VALUE(dyn, TS_PATCH_CONTROL_POINTS, ts.patch_control_points,
+                 patchControlPoints <= UINT8_MAX ? patchControlPoints : 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL

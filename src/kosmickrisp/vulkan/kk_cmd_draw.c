@@ -2999,11 +2999,23 @@ kk_draw_impl(struct kk_cmd_buffer *cmd, struct kk_draw_command *data, bool fan_s
    data->flatshade_first =
       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
 
+   bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+
+   /* The patch size divides the vertex count, on the CPU here and on the GPU
+    * for an indirect draw (libkk_tess_setup_indirect). A venus guest's reaches
+    * us unvalidated, so drop a draw whose patch size is not one we serve.
+    */
+   if (tess) {
+      uint32_t patch_size = dyn->ts.patch_control_points;
+      if (patch_size == 0 ||
+          patch_size > kk_cmd_buffer_device(cmd)
+                          ->vk.physical->properties.maxTessellationPatchSize)
+         return;
+   }
+
    /* Convert to indirect and process predicates. Skip draw if we fail. */
    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
       return;
-
-   bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
    /* A geometry shader draw counts and captures on the GPU (kk_launch_gs) */
    bool xfb_track =
       unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool) &&
