@@ -2663,10 +2663,23 @@ kk_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
       if (idx >= ARRAY_SIZE(gfx->xfb.buf))
          break;
       VK_FROM_HANDLE(kk_buffer, buffer, pBuffers[i]);
+
+      /* pOffsets/pSizes are the guest's. vk_buffer_range only asserts they fit the buffer
+       * (compiled out in release), and the VK_WHOLE_SIZE size below is vk.size - offset, which
+       * underflows to a huge value for an offset past the buffer -- the capture shader would
+       * then write out of bounds through range.addr/range.range. Refuse an out-of-range offset
+       * and clamp an oversized size so the captured range stays inside the buffer. */
+      VkDeviceSize bsize = buffer ? buffer->vk.size : 0u;
+      if (!buffer || pOffsets[i] > bsize) {
+         gfx->xfb.buf[idx].gpu_base = 0u;
+         gfx->xfb.buf[idx].size = 0u;
+         continue;
+      }
+      VkDeviceSize avail = bsize - pOffsets[i];
       VkDeviceSize size =
-         pSizes && pSizes[i] != VK_WHOLE_SIZE
-            ? pSizes[i]
-            : (buffer ? buffer->vk.size - pOffsets[i] : 0);
+         pSizes && pSizes[i] != VK_WHOLE_SIZE ? pSizes[i] : avail;
+      if (size > avail)
+         size = avail;
 
       struct kk_addr_range range =
          kk_buffer_addr_range(buffer, pOffsets[i], size);
