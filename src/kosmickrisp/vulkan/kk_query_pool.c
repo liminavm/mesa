@@ -389,6 +389,12 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    assert(kk_pool_is_ts(pool) && pool->ts.heap);
 
+   /* limina: query is the guest's. The Metal counter heap and the pool BO both hold
+    * exactly query_count entries; refuse a base index past the pool before sampling
+    * the heap or writing the report. */
+   if (query >= pool->vk.query_count)
+      return;
+
    uint32_t count = kk_mv_query_count(cmd);
    enum mtl_render_stages mtl_stage =
       kk_pipeline_stages_to_mtl_render_stage(stage);
@@ -433,7 +439,10 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 
    /* Resolve the Metal timestamp value to all multiview query indices so that
     * they all become available. */
-   for (uint32_t i = 0; i < count; i++) {
+   /* Multiview resolves the one sample to N consecutive reports (N = views). A guest
+    * can name a base query within range but a view count that runs past the pool;
+    * stop at the last valid query so no resolve targets a report outside the BO. */
+   for (uint32_t i = 0; i < count && query + i < pool->vk.query_count; i++) {
       struct kk_ts_resolve resolve = {
          .heap = pool->ts.heap,
          .index = heap_index,
@@ -475,6 +484,10 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+   /* limina: query is the guest's and indexes the occlusion remap array (query_count
+    * entries). Refuse an out-of-range index rather than read it out of bounds. */
+   if (query >= pool->vk.query_count)
+      return;
    uint16_t *remap_index = kk_pool_index_ptr(pool);
    cmd->state.gfx.occlusion.index = remap_index[query];
 }
@@ -566,6 +579,12 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
 
+   /* limina: query is the guest's and indexes the availability array (query_count
+    * entries). Refuse an out-of-range base before kk_query_available_addr(), which
+    * asserts the bound. Occlusion is already disabled above, so the query stops. */
+   if (query >= pool->vk.query_count)
+      return;
+
    /* Make the query available. The Vulkan spec states:
     * If queries are used while executing a render pass instance that has
     * multiview enabled, the query uses N consecutive query indices in the
@@ -576,10 +595,14 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
     * ...
     * Queries used with multiview rendering must not span subpasses, i.e.
     * they must begin and end in the same subpass.
+    *
+    * A guest can name a base query within range but a view count that runs past
+    * the pool; stop at the last valid query so the availability writes stay in
+    * the BO.
     */
    uint64_t addr = kk_query_available_addr(pool, query);
    uint32_t count = kk_mv_query_count(cmd);
-   for (uint32_t i = 0; i < count; i++) {
+   for (uint32_t i = 0; i < count && query + i < pool->vk.query_count; i++) {
       kk_cmd_write(cmd, (struct libkk_imm_write){addr, true});
       addr += sizeof(uint32_t);
    }
