@@ -64,20 +64,39 @@ fs_force_output_type(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    enum pipe_format format =
       render_target_formats[io.location - FRAG_RESULT_DATA0];
    nir_alu_type type = nir_intrinsic_src_type(intrin);
-   if (util_format_is_float(format) || util_format_is_unorm(format)) {
-      if (type & nir_type_uint) {
+   /* A fragment output whose numeric class (float/int/uint) differs from the
+    * colour attachment's format is undefined in Vulkan. D3D12 -- and the WineHQ
+    * vkd3d rt-format-mismatch test -- define it as "the bits are copied as-is,
+    * without being interpreted", which is also what discrete GPUs do via their
+    * raw colour export. So for a class mismatch, *reinterpret* the bits by
+    * retagging the store's source type (the MSL backend then emits an as_type<>
+    * bitcast), rather than numerically converting: a uint 22 written to an R32F
+    * target must land as the float bit pattern 0x16, not as 22.0f. This mirrors
+    * the int<->uint cases below, which already retag without converting. Only a
+    * mismatched output reaches these branches; a correct app whose output class
+    * matches the attachment never does, so normal rendering is untouched.
+    *
+    * UNORM is the exception: it is a normalized store, not a
+    * bit-copy-compatible format, so an integer output to a unorm target keeps
+    * the numeric conversion (still UB, but bit-copy semantics are not asserted
+    * there). */
+   if (util_format_is_unorm(format)) {
+      if (type & (nir_type_uint | nir_type_int)) {
+         nir_alu_type was = type & (nir_type_uint | nir_type_int);
          b->cursor = nir_before_instr(&intrin->instr);
          nir_def *value =
             nir_u2fN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
          nir_src_rewrite(&intrin->src[0], value);
+         type ^= (nir_type_float | was);
+         nir_intrinsic_set_src_type(intrin, type);
+         return true;
+      }
+   } else if (util_format_is_float(format)) {
+      if (type & nir_type_uint) {
          type ^= (nir_type_float | nir_type_uint);
          nir_intrinsic_set_src_type(intrin, type);
          return true;
       } else if (type & nir_type_int) {
-         b->cursor = nir_before_instr(&intrin->instr);
-         nir_def *value =
-            nir_u2fN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
-         nir_src_rewrite(&intrin->src[0], value);
          type ^= (nir_type_float | nir_type_int);
          nir_intrinsic_set_src_type(intrin, type);
          return true;
@@ -88,10 +107,6 @@ fs_force_output_type(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
          nir_intrinsic_set_src_type(intrin, type);
          return true;
       } else if (type & nir_type_float) {
-         b->cursor = nir_before_instr(&intrin->instr);
-         nir_def *value =
-            nir_f2uN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
-         nir_src_rewrite(&intrin->src[0], value);
          type ^= (nir_type_float | nir_type_int);
          nir_intrinsic_set_src_type(intrin, type);
          return true;
@@ -102,10 +117,6 @@ fs_force_output_type(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
          nir_intrinsic_set_src_type(intrin, type);
          return true;
       } else if (type & nir_type_float) {
-         b->cursor = nir_before_instr(&intrin->instr);
-         nir_def *value =
-            nir_f2uN(b, intrin->src[0].ssa, nir_src_bit_size(intrin->src[0]));
-         nir_src_rewrite(&intrin->src[0], value);
          type ^= (nir_type_float | nir_type_uint);
          nir_intrinsic_set_src_type(intrin, type);
          return true;
@@ -952,8 +963,9 @@ msl_nir_lower_fs_combined_depth_clamp_clip(nir_shader *s)
    return nir_progress(true, b->impl, nir_metadata_none);
 }
 
-static bool lower_demote_samples(nir_builder *b, nir_intrinsic_instr *intr,
-                                 UNUSED void *data)
+static bool
+lower_demote_samples(nir_builder *b, nir_intrinsic_instr *intr,
+                     UNUSED void *data)
 {
    if (intr->intrinsic != nir_intrinsic_demote_samples)
       return false;
@@ -983,8 +995,7 @@ msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
    bool progress = false;
 
    if (alpha_to_coverage) {
-      NIR_PASS(progress, s, nir_lower_alpha_to_coverage, false,
-               NULL);
+      NIR_PASS(progress, s, nir_lower_alpha_to_coverage, false, NULL);
 
       /* Lower the resulting demote samples intrinsics */
       NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_demote_samples,
