@@ -707,6 +707,10 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    cs_end(cmd);
    mtl_release(cmd->state.gfx.render_pass_descriptor);
    cmd->state.gfx.render_pass_descriptor = NULL;
+   /* limina: an attachment-less pass defers its encoder start (need_to_start_render_pass);
+    * if it ended before any draw the flag would otherwise survive here with the descriptor
+    * freed, and the next draw would start a pass from NULL. Clear it with the descriptor. */
+   cmd->state.gfx.need_to_start_render_pass = false;
 
    if (render->flags &
        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT))
@@ -3234,6 +3238,12 @@ kk_xfb_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 static void
 kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
+   /* limina: no render pass is active or pending -- e.g. a guest recorded a draw after an
+    * attachment-less pass ended. There is nothing to draw into; drop it rather than reach
+    * cs_get_render and start a pass from a freed descriptor. */
+   if (!cmd->metal.render && !cmd->state.gfx.need_to_start_render_pass)
+      return;
+
    if (kk_xfb_draw(cmd, data))
       return;
 
