@@ -1657,6 +1657,20 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
 #undef IS_SHADER_DIRTY
 #undef IS_DIRTY
 
+/* The byte size of `count` draw records of `stride` bytes, for the pool
+ * allocations that hold a copy of a draw list. A guest's draw count is not
+ * bounded by the 32-bit size kk_pool_alloc takes, so fail rather than wrap.
+ */
+static bool
+kk_draw_list_size(uint32_t count, uint32_t stride, uint32_t *size_B)
+{
+   uint64_t size = (uint64_t)count * stride;
+   if (size > UINT32_MAX)
+      return false;
+   *size_B = size;
+   return true;
+}
+
 /* Returns true if the draw was successfully converted. */
 static bool
 kk_convert_to_indirect_draw(struct kk_cmd_buffer *cmd,
@@ -1667,8 +1681,11 @@ kk_convert_to_indirect_draw(struct kk_cmd_buffer *cmd,
 
    uint32_t draw_stride = data->indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                         : sizeof(VkDrawIndirectCommand);
+   uint32_t size_B;
+   if (!kk_draw_list_size(data->draw_count, draw_stride, &size_B))
+      return false;
    struct kk_ptr indirect_draw =
-      kk_pool_upload(cmd, &data->draws[0], data->draw_count * draw_stride, 4u);
+      kk_pool_upload(cmd, &data->draws[0], size_B, 4u);
 
    if (unlikely(!indirect_draw.gpu))
       return false;
@@ -1694,8 +1711,10 @@ kk_predicate_draws(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    uint32_t out_stride = data->indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                        : sizeof(VkDrawIndirectCommand);
-   struct kk_ptr patched =
-      kk_pool_alloc(cmd, out_stride * data->draw_count, 4u);
+   uint32_t patched_size_B;
+   if (!kk_draw_list_size(data->draw_count, out_stride, &patched_size_B))
+      return false;
+   struct kk_ptr patched = kk_pool_alloc(cmd, patched_size_B, 4u);
    if (unlikely(!patched.gpu))
       return false;
 
@@ -1771,8 +1790,11 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    assert((data->indirect_command.stride % sizeof(uint32_t)) == 0 &&
           "stride is not aligned");
 
-   struct kk_ptr out_draws = kk_pool_alloc(
-      cmd, data->draw_count * sizeof(VkDrawIndexedIndirectCommand), 4u);
+   uint32_t out_size_B;
+   if (!kk_draw_list_size(data->draw_count,
+                          sizeof(VkDrawIndexedIndirectCommand), &out_size_B))
+      return false;
+   struct kk_ptr out_draws = kk_pool_alloc(cmd, out_size_B, 4u);
    if (unlikely(!out_draws.gpu))
       return false;
 
@@ -3283,14 +3305,26 @@ kk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
    ralloc_free(data);
 }
 
+/* A venus guest's indirect draw count reaches us unvalidated. One above
+ * maxDrawIndirectCount is invalid, and acting on it would encode a Metal draw
+ * per count and size the rewritten draw lists from it: drop the draw.
+ */
+static bool
+kk_indirect_count_ok(struct kk_cmd_buffer *cmd, uint32_t count)
+{
+   return count != 0 &&
+          count <= kk_cmd_buffer_device(cmd)
+                      ->vk.physical->properties.maxDrawIndirectCount;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
                        const VkDrawIndirect2InfoKHR *pInfo)
 {
-   if (pInfo->drawCount == 0)
-      return;
-
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   if (!kk_indirect_count_ok(cmd, pInfo->drawCount))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -3316,10 +3350,10 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
                               const VkDrawIndirect2InfoKHR *pInfo)
 {
-   if (pInfo->drawCount == 0)
-      return;
-
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   if (!kk_indirect_count_ok(cmd, pInfo->drawCount))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -3348,10 +3382,10 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
                             const VkDrawIndirectCount2InfoKHR *pInfo)
 {
-   if (pInfo->maxDrawCount == 0)
-      return;
-
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   if (!kk_indirect_count_ok(cmd, pInfo->maxDrawCount))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -3379,10 +3413,10 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
                                    const VkDrawIndirectCount2InfoKHR *pInfo)
 {
-   if (pInfo->maxDrawCount == 0)
-      return;
-
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   if (!kk_indirect_count_ok(cmd, pInfo->maxDrawCount))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
