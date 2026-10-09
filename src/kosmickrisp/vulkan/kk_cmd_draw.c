@@ -271,6 +271,25 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    struct kk_rendering_state *render = &cmd->state.gfx.render;
 
+   /* limina: renderArea and layerCount come straight from the guest. KK
+    * advertises maxFramebufferWidth/Height = 16384 and maxFramebufferLayers =
+    * 2048 (kk_physical_device.c); a pass built from values beyond those, or a
+    * renderArea whose offset+extent overflows u32, would hand Metal absurd
+    * render-target dimensions. Refuse out-of-advertised-range input rather than
+    * forward it, matching the bounds KK already enforces at image creation.
+    * (No host failure has been observed from this today — Metal bounds the
+    * target by the real attachment — so this is defence in depth.) */
+   {
+      const VkRect2D a = pRenderingInfo->renderArea;
+      if (a.extent.width > 16384u || a.extent.height > 16384u ||
+          (uint64_t)(uint32_t)a.offset.x + a.extent.width > 16384u ||
+          (uint64_t)(uint32_t)a.offset.y + a.extent.height > 16384u ||
+          pRenderingInfo->layerCount > 2048u) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_INITIALIZATION_FAILED);
+         return;
+      }
+   }
+
    memset(render, 0, sizeof(*render));
 
    render->flags = pRenderingInfo->flags;
