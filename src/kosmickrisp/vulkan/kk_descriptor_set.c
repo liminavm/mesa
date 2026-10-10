@@ -725,6 +725,12 @@ kk_CreateDescriptorPool(VkDevice _device,
 
    list_inithead(&pool->sets);
 
+   /* Initialise the heap empty up front so every failure path below can run
+    * kk_destroy_descriptor_pool (which calls util_vma_heap_finish) safely. The
+    * pool came from vk_object_zalloc, so without this the heap's hole list is
+    * NULL and finish walks it into a SIGSEGV when kk_alloc_bo fails. */
+   util_vma_heap_init(&pool->heap, 0, 0);
+
    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
       vk_find_struct_const(pCreateInfo->pNext,
                            MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
@@ -752,8 +758,8 @@ kk_CreateDescriptorPool(VkDevice _device,
       uint32_t stride, alignment;
       kk_descriptor_stride_align_for_type(pCreateInfo->pPoolSizes[i].type,
                                           type_list, &stride, &alignment);
-      mem_size +=
-         MAX2(stride, max_align) * pCreateInfo->pPoolSizes[i].descriptorCount;
+      mem_size += (uint64_t)MAX2(stride, max_align) *
+                  pCreateInfo->pPoolSizes[i].descriptorCount;
    }
 
    /* Individual descriptor sets are aligned to the min UBO alignment to
@@ -764,7 +770,7 @@ kk_CreateDescriptorPool(VkDevice _device,
     * conservative here.)  Allocate enough extra space that we can chop it
     * into maxSets pieces and align each one of them to 32B.
     */
-   mem_size += kk_min_cbuf_alignment() * pCreateInfo->maxSets;
+   mem_size += (uint64_t)kk_min_cbuf_alignment() * pCreateInfo->maxSets;
 
    if (mem_size) {
       result = kk_alloc_bo(dev, &dev->vk.base, mem_size, 0u, &pool->bo);
@@ -774,12 +780,12 @@ kk_CreateDescriptorPool(VkDevice _device,
       }
 
       /* The BO may be larger thanks to GPU page alignment.  We may as well
-       * make that extra space available to the client.
+       * make that extra space available to the client.  The empty heap set up
+       * above is re-initialised here with the real range; it holds no holes
+       * yet, so nothing leaks.
        */
       assert(pool->bo->size_B >= mem_size);
       util_vma_heap_init(&pool->heap, pool->bo->gpu, pool->bo->size_B);
-   } else {
-      util_vma_heap_init(&pool->heap, 0, 0);
    }
 
    *pDescriptorPool = kk_descriptor_pool_to_handle(pool);
