@@ -424,6 +424,11 @@ wsi_wl_display_add_vk_format(struct wsi_wl_display *display,
    if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
       return NULL;
 
+   struct wsi_device *wsi = display->wsi_wl->wsi;
+   if (!wsi->sw && wsi->can_share_format &&
+       !wsi->can_share_format(display->wsi_wl->physical_device, format))
+      return NULL;
+
    struct u_vector modifiers;
    if (!u_vector_init_pow2(&modifiers, 4, sizeof(uint64_t)))
       return NULL;
