@@ -11,10 +11,13 @@
 #include "util/format/u_formats.h"
 #include "vulkan/vulkan_core.h"
 
+#include <drm/virtgpu_drm.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "virtgpu_limina_drm.h"
 
@@ -77,6 +80,33 @@ arena_create(struct lmn_device *dev, uint64_t size, struct lmn_arena *out)
    return true;
 }
 
+static void
+gem_ref(struct lmn_device *dev, uint32_t gem)
+{
+   pthread_mutex_lock(&dev->pool_lock);
+   if (!dev->gems)
+      dev->gems = _mesa_hash_table_u64_create(NULL);
+   uintptr_t n = (uintptr_t)_mesa_hash_table_u64_search(dev->gems, gem);
+   _mesa_hash_table_u64_insert(dev->gems, gem, (void *)(n + 1));
+   pthread_mutex_unlock(&dev->pool_lock);
+}
+
+static void
+gem_unref(struct lmn_device *dev, uint32_t gem)
+{
+   pthread_mutex_lock(&dev->pool_lock);
+   uintptr_t n = (uintptr_t)_mesa_hash_table_u64_search(dev->gems, gem);
+   if (n > 1)
+      _mesa_hash_table_u64_insert(dev->gems, gem, (void *)(n - 1));
+   else
+      _mesa_hash_table_u64_remove(dev->gems, gem);
+   pthread_mutex_unlock(&dev->pool_lock);
+   if (n <= 1) {
+      struct drm_gem_close c = {.handle = gem};
+      ioctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &c);
+   }
+}
+
 /* Every mapping of the arena must be gone: the host reuses its range. */
 static void
 arena_destroy(struct lmn_device *dev, struct lmn_arena *a)
@@ -85,8 +115,97 @@ arena_destroy(struct lmn_device *dev, struct lmn_arena *a)
    struct drm_virtgpu_limina_arena_destroy d = {.arena_id = a->id};
    if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_DESTROY, &d) != 0)
       fprintf(stderr, "[limina-kk] arena %u destroy failed: %s\n", a->id, strerror(errno));
+   if (a->gem)
+      gem_unref(dev, a->gem);
    atomic_fetch_sub(&dev->allocated, a->size);
    arena_id_free(dev, a->id);
+}
+
+/* Maps a shared arena through its GEM object and fills in the rest of `a`. */
+static bool
+arena_map_gem(struct lmn_device *dev, struct lmn_arena *a)
+{
+   struct drm_virtgpu_map m = {.handle = a->gem};
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_MAP, &m) != 0)
+      return false;
+   void *map =
+      mmap(NULL, a->size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd, (off_t)m.offset);
+   if (map == MAP_FAILED)
+      return false;
+   a->mmap_offset = m.offset;
+   a->map = map;
+   atomic_fetch_add(&dev->allocated, a->size);
+   return true;
+}
+
+/* Undoes a shared arena whose mapping failed: the arena id is the host's, the GEM ours. */
+static void
+arena_unwind(struct lmn_device *dev, struct lmn_arena *a)
+{
+   struct drm_virtgpu_limina_arena_destroy d = {.arena_id = a->id};
+   ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_DESTROY, &d);
+   if (a->gem)
+      gem_unref(dev, a->gem);
+   arena_id_free(dev, a->id);
+}
+
+/* An arena other processes can share: exported as a GEM object, mapped through it. */
+static bool
+arena_create_shared(struct lmn_device *dev, uint64_t size, struct lmn_arena *out)
+{
+   uint32_t id = arena_id_alloc(dev);
+   if (!id)
+      return false;
+   struct drm_virtgpu_limina_arena_create c = {
+      .arena_id = id,
+      .flags = VIRTGPU_LIMINA_ARENA_SHARED,
+      .size = size,
+   };
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_CREATE, &c) != 0) {
+      arena_id_free(dev, id);
+      return false;
+   }
+   *out = (struct lmn_arena){.id = id, .size = c.size, .gpu_base = c.gpu_base};
+   struct drm_virtgpu_limina_arena_export e = {.arena_id = id};
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_EXPORT, &e) != 0) {
+      arena_unwind(dev, out);
+      return false;
+   }
+   out->gem = e.handle;
+   gem_ref(dev, out->gem);
+   if (!arena_map_gem(dev, out)) {
+      arena_unwind(dev, out);
+      return false;
+   }
+   return true;
+}
+
+/* The arena a dma-buf another context exported is. */
+static bool
+arena_import(struct lmn_device *dev, int fd, struct lmn_arena *out)
+{
+   struct drm_prime_handle p = {.fd = fd};
+   if (ioctl(dev->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &p) != 0)
+      return false;
+   gem_ref(dev, p.handle);
+   uint32_t id = arena_id_alloc(dev);
+   if (!id) {
+      gem_unref(dev, p.handle);
+      return false;
+   }
+   struct drm_virtgpu_limina_arena_import i = {.arena_id = id, .handle = p.handle};
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_IMPORT, &i) != 0) {
+      gem_unref(dev, p.handle);
+      arena_id_free(dev, id);
+      return false;
+   }
+   *out = (struct lmn_arena){
+      .id = id, .size = i.size, .gpu_base = i.gpu_base, .gem = p.handle};
+   if (!arena_map_gem(dev, out)) {
+      arena_unwind(dev, out);
+      return false;
+   }
+   return true;
 }
 
 static void
@@ -138,6 +257,48 @@ lmn_heap_create(struct lmn_device *dev, uint64_t size)
    }
    heap_place(h, &h->own, 0, h->own.size);
    return h;
+}
+
+/* A heap that is a shared arena of its own: made here (`fd` < 0) or imported from `fd`. */
+static struct lmn_heap *
+heap_shared(struct lmn_device *dev, uint64_t size, int fd)
+{
+   struct lmn_heap *h = lmn_obj_new(dev, LMN_KIND_HEAP, sizeof(*h), heap_destroy);
+   if (!h)
+      return NULL;
+   bool ok = fd < 0 ? arena_create_shared(dev, size, &h->own) : arena_import(dev, fd, &h->own);
+   if (!ok) {
+      free(h);
+      return NULL;
+   }
+   heap_place(h, &h->own, 0, h->own.size);
+   return h;
+}
+
+mtl_heap *
+mtl_new_heap_exportable(mtl_device *device, uint64_t size)
+{
+   return heap_shared(LMN_CAST(lmn_device, device, LMN_KIND_DEVICE), size, -1);
+}
+
+mtl_heap *
+mtl_new_heap_from_fd(mtl_device *device, int fd)
+{
+   if (fd < 0)
+      return NULL;
+   return heap_shared(LMN_CAST(lmn_device, device, LMN_KIND_DEVICE), 0, fd);
+}
+
+int
+mtl_heap_export_fd(mtl_heap *heap)
+{
+   struct lmn_heap *h = LMN_CAST(lmn_heap, heap, LMN_KIND_HEAP);
+   if (h->pool || !h->own.gem)
+      return -1;
+   struct drm_prime_handle p = {.handle = h->own.gem, .flags = DRM_CLOEXEC | DRM_RDWR, .fd = -1};
+   if (ioctl(h->base.dev->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &p) != 0)
+      return -1;
+   return p.fd;
 }
 
 static struct lmn_heap *
@@ -193,6 +354,10 @@ lmn_pools_finish(struct lmn_device *dev)
       util_vma_heap_finish(&p->vma);
       arena_destroy(dev, &p->arena);
       free(p);
+   }
+   if (dev->gems) {
+      _mesa_hash_table_u64_destroy(dev->gems);
+      dev->gems = NULL;
    }
 }
 
