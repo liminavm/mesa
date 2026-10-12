@@ -123,11 +123,12 @@ kk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       goto fail_init;
    }
 
+   /* 16 bytes on macOS (LC_UUID); a longer GNU build-id (20 for sha1) is truncated. */
    unsigned build_id_len = build_id_length(note);
-   if (build_id_len != VK_UUID_SIZE) {
+   if (build_id_len < VK_UUID_SIZE) {
       result = vk_errorf(
          NULL, VK_ERROR_INITIALIZATION_FAILED,
-         "build-id size does not match expected size (VK_UUID_SIZE which is 16 bytes)");
+         "build-id is shorter than VK_UUID_SIZE (16 bytes)");
       goto fail_init;
    }
 
