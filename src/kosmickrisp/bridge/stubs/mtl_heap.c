@@ -51,3 +51,21 @@ mtl_heap_map_at(mtl_heap *heap, void *addr, uint64_t size_B)
 {
    return NULL;
 }
+
+mtl_heap *
+mtl_new_heap_exportable(mtl_device *device, uint64_t size)
+{
+   return NULL;
+}
+
+int
+mtl_heap_export_fd(mtl_heap *heap)
+{
+   return -1;
+}
+
+mtl_heap *
+mtl_new_heap_from_fd(mtl_device *device, int fd)
+{
+   return NULL;
+}
