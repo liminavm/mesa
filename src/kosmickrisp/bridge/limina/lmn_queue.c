@@ -322,10 +322,41 @@ limina_kk_alloc_track_complete(uint64_t token)
 
 static _Atomic uint64_t lmn_cb_serial;
 
+void
+lmn_cb_ref(struct lmn_command_buffer *cb, void *obj)
+{
+   struct lmn_obj *o = obj;
+   /* Encoders name the same objects over and over; most repeats are back to back. */
+   if (!o || (cb->ref_count && cb->refs[cb->ref_count - 1] == o))
+      return;
+   if (cb->ref_count == cb->ref_cap) {
+      uint32_t cap = cb->ref_cap ? cb->ref_cap * 2 : 64;
+      void *p = realloc(cb->refs, cap * sizeof(*cb->refs));
+      if (!p) {
+         cb->failed = true;
+         return;
+      }
+      cb->refs = p;
+      cb->ref_cap = cap;
+   }
+   cb->refs[cb->ref_count++] = mtl_retain(o);
+}
+
+static void
+drop_refs(struct lmn_command_buffer *cb)
+{
+   for (uint32_t i = 0; i < cb->ref_count; i++)
+      mtl_release(cb->refs[i]);
+   cb->ref_count = 0;
+}
+
 static void
 command_buffer_destroy(struct lmn_obj *obj)
 {
-   free(((struct lmn_command_buffer *)obj)->data);
+   struct lmn_command_buffer *cb = (struct lmn_command_buffer *)obj;
+   drop_refs(cb);
+   free(cb->refs);
+   free(cb->data);
 }
 
 mtl_command_buffer *
@@ -344,6 +375,8 @@ mtl_begin_command_buffer(mtl_command_buffer *command_buffer, mtl_command_allocat
 {
    struct lmn_command_buffer *cb =
       LMN_CAST(lmn_command_buffer, command_buffer, LMN_KIND_COMMAND_BUFFER);
+   /* A command buffer is recorded again only once its last commit has completed. */
+   drop_refs(cb);
    cb->len = 0;
    cb->failed = false;
    cb->serial = atomic_fetch_add(&lmn_cb_serial, 1) + 1;
