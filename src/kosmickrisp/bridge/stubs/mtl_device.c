@@ -42,6 +42,12 @@ mtl_device_get_gpu_apple_family(mtl_device *dev)
 }
 
 bool
+mtl_device_supports_shareable_textures(mtl_device *dev)
+{
+   return false;
+}
+
+bool
 mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor)
 {
    return false;

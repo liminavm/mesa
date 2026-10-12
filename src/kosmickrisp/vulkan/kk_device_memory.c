@@ -164,6 +164,39 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       return VK_SUCCESS;
    }
    if (export_info && (export_info->handleTypes & KK_FD_HANDLE_TYPES)) {
+      /* A dedicated linear image other drivers read: its storage is a surface they can import,
+       * not a heap only this driver understands. */
+      const VkMemoryDedicatedAllocateInfo *ded =
+         vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+      struct kk_image *ded_image = ded && ded->image ? kk_image_from_handle(ded->image) : NULL;
+      mtl_texture *shareable =
+         ded_image && ded_image->plane_count == 1
+            ? mtl_new_texture_shareable(dev->mtl_handle, &ded_image->planes[0].layout)
+            : NULL;
+      if (shareable) {
+         mem->bo = CALLOC_STRUCT(kk_bo);
+         if (!mem->bo) {
+            mtl_release(shareable);
+            result = vk_errorf(&dev->vk.base, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
+            goto fail_alloc;
+         }
+         mem->bo->texture = shareable;
+         mem->bo->size_B = mem->vk.size;
+         kk_device_add_texture_to_residency_set(dev, shareable);
+         *pMem = kk_device_memory_to_handle(mem);
+         return VK_SUCCESS;
+      }
+      /* The compositor's driver cannot read this one's layout, and an import it cannot make
+       * ends its own context, not ours: refuse here, where only this swapchain fails. */
+      if (ded_image && ded_image->vk.wsi_legacy_scanout) {
+         fprintf(stderr, "[limina-kk] a window-system image %ux%u in Metal format %u cannot be "
+                 "shared with the compositor\n",
+                 ded_image->vk.extent.width, ded_image->vk.extent.height,
+                 ded_image->planes[0].layout.format.mtl);
+         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "window-system image in a format the compositor cannot import");
+         goto fail_alloc;
+      }
       result = kk_alloc_bo_exportable(dev, &dev->vk.base, aligned_size, &mem->bo);
       if (result != VK_SUCCESS)
          goto fail_alloc;
@@ -488,9 +521,10 @@ kk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *
    VK_FROM_HANDLE(kk_device, dev, device);
    VK_FROM_HANDLE(kk_device_memory, mem, pGetFdInfo->memory);
 
-   if (!(pGetFdInfo->handleType & KK_FD_HANDLE_TYPES) || !mem->bo->mtl_handle)
+   if (!(pGetFdInfo->handleType & KK_FD_HANDLE_TYPES) || (!mem->bo->mtl_handle && !mem->bo->texture))
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-   int fd = mtl_heap_export_fd(mem->bo->mtl_handle);
+   int fd = mem->bo->texture ? mtl_texture_export_fd(mem->bo->texture)
+                             : mtl_heap_export_fd(mem->bo->mtl_handle);
    if (fd < 0)
       return vk_error(dev, VK_ERROR_TOO_MANY_OBJECTS);
    *pFd = fd;
