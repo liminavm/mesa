@@ -49,6 +49,10 @@ mtl_heap *mtl_new_heap_from_fd(mtl_device *device, int fd);
 mtl_texture *mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout);
 /* A new dma-buf fd for a shareable texture, or -1. */
 int mtl_texture_export_fd(mtl_texture *texture);
+/* The texture over the surface dma-buf `fd` names, whichever driver made it, laid out as `layout`
+ * says; NULL when it is no surface or not one `layout` describes. The fd stays the caller's. */
+mtl_texture *mtl_new_texture_from_fd(mtl_device *device, int fd,
+                                     const struct kk_image_layout *layout);
 void mtl_resource_set_label(mtl_resource *resource, const char *label);
 
 #endif /* MTL_HEAP_H */
