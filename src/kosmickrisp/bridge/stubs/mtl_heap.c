@@ -71,7 +71,8 @@ mtl_texture_export_fd(mtl_texture *texture)
 }
 
 mtl_texture *
-mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *layout)
+mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *const *layouts,
+                        uint32_t layout_count)
 {
    return NULL;
 }
