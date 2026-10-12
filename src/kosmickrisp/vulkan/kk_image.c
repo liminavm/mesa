@@ -637,33 +637,37 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
 
    /* VK_EXT_image_drm_format_modifier: DRM_FORMAT_MOD_LINEAR is the only
     * modifier we advertise, so it is the only one a valid LIST can offer us
-    * and the only one a valid EXPLICIT can name. Single-plane only (the
-    * format-properties list advertises drmFormatModifierPlaneCount = 1). */
-   uint32_t explicit_row_stride_B = 0;
+    * and the only one a valid EXPLICIT can name. A multi-plane image is
+    * disjoint, every plane in memory of its own (limina: one surface per
+    * plane), since no single allocation lays its planes out for us. */
+   uint32_t explicit_row_stride_B[3] = {0};
    if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
-      assert(image->plane_count == 1);
+      if (image->plane_count > 1 && !image->disjoint)
+         return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                          "a multi-plane image with a modifier must be disjoint");
 
       const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit_info =
          vk_find_struct_const(pCreateInfo->pNext,
                               IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
       if (mod_explicit_info) {
          if (mod_explicit_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
-             mod_explicit_info->drmFormatModifierPlaneCount != 1)
+             mod_explicit_info->drmFormatModifierPlaneCount != image->plane_count)
             return vk_errorf(dev,
                              VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
                              "unsupported DRM format modifier 0x%" PRIx64
                              " (plane count %u)",
                              mod_explicit_info->drmFormatModifier,
                              mod_explicit_info->drmFormatModifierPlaneCount);
-         const VkSubresourceLayout *plane0 =
-            &mod_explicit_info->pPlaneLayouts[0];
-         if (plane0->offset != 0 || plane0->rowPitch > UINT32_MAX)
-            return vk_errorf(dev,
-                             VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
-                             "unsupported explicit plane layout (offset %" PRIu64
-                             ", rowPitch %" PRIu64 ")",
-                             plane0->offset, plane0->rowPitch);
-         explicit_row_stride_B = plane0->rowPitch;
+         for (uint8_t p = 0; p < image->plane_count; p++) {
+            const VkSubresourceLayout *pl = &mod_explicit_info->pPlaneLayouts[p];
+            if (pl->offset != 0 || pl->rowPitch > UINT32_MAX)
+               return vk_errorf(dev,
+                                VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                                "unsupported explicit plane %u layout (offset %" PRIu64
+                                ", rowPitch %" PRIu64 ")",
+                                p, pl->offset, pl->rowPitch);
+            explicit_row_stride_B[p] = pl->rowPitch;
+         }
       } else {
          const VkImageDrmFormatModifierListCreateInfoEXT *mod_list_info =
             vk_find_struct_const(pCreateInfo->pNext,
@@ -693,7 +697,7 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
       const uint8_t height_scale =
          ycbcr_info ? ycbcr_info->planes[plane].denominator_scales[1] : 1;
       kk_image_layout_init(dev, &image->vk, vk_format_to_pipe_format(format),
-                           width_scale, height_scale, explicit_row_stride_B,
+                           width_scale, height_scale, explicit_row_stride_B[plane],
                            &image->planes[plane].layout);
    }
 
@@ -715,13 +719,15 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
     * when width*bpp misses the alignment. The queries always report the pitch
     * actually in use, never the rejected value — the claim stays truthful.
     * This log line disappearing is the tripwire that the guest went truthful. */
-   if (explicit_row_stride_B != 0 &&
-       image->planes[0].layout.linear_stride_B != explicit_row_stride_B) {
-      fprintf(stderr,
-              "[KK-MODIFIER] EXPLICIT rowPitch %u unusable (minimum %u, "
-              "alignment %" PRIu64 "); using the computed pitch\n",
-              explicit_row_stride_B, image->planes[0].layout.linear_stride_B,
-              image->planes[0].layout.align_B);
+   for (uint8_t p = 0; p < image->plane_count; p++) {
+      if (explicit_row_stride_B[p] != 0 &&
+          image->planes[p].layout.linear_stride_B != explicit_row_stride_B[p]) {
+         fprintf(stderr,
+                 "[KK-MODIFIER] EXPLICIT plane %u rowPitch %u unusable (minimum %u, "
+                 "alignment %" PRIu64 "); using the computed pitch\n",
+                 p, explicit_row_stride_B[p], image->planes[p].layout.linear_stride_B,
+                 image->planes[p].layout.align_B);
+      }
    }
 
    return VK_SUCCESS;
@@ -1083,7 +1089,7 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
        * wrong image here is therefore invisible at every later layer, so it has to
        * die at bind time. */
       const bool geometry_ok =
-         image->plane_count == 1 && *offset_B == 0 &&
+         (image->plane_count == 1 || image->disjoint) && *offset_B == 0 &&
          props.width == plane->layout.width_px &&
          props.height == plane->layout.height_px &&
          props.mip_levels == plane->layout.levels &&

@@ -153,11 +153,18 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          goto fail_alloc;
       }
       /* A buffer another driver made (vrend, venus) or another context shared as a surface is
-       * a texture over that surface; only an image can be one. */
+       * a texture over that surface; only an image can be one. A disjoint image's memory is
+       * one plane's, and which one only the bind says: the surface's own shape picks it. */
+      const struct kk_image_layout *layouts[3] = {0};
+      uint32_t layout_count = 0;
+      if (ded_image && (ded_image->plane_count == 1 || ded_image->disjoint)) {
+         for (uint8_t p = 0; p < ded_image->plane_count; p++)
+            layouts[layout_count++] = &ded_image->planes[p].layout;
+      }
       mtl_texture *surface =
-         ded_image && ded_image->plane_count == 1
-            ? mtl_new_texture_from_fd(dev->mtl_handle, fd_info->fd, &ded_image->planes[0].layout)
-            : NULL;
+         layout_count ? mtl_new_texture_from_fd(dev->mtl_handle, fd_info->fd, layouts,
+                                                layout_count)
+                      : NULL;
       if (surface) {
          mem->bo = CALLOC_STRUCT(kk_bo);
          if (!mem->bo) {
