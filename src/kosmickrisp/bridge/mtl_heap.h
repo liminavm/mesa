@@ -42,6 +42,13 @@ mtl_heap *mtl_new_heap_exportable(mtl_device *device, uint64_t size);
 int mtl_heap_export_fd(mtl_heap *heap);
 /* The heap another heap exported as dma-buf `fd`, or NULL. The fd stays the caller's. */
 mtl_heap *mtl_new_heap_from_fd(mtl_device *device, int fd);
+/* A texture whose storage is a surface the host makes to share beyond this driver: what another
+ * GPU driver in the guest (a compositor's) imports as a plain buffer. Only linear 2D images of one
+ * level, one layer and one sample, in a 32-bit BGRA or RGBA format, laid out as `layout` says;
+ * NULL for anything else, or when the bridge cannot. */
+mtl_texture *mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout);
+/* A new dma-buf fd for a shareable texture, or -1. */
+int mtl_texture_export_fd(mtl_texture *texture);
 void mtl_resource_set_label(mtl_resource *resource, const char *label);
 
 #endif /* MTL_HEAP_H */
