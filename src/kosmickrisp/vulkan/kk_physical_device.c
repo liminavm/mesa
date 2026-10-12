@@ -181,7 +181,9 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_depth_clip_enable = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
-      .EXT_external_memory_host = true,
+      /* Wrapping arbitrary host pages needs the Metal bridge's bytes-no-copy buffers: a bridge
+       * that is not Metal itself has no way to make them. */
+      .EXT_external_memory_host = DETECT_OS_APPLE,
       .EXT_hdr_metadata = true,
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_view_min_lod = KK_EXPERIMENTAL(IMAGE_VIEW_MIN_LOD),
