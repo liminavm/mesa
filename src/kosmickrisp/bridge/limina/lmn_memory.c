@@ -44,56 +44,167 @@ arena_id_free(struct lmn_device *dev, uint32_t id)
    pthread_mutex_unlock(&dev->lock);
 }
 
+/* An arena: guest memory the host made one Metal heap of, mapped here once. */
+static bool
+arena_create(struct lmn_device *dev, uint64_t size, struct lmn_arena *out)
+{
+   uint32_t id = arena_id_alloc(dev);
+   if (!id) {
+      fprintf(stderr, "[limina-kk] out of arena ids\n");
+      return false;
+   }
+   struct drm_virtgpu_limina_arena_create a = {.arena_id = id, .size = size};
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_CREATE, &a) != 0) {
+      arena_id_free(dev, id);
+      return false;
+   }
+   void *map = mmap(NULL, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
+                    (off_t)a.mmap_offset);
+   if (map == MAP_FAILED) {
+      struct drm_virtgpu_limina_arena_destroy d = {.arena_id = id};
+      ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_DESTROY, &d);
+      arena_id_free(dev, id);
+      return false;
+   }
+   *out = (struct lmn_arena){
+      .id = id,
+      .size = a.size,
+      .gpu_base = a.gpu_base,
+      .mmap_offset = a.mmap_offset,
+      .map = map,
+   };
+   atomic_fetch_add(&dev->allocated, a.size);
+   return true;
+}
+
+/* Every mapping of the arena must be gone: the host reuses its range. */
+static void
+arena_destroy(struct lmn_device *dev, struct lmn_arena *a)
+{
+   munmap(a->map, a->size);
+   struct drm_virtgpu_limina_arena_destroy d = {.arena_id = a->id};
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_DESTROY, &d) != 0)
+      fprintf(stderr, "[limina-kk] arena %u destroy failed: %s\n", a->id, strerror(errno));
+   atomic_fetch_sub(&dev->allocated, a->size);
+   arena_id_free(dev, a->id);
+}
+
+static void
+heap_place(struct lmn_heap *h, const struct lmn_arena *a, uint64_t offset, uint64_t size)
+{
+   h->arena = a->id;
+   h->offset = offset;
+   h->size = size;
+   h->gpu_base = a->gpu_base + offset;
+   h->mmap_offset = a->mmap_offset + offset;
+   h->map = a->map + offset;
+}
+
 static void
 heap_destroy(struct lmn_obj *obj)
 {
    struct lmn_heap *h = (struct lmn_heap *)obj;
    struct lmn_device *dev = obj->dev;
-   if (h->map)
-      munmap(h->map, h->size);
-   struct drm_virtgpu_limina_arena_destroy d = {.arena_id = h->arena};
-   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_DESTROY, &d) != 0)
-      fprintf(stderr, "[limina-kk] arena %u destroy failed: %s\n", h->arena, strerror(errno));
-   atomic_fetch_sub(&dev->allocated, h->size);
-   arena_id_free(dev, h->arena);
+   struct lmn_pool *p = h->pool;
+   if (!p) {
+      arena_destroy(dev, &h->own);
+      return;
+   }
+   pthread_mutex_lock(&dev->pool_lock);
+   util_vma_heap_free(&p->vma, LMN_POOL_BIAS + h->offset, h->size);
+   p->used -= h->size;
+   /* An empty pool goes back to the host, unless it is the last one. */
+   bool drop = p->used == 0 && dev->pools.next != dev->pools.prev;
+   if (drop)
+      list_del(&p->link);
+   pthread_mutex_unlock(&dev->pool_lock);
+   if (drop) {
+      util_vma_heap_finish(&p->vma);
+      arena_destroy(dev, &p->arena);
+      free(p);
+   }
 }
 
+/* A heap that is a whole arena of its own. */
 struct lmn_heap *
 lmn_heap_create(struct lmn_device *dev, uint64_t size)
 {
-   uint32_t id = arena_id_alloc(dev);
-   if (!id)
-      return NULL;
-   struct drm_virtgpu_limina_arena_create a = {.arena_id = id, .size = size};
-   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_CREATE, &a) != 0) {
-      arena_id_free(dev, id);
-      return NULL;
-   }
-   void *map = mmap(NULL, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
-                    (off_t)a.mmap_offset);
    struct lmn_heap *h = lmn_obj_new(dev, LMN_KIND_HEAP, sizeof(*h), heap_destroy);
-   if (map == MAP_FAILED || !h) {
-      if (map != MAP_FAILED)
-         munmap(map, a.size);
-      struct drm_virtgpu_limina_arena_destroy d = {.arena_id = id};
-      ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_ARENA_DESTROY, &d);
-      arena_id_free(dev, id);
+   if (!h)
+      return NULL;
+   if (!arena_create(dev, size, &h->own)) {
       free(h);
       return NULL;
    }
-   h->arena = id;
-   h->size = a.size;
-   h->gpu_base = a.gpu_base;
-   h->mmap_offset = a.mmap_offset;
-   h->map = map;
-   atomic_fetch_add(&dev->allocated, a.size);
+   heap_place(h, &h->own, 0, h->own.size);
    return h;
+}
+
+static struct lmn_heap *
+heap_from_pool(struct lmn_device *dev, uint64_t size)
+{
+   /* Placed textures need their own alignment; the largest the host has reported covers it. */
+   uint64_t align = atomic_load(&dev->max_texture_align);
+   if (align < LMN_ARENA_PAGE)
+      align = LMN_ARENA_PAGE;
+   size = (size + LMN_ARENA_PAGE - 1) & ~(uint64_t)(LMN_ARENA_PAGE - 1);
+
+   struct lmn_heap *h = lmn_obj_new(dev, LMN_KIND_HEAP, sizeof(*h), heap_destroy);
+   if (!h)
+      return NULL;
+   pthread_mutex_lock(&dev->pool_lock);
+   list_for_each_entry(struct lmn_pool, p, &dev->pools, link) {
+      uint64_t at = util_vma_heap_alloc(&p->vma, size, align);
+      if (at) {
+         p->used += size;
+         h->pool = p;
+         heap_place(h, &p->arena, at - LMN_POOL_BIAS, size);
+         pthread_mutex_unlock(&dev->pool_lock);
+         return h;
+      }
+   }
+   struct lmn_pool *p = calloc(1, sizeof(*p));
+   if (!p || !arena_create(dev, LMN_POOL_ARENA, &p->arena)) {
+      pthread_mutex_unlock(&dev->pool_lock);
+      free(p);
+      free(h);
+      return NULL;
+   }
+   util_vma_heap_init(&p->vma, LMN_POOL_BIAS, p->arena.size);
+   p->vma.alloc_high = false;
+   /* Newest first: the pools that fill up drift to the back. */
+   list_add(&p->link, &dev->pools);
+   uint64_t at = util_vma_heap_alloc(&p->vma, size, align);
+   p->used += size;
+   h->pool = p;
+   heap_place(h, &p->arena, at - LMN_POOL_BIAS, size);
+   pthread_mutex_unlock(&dev->pool_lock);
+   return h;
+}
+
+void
+lmn_pools_finish(struct lmn_device *dev)
+{
+   list_for_each_entry_safe(struct lmn_pool, p, &dev->pools, link) {
+      if (p->used)
+         fprintf(stderr, "[limina-kk] %llu bytes of heaps outlived their device\n",
+                 (unsigned long long)p->used);
+      list_del(&p->link);
+      util_vma_heap_finish(&p->vma);
+      arena_destroy(dev, &p->arena);
+      free(p);
+   }
 }
 
 mtl_heap *
 mtl_new_heap(mtl_device *device, uint64_t size, enum mtl_resource_options resource_options)
 {
-   return lmn_heap_create(LMN_CAST(lmn_device, device, LMN_KIND_DEVICE), size);
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   /* Each arena takes one of a fixed number of ids, and KosmicKrisp makes a heap per
+    * allocation, so small heaps share pooled arenas; large ones still get their own. */
+   if (size > LMN_POOL_MAX_HEAP)
+      return lmn_heap_create(dev, size);
+   return heap_from_pool(dev, size);
 }
 
 void *
@@ -263,7 +374,7 @@ mtl_new_texture_with_descriptor(mtl_heap *heap, const struct kk_image_layout *la
                                 uint64_t offset)
 {
    struct lmn_heap *h = LMN_CAST(lmn_heap, heap, LMN_KIND_HEAP);
-   return texture_create(h->base.dev, &h->base, h->arena, offset, 0, layout);
+   return texture_create(h->base.dev, &h->base, h->arena, h->offset + offset, 0, layout);
 }
 
 mtl_texture *
@@ -271,7 +382,8 @@ mtl_new_texture_with_descriptor_linear(mtl_buffer *buffer, const struct kk_image
                                        uint64_t offset)
 {
    struct lmn_buffer *b = LMN_CAST(lmn_buffer, buffer, LMN_KIND_BUFFER);
-   return texture_create(b->base.dev, &b->base, b->heap->arena, b->offset + offset,
+   return texture_create(b->base.dev, &b->base, b->heap->arena,
+                         b->heap->offset + b->offset + offset,
                          layout->linear_stride_B, layout);
 }
 
