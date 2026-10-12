@@ -1270,6 +1270,17 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
 
 #if !DETECT_OS_APPLE
    pdev->shareable_textures = mtl_device_supports_shareable_textures(pdev->mtl_dev_handle);
+   /* An imported dma-buf is a host surface whose pixels this guest's CPU cannot see: mapping it
+    * would show its guest backing, not the picture. Its memory is device-local only, so an app
+    * that maps whatever is host-visible (libplacebo does) leaves it alone. */
+   if (pdev->shareable_textures) {
+      pdev->import_mem_type = pdev->mem_type_count;
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+      assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+   }
 #endif
    result = kk_init_wsi(pdev);
    if (result != VK_SUCCESS)
