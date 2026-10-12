@@ -8,7 +8,12 @@ mtl_bridge_files = files(
   'mtl_format.h',
 )
 
-if host_machine.system() == 'darwin'
+kk_bridge = get_option('kosmickrisp-bridge')
+if kk_bridge == 'auto'
+  kk_bridge = host_machine.system() == 'darwin' ? 'metal' : 'stubs'
+endif
+
+if kk_bridge == 'metal'
   mtl_bridge_files += files(
     'mtl_argument_table.m',
     'mtl_bridge.m',
@@ -25,6 +30,17 @@ if host_machine.system() == 'darwin'
     'mtl_sync.m',
     'mtl_texture.m',
     'ns_process_info.m',
+  )
+elif kk_bridge == 'limina'
+  mtl_bridge_files += files(
+    'limina/lmn_bridge.h',
+    'limina/lmn_device.c',
+    'limina/lmn_encoder.c',
+    'limina/lmn_memory.c',
+    'limina/lmn_queue.c',
+    'limina/limina_gpu_ring.h',
+    'limina/limina_gpu_wire.h',
+    'limina/virtgpu_limina_drm.h',
   )
 else
   mtl_bridge_files += files(
@@ -51,7 +67,7 @@ mtl_bridge_dependencies = [
   idep_vulkan_util
 ]
 
-if host_machine.system() == 'darwin'
+if kk_bridge == 'metal'
   mtl_bridge_dependencies += dependency(
     'appleframeworks',
     modules : ['Foundation']
