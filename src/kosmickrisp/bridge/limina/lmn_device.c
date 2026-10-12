@@ -16,6 +16,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -490,6 +492,17 @@ uint32_t
 mtl_device_get_gpu_apple_family(mtl_device *dev)
 {
    return D(dev)->info.apple_family;
+}
+
+bool
+mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor)
+{
+   struct stat st;
+   if (fstat(D(dev)->fd, &st) != 0 || !S_ISCHR(st.st_mode))
+      return false;
+   *major = major(st.st_rdev);
+   *minor = minor(st.st_rdev);
+   return true;
 }
 
 uint64_t
