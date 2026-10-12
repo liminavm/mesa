@@ -77,6 +77,9 @@ struct kk_physical_device {
 
    struct kk_queue_family queue_families[3];
    uint8_t queue_family_count;
+
+   /* The bridge makes textures over surfaces other drivers read (limina). */
+   bool shareable_textures;
 };
 
 static inline uint32_t

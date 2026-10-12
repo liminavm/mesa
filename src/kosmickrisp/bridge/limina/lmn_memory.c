@@ -589,6 +589,21 @@ shareable_fourcc(enum mtl_pixel_format format)
    }
 }
 
+/* The DRM fourcc an imported surface is in for a texture in `format`, or 0 for none. A superset
+ * of shareable_fourcc: a video plane comes from another driver, but nothing here makes one. */
+static uint32_t
+surface_fourcc(enum mtl_pixel_format format)
+{
+   switch (format) {
+   case MTL_PIXEL_FORMAT_R8_UNORM:
+      return DRM_FORMAT_R8;
+   case MTL_PIXEL_FORMAT_R8G8_UNORM:
+      return DRM_FORMAT_GR88;
+   default:
+      return shareable_fourcc(format);
+   }
+}
+
 bool
 mtl_pixel_format_is_shareable(enum mtl_pixel_format format)
 {
@@ -628,7 +643,7 @@ gem_surface_find(struct lmn_device *dev, uint32_t gem, struct lmn_gem_surface *o
 static bool
 surface_layout_ok(const struct kk_image_layout *layout)
 {
-   return shareable_fourcc(layout->format.mtl) && layout->levels == 1 && layout->layers == 1 &&
+   return surface_fourcc(layout->format.mtl) && layout->levels == 1 && layout->layers == 1 &&
           layout->sample_count_sa == 1 && layout->depth_px == 1 &&
           layout->linear_stride_B <= UINT32_MAX;
 }
@@ -670,11 +685,26 @@ texture_over_surface(struct lmn_device *dev, uint32_t gem, uint32_t res_handle,
    return t;
 }
 
+/* Whether surface `s` can be the storage `layout` describes. The texture takes the surface's own
+ * rows, so an image laid out at another pitch would shear; it may cover only the top left of a
+ * larger surface, as a video decoder pads its planes past the picture. */
+static bool
+surface_is(const struct lmn_gem_surface *s, const struct kk_image_layout *layout)
+{
+   return surface_layout_ok(layout) && s->width >= layout->width_px &&
+          s->height >= layout->height_px && s->drm_fourcc == surface_fourcc(layout->format.mtl) &&
+          (!layout->linear || layout->linear_stride_B == s->stride);
+}
+
 mtl_texture *
-mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *layout)
+mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *const *layouts,
+                        uint32_t layout_count)
 {
    struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
-   if (fd < 0 || !surface_layout_ok(layout))
+   bool any = false;
+   for (uint32_t i = 0; i < layout_count; i++)
+      any |= surface_layout_ok(layouts[i]);
+   if (fd < 0 || !any)
       return NULL;
    struct drm_prime_handle p = {.fd = fd};
    if (ioctl(dev->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &p) != 0)
@@ -696,19 +726,19 @@ mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout
       };
       gem_surface_note(dev, p.handle, s);
    }
-   /* The texture takes the surface's own rows; an image laid out at another pitch would shear. */
-   if (s.width != layout->width_px || s.height != layout->height_px ||
-       s.drm_fourcc != shareable_fourcc(layout->format.mtl) ||
-       (layout->linear && layout->linear_stride_B != s.stride)) {
-      fprintf(stderr,
-              "[limina-kk] a %ux%u surface (fourcc 0x%x, pitch %u) is not the %ux%u image "
-              "(Metal format %u, pitch %" PRIu64 ") it was imported as\n",
-              s.width, s.height, s.drm_fourcc, s.stride, layout->width_px, layout->height_px,
-              layout->format.mtl, (uint64_t)(layout->linear ? layout->linear_stride_B : 0));
-      gem_unref(dev, p.handle);
-      return NULL;
+   for (uint32_t i = 0; i < layout_count; i++) {
+      if (surface_is(&s, layouts[i]))
+         return texture_over_surface(dev, p.handle, s.res_handle, layouts[i]);
    }
-   return texture_over_surface(dev, p.handle, s.res_handle, layout);
+   const struct kk_image_layout *layout = layouts[0];
+   fprintf(stderr,
+           "[limina-kk] a %ux%u surface (fourcc 0x%x, pitch %u) is not the %ux%u image "
+           "(Metal format %u, pitch %" PRIu64 ")%s it was imported as\n",
+           s.width, s.height, s.drm_fourcc, s.stride, layout->width_px, layout->height_px,
+           layout->format.mtl, (uint64_t)(layout->linear ? layout->linear_stride_B : 0),
+           layout_count > 1 ? " or any other plane of it" : "");
+   gem_unref(dev, p.handle);
+   return NULL;
 }
 
 mtl_texture *
