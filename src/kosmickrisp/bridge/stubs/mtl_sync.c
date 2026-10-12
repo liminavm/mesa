@@ -21,6 +21,12 @@ mtl_new_event(mtl_device *device)
 }
 
 /* MTLSharedEvent */
+int
+mtl_shared_event_export_sync_file(mtl_shared_event *event_handle, uint64_t value)
+{
+   return -1;
+}
+
 mtl_shared_event *
 mtl_new_shared_event(mtl_device *device)
 {
