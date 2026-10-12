@@ -30,7 +30,12 @@ vk_image_to_mtl_texture_type(const struct vk_image *image)
     * COLOR_ATTACHMENT, whose render path is proven, while a subpass read on
     * one would fail loudly at view creation rather than make the base
     * texture un-creatable here). */
-   const bool can_array = image->tiling == VK_IMAGE_TILING_OPTIMAL;
+   bool can_array = image->tiling == VK_IMAGE_TILING_OPTIMAL;
+#if !DETECT_OS_APPLE
+   /* A legacy WSI scanout image is laid out linear whatever its tiling says (see
+    * kk_image_layout_init), so it is held to the same rule. */
+   can_array &= !image->wsi_legacy_scanout;
+#endif
    switch (image->image_type) {
    case VK_IMAGE_TYPE_1D:
    case VK_IMAGE_TYPE_2D:
