@@ -80,6 +80,8 @@ struct kk_physical_device {
 
    /* The bridge makes textures over surfaces other drivers read (limina). */
    bool shareable_textures;
+   /* The queue writes timestamps (not every bridge carries counter heaps). */
+   bool timestamps;
    /* With shareable_textures: the memory type a dma-buf import gets, device-local only. */
    uint8_t import_mem_type;
 };
