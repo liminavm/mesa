@@ -70,6 +70,7 @@ enum lmn_kind {
    LMN_KIND_COMMAND_BUFFER,
    LMN_KIND_ENCODER,
    LMN_KIND_COMMIT_OPTIONS,
+   LMN_KIND_COUNTER_HEAP,
 };
 
 struct lmn_device;
@@ -190,6 +191,10 @@ struct lmn_device {
     * that commit's completion. */
    bool waited_since_commit;
    bool lost;
+   /* Orders timestamp resolves, which no barrier reaches: an encoder that wrote a timestamp
+    * updates it as it ends, a resolve waits on it and updates it, and the encoder after a
+    * resolve waits on it. Made with the first counter heap. */
+   _Atomic(struct lmn_obj *) ts_fence;
 
    /* Host-written records. */
    pthread_mutex_t slot_lock;
@@ -305,6 +310,8 @@ struct lmn_command_buffer {
     * states, meta pipelines) while still recording, as Metal encoders retain what they are set. */
    struct lmn_obj **refs;
    uint32_t ref_count, ref_cap;
+   /* A counter-heap resolve is the last thing recorded: the next encoder waits on its fence. */
+   bool resolved;
 };
 
 /* Holds `obj` for as long as `cb`'s current recording. */
