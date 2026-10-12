@@ -31,6 +31,8 @@ uint32_t mtl_device_get_gpu_apple_family(mtl_device *dev);
 uint64_t mtl_device_get_registry_id(mtl_device *dev);
 /* The DRM render node the device was opened on, if it was: false for Metal itself. */
 bool mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor);
+/* Whether mtl_new_texture_shareable can succeed. Only for bridges on a DRM device. */
+bool mtl_device_supports_shareable_textures(mtl_device *dev);
 bool mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count);
 struct mtl_size mtl_device_max_threads_per_threadgroup(mtl_device *dev);
 uint32_t mtl_device_max_threadgroup_memory_length(mtl_device *dev);
