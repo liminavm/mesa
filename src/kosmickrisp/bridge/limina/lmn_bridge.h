@@ -207,6 +207,9 @@ struct lmn_device {
    /* GEM handle -> how many shared arenas hold it: importing what this file exported gives back
     * the same handle, which must close only with the last of them. Under `pool_lock`. */
    struct hash_table_u64 *gems;
+   /* The surfaces of GEM objects that are ones (struct lmn_gem_surface), for as long as a handle
+    * is held: the host gives a context a surface once. Under `pool_lock`. */
+   struct hash_table_u64 *gem_surfaces;
    /* The largest placement alignment the host has reported for a texture. */
    _Atomic uint64_t max_texture_align;
 

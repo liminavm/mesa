@@ -70,6 +70,12 @@ mtl_texture_export_fd(mtl_texture *texture)
    return -1;
 }
 
+mtl_texture *
+mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *layout)
+{
+   return NULL;
+}
+
 int
 mtl_heap_export_fd(mtl_heap *heap)
 {

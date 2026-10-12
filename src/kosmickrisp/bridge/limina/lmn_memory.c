@@ -14,6 +14,7 @@
 
 #include <drm/virtgpu_drm.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -81,6 +82,15 @@ arena_create(struct lmn_device *dev, uint64_t size, struct lmn_arena *out)
    return true;
 }
 
+/* What the host said a surface GEM object is: its resource and shape. */
+struct lmn_gem_surface {
+   uint32_t res_handle;
+   uint32_t width;
+   uint32_t height;
+   uint32_t drm_fourcc;
+   uint32_t stride;
+};
+
 static void
 gem_ref(struct lmn_device *dev, uint32_t gem)
 {
@@ -101,7 +111,13 @@ gem_unref(struct lmn_device *dev, uint32_t gem)
       _mesa_hash_table_u64_insert(dev->gems, gem, (void *)(n - 1));
    else
       _mesa_hash_table_u64_remove(dev->gems, gem);
+   struct lmn_gem_surface *surface = NULL;
+   if (n <= 1 && dev->gem_surfaces) {
+      surface = _mesa_hash_table_u64_search(dev->gem_surfaces, gem);
+      _mesa_hash_table_u64_remove(dev->gem_surfaces, gem);
+   }
    pthread_mutex_unlock(&dev->pool_lock);
+   free(surface);
    if (n <= 1) {
       struct drm_gem_close c = {.handle = gem};
       ioctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &c);
@@ -579,32 +595,56 @@ mtl_pixel_format_is_shareable(enum mtl_pixel_format format)
    return shareable_fourcc(format) != 0;
 }
 
-mtl_texture *
-mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout)
+/* Notes what the host said surface GEM object `gem` is, for later imports of it in this file. */
+static void
+gem_surface_note(struct lmn_device *dev, uint32_t gem, struct lmn_gem_surface s)
 {
-   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
-   uint32_t fourcc = shareable_fourcc(layout->format.mtl);
-   if (!fourcc || !layout->linear || layout->levels != 1 || layout->layers != 1 ||
-       layout->sample_count_sa != 1 || layout->depth_px != 1 ||
-       layout->linear_stride_B > UINT32_MAX)
-      return NULL;
-   struct drm_virtgpu_limina_surface_create s = {
-      .width = layout->width_px,
-      .height = layout->height_px,
-      .drm_fourcc = fourcc,
-      .stride = (uint32_t)layout->linear_stride_B,
-   };
-   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_CREATE, &s) != 0)
-      return NULL;
-   gem_ref(dev, s.handle);
+   struct lmn_gem_surface *copy = malloc(sizeof(*copy));
+   if (!copy)
+      return;
+   *copy = s;
+   pthread_mutex_lock(&dev->pool_lock);
+   if (!dev->gem_surfaces)
+      dev->gem_surfaces = _mesa_hash_table_u64_create(NULL);
+   struct lmn_gem_surface *old = _mesa_hash_table_u64_search(dev->gem_surfaces, gem);
+   _mesa_hash_table_u64_insert(dev->gem_surfaces, gem, copy);
+   pthread_mutex_unlock(&dev->pool_lock);
+   free(old);
+}
 
+static bool
+gem_surface_find(struct lmn_device *dev, uint32_t gem, struct lmn_gem_surface *out)
+{
+   pthread_mutex_lock(&dev->pool_lock);
+   struct lmn_gem_surface *s =
+      dev->gem_surfaces ? _mesa_hash_table_u64_search(dev->gem_surfaces, gem) : NULL;
+   if (s)
+      *out = *s;
+   pthread_mutex_unlock(&dev->pool_lock);
+   return s != NULL;
+}
+
+/* Whether `layout` describes a single 2D image a surface can be the storage of. */
+static bool
+surface_layout_ok(const struct kk_image_layout *layout)
+{
+   return shareable_fourcc(layout->format.mtl) && layout->levels == 1 && layout->layers == 1 &&
+          layout->sample_count_sa == 1 && layout->depth_px == 1 &&
+          layout->linear_stride_B <= UINT32_MAX;
+}
+
+/* A texture over surface `res_handle`, holding the reference to `gem` the caller took. */
+static mtl_texture *
+texture_over_surface(struct lmn_device *dev, uint32_t gem, uint32_t res_handle,
+                     const struct kk_image_layout *layout)
+{
    struct lmn_texture *t = texture_new(dev, NULL);
    struct lmn_slot slot;
    if (!t) {
-      gem_unref(dev, s.handle);
+      gem_unref(dev, gem);
       return NULL;
    }
-   t->gem = s.handle;
+   t->gem = gem;
    if (!lmn_slot_alloc(dev, &slot)) {
       t->base.handle = 0;
       mtl_release(t);
@@ -612,7 +652,7 @@ mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layo
    }
    struct lmn_create_texture_from_surface c = {
       .handle = t->base.handle,
-      .surface = s.res_handle,
+      .surface = res_handle,
       .reply = slot.ref,
    };
    lmn_texture_desc_from_layout(layout, &c.desc);
@@ -628,6 +668,73 @@ mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layo
       return NULL;
    }
    return t;
+}
+
+mtl_texture *
+mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *layout)
+{
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   if (fd < 0 || !surface_layout_ok(layout))
+      return NULL;
+   struct drm_prime_handle p = {.fd = fd};
+   if (ioctl(dev->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &p) != 0)
+      return NULL;
+   gem_ref(dev, p.handle);
+   struct lmn_gem_surface s;
+   if (!gem_surface_find(dev, p.handle, &s)) {
+      struct drm_virtgpu_limina_surface_import im = {.handle = p.handle};
+      if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_IMPORT, &im) != 0) {
+         gem_unref(dev, p.handle);
+         return NULL;
+      }
+      s = (struct lmn_gem_surface){
+         .res_handle = im.res_handle,
+         .width = im.width,
+         .height = im.height,
+         .drm_fourcc = im.drm_fourcc,
+         .stride = im.stride,
+      };
+      gem_surface_note(dev, p.handle, s);
+   }
+   /* The texture takes the surface's own rows; an image laid out at another pitch would shear. */
+   if (s.width != layout->width_px || s.height != layout->height_px ||
+       s.drm_fourcc != shareable_fourcc(layout->format.mtl) ||
+       (layout->linear && layout->linear_stride_B != s.stride)) {
+      fprintf(stderr,
+              "[limina-kk] a %ux%u surface (fourcc 0x%x, pitch %u) is not the %ux%u image "
+              "(Metal format %u, pitch %" PRIu64 ") it was imported as\n",
+              s.width, s.height, s.drm_fourcc, s.stride, layout->width_px, layout->height_px,
+              layout->format.mtl, (uint64_t)(layout->linear ? layout->linear_stride_B : 0));
+      gem_unref(dev, p.handle);
+      return NULL;
+   }
+   return texture_over_surface(dev, p.handle, s.res_handle, layout);
+}
+
+mtl_texture *
+mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout)
+{
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   if (!surface_layout_ok(layout) || !layout->linear)
+      return NULL;
+   struct drm_virtgpu_limina_surface_create s = {
+      .width = layout->width_px,
+      .height = layout->height_px,
+      .drm_fourcc = shareable_fourcc(layout->format.mtl),
+      .stride = (uint32_t)layout->linear_stride_B,
+   };
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_CREATE, &s) != 0)
+      return NULL;
+   gem_ref(dev, s.handle);
+   gem_surface_note(dev, s.handle,
+                    (struct lmn_gem_surface){
+                       .res_handle = s.res_handle,
+                       .width = s.width,
+                       .height = s.height,
+                       .drm_fourcc = s.drm_fourcc,
+                       .stride = s.stride,
+                    });
+   return texture_over_surface(dev, s.handle, s.res_handle, layout);
 }
 
 int
