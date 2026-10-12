@@ -1192,6 +1192,11 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
 
    struct vk_device_extension_table supported_extensions;
    kk_get_device_extensions(instance, pdev, &supported_extensions);
+   /* A bridge onto a DRM device (limina's) names its render node, which is how a GL driver on
+    * the same node (zink) finds this device. */
+   int64_t drm_major, drm_minor;
+   supported_extensions.EXT_physical_device_drm =
+      mtl_device_get_drm_render_node(pdev->mtl_dev_handle, &drm_major, &drm_minor);
 
    struct vk_features supported_features;
    kk_get_device_features(pdev, &supported_extensions, &supported_features);
@@ -1199,7 +1204,14 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    struct vk_properties properties;
    kk_get_device_properties(pdev, instance, &supported_extensions, &properties);
 
-   properties.drmHasRender = false;
+   int64_t render_major, render_minor;
+   properties.drmHasRender = supported_extensions.EXT_physical_device_drm &&
+                             mtl_device_get_drm_render_node(pdev->mtl_dev_handle, &render_major,
+                                                            &render_minor);
+   if (properties.drmHasRender) {
+      properties.drmRenderMajor = render_major;
+      properties.drmRenderMinor = render_minor;
+   }
 
    result = vk_physical_device_init(&pdev->vk, &instance->vk,
                                     &supported_extensions, &supported_features,
