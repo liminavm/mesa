@@ -144,10 +144,34 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
+   const VkMemoryDedicatedAllocateInfo *ded =
+      vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+   struct kk_image *ded_image = ded && ded->image ? kk_image_from_handle(ded->image) : NULL;
    if (fd_info && fd_info->handleType) {
       if (!(fd_info->handleType & KK_FD_HANDLE_TYPES)) {
          result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          goto fail_alloc;
+      }
+      /* A buffer another driver made (vrend, venus) or another context shared as a surface is
+       * a texture over that surface; only an image can be one. */
+      mtl_texture *surface =
+         ded_image && ded_image->plane_count == 1
+            ? mtl_new_texture_from_fd(dev->mtl_handle, fd_info->fd, &ded_image->planes[0].layout)
+            : NULL;
+      if (surface) {
+         mem->bo = CALLOC_STRUCT(kk_bo);
+         if (!mem->bo) {
+            mtl_release(surface);
+            result = vk_errorf(&dev->vk.base, VK_ERROR_OUT_OF_HOST_MEMORY, "%m");
+            goto fail_alloc;
+         }
+         mem->bo->texture = surface;
+         mem->bo->size_B = mem->vk.size;
+         kk_device_add_texture_to_residency_set(dev, surface);
+         /* A successful import owns the fd. */
+         close(fd_info->fd);
+         *pMem = kk_device_memory_to_handle(mem);
+         return VK_SUCCESS;
       }
       result = kk_import_bo_fd(dev, &dev->vk.base, fd_info->fd, &mem->bo);
       if (result != VK_SUCCESS)
@@ -166,9 +190,6 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (export_info && (export_info->handleTypes & KK_FD_HANDLE_TYPES)) {
       /* A dedicated linear image other drivers read: its storage is a surface they can import,
        * not a heap only this driver understands. */
-      const VkMemoryDedicatedAllocateInfo *ded =
-         vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
-      struct kk_image *ded_image = ded && ded->image ? kk_image_from_handle(ded->image) : NULL;
       mtl_texture *shareable =
          ded_image && ded_image->plane_count == 1
             ? mtl_new_texture_shareable(dev->mtl_handle, &ded_image->planes[0].layout)
