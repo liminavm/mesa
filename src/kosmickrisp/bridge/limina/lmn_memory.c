@@ -8,6 +8,7 @@
 #include "lmn_bridge.h"
 
 #include "kosmickrisp/vulkan/kk_image_layout.h"
+#include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_formats.h"
 #include "vulkan/vulkan_core.h"
 
@@ -452,8 +453,12 @@ mtl_get_contents(mtl_buffer *buffer)
 static void
 texture_destroy(struct lmn_obj *obj)
 {
+   struct lmn_texture *t = (struct lmn_texture *)obj;
    lmn_destroy_host_object(obj);
-   mtl_release(((struct lmn_texture *)obj)->parent);
+   mtl_release(t->parent);
+   /* After the DESTROY: the host's texture keeps the surface, the GEM object the resource. */
+   if (t->gem)
+      gem_unref(obj->dev, t->gem);
 }
 
 static struct lmn_texture *
@@ -550,6 +555,85 @@ mtl_new_texture_with_descriptor_linear(mtl_buffer *buffer, const struct kk_image
    return texture_create(b->base.dev, &b->base, b->heap->arena,
                          b->heap->offset + b->offset + offset,
                          layout->linear_stride_B, layout);
+}
+
+/* The DRM fourcc a shareable texture's surface is in, or 0 for a format it cannot be in. */
+static uint32_t
+shareable_fourcc(enum mtl_pixel_format format)
+{
+   switch (format) {
+   case MTL_PIXEL_FORMAT_B8G8R8A8_UNORM:
+   case MTL_PIXEL_FORMAT_B8G8R8A8_SRGB:
+      return DRM_FORMAT_ARGB8888;
+   case MTL_PIXEL_FORMAT_R8G8B8A8_UNORM:
+   case MTL_PIXEL_FORMAT_R8G8B8A8_SRGB:
+      return DRM_FORMAT_ABGR8888;
+   default:
+      return 0;
+   }
+}
+
+mtl_texture *
+mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout)
+{
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   uint32_t fourcc = shareable_fourcc(layout->format.mtl);
+   if (!fourcc || !layout->linear || layout->levels != 1 || layout->layers != 1 ||
+       layout->sample_count_sa != 1 || layout->depth_px != 1 ||
+       layout->linear_stride_B > UINT32_MAX)
+      return NULL;
+   struct drm_virtgpu_limina_surface_create s = {
+      .width = layout->width_px,
+      .height = layout->height_px,
+      .drm_fourcc = fourcc,
+      .stride = (uint32_t)layout->linear_stride_B,
+   };
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_CREATE, &s) != 0)
+      return NULL;
+   gem_ref(dev, s.handle);
+
+   struct lmn_texture *t = texture_new(dev, NULL);
+   struct lmn_slot slot;
+   if (!t) {
+      gem_unref(dev, s.handle);
+      return NULL;
+   }
+   t->gem = s.handle;
+   if (!lmn_slot_alloc(dev, &slot)) {
+      t->base.handle = 0;
+      mtl_release(t);
+      return NULL;
+   }
+   struct lmn_create_texture_from_surface c = {
+      .handle = t->base.handle,
+      .surface = s.res_handle,
+      .reply = slot.ref,
+   };
+   lmn_texture_desc_from_layout(layout, &c.desc);
+   /* Metal takes a linear 2D array of one layer only as 2D. */
+   if (c.desc.texture_type == MTL_TEXTURE_TYPE_2D_ARRAY)
+      c.desc.texture_type = MTL_TEXTURE_TYPE_2D;
+   props_from_desc(t, &c.desc);
+   struct lmn_iov iov = {&c, sizeof(c)};
+   if (!create_with_id(dev, LMN_OP_CREATE_TEXTURE_FROM_SURFACE, &iov, 1, &slot, &t->resource_id,
+                       "texture over a surface")) {
+      t->base.handle = 0;
+      mtl_release(t);
+      return NULL;
+   }
+   return t;
+}
+
+int
+mtl_texture_export_fd(mtl_texture *texture)
+{
+   struct lmn_texture *t = LMN_CAST(lmn_texture, texture, LMN_KIND_TEXTURE);
+   if (!t->gem)
+      return -1;
+   struct drm_prime_handle p = {.handle = t->gem, .flags = DRM_CLOEXEC | DRM_RDWR, .fd = -1};
+   if (ioctl(t->base.dev->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &p) != 0)
+      return -1;
+   return p.fd;
 }
 
 uint64_t
