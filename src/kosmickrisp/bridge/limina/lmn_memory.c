@@ -696,6 +696,46 @@ surface_is(const struct lmn_gem_surface *s, const struct kk_image_layout *layout
           (!layout->linear || layout->linear_stride_B == s->stride);
 }
 
+/* The surface dma-buf `fd` names, with a reference on its GEM handle the caller drops; false,
+ * holding nothing, when it names no surface. */
+static bool
+fd_surface(struct lmn_device *dev, int fd, uint32_t *gem, struct lmn_gem_surface *s)
+{
+   struct drm_prime_handle p = {.fd = fd};
+   if (fd < 0 || ioctl(dev->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &p) != 0)
+      return false;
+   gem_ref(dev, p.handle);
+   if (!gem_surface_find(dev, p.handle, s)) {
+      struct drm_virtgpu_limina_surface_import im = {.handle = p.handle};
+      if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_IMPORT, &im) != 0) {
+         gem_unref(dev, p.handle);
+         return false;
+      }
+      *s = (struct lmn_gem_surface){
+         .res_handle = im.res_handle,
+         .width = im.width,
+         .height = im.height,
+         .drm_fourcc = im.drm_fourcc,
+         .stride = im.stride,
+      };
+      gem_surface_note(dev, p.handle, *s);
+   }
+   *gem = p.handle;
+   return true;
+}
+
+bool
+mtl_fd_is_surface(mtl_device *device, int fd)
+{
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   uint32_t gem;
+   struct lmn_gem_surface s;
+   if (!fd_surface(dev, fd, &gem, &s))
+      return false;
+   gem_unref(dev, gem);
+   return true;
+}
+
 mtl_texture *
 mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *const *layouts,
                         uint32_t layout_count)
@@ -704,31 +744,13 @@ mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout
    bool any = false;
    for (uint32_t i = 0; i < layout_count; i++)
       any |= surface_layout_ok(layouts[i]);
-   if (fd < 0 || !any)
-      return NULL;
-   struct drm_prime_handle p = {.fd = fd};
-   if (ioctl(dev->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &p) != 0)
-      return NULL;
-   gem_ref(dev, p.handle);
+   uint32_t gem;
    struct lmn_gem_surface s;
-   if (!gem_surface_find(dev, p.handle, &s)) {
-      struct drm_virtgpu_limina_surface_import im = {.handle = p.handle};
-      if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_IMPORT, &im) != 0) {
-         gem_unref(dev, p.handle);
-         return NULL;
-      }
-      s = (struct lmn_gem_surface){
-         .res_handle = im.res_handle,
-         .width = im.width,
-         .height = im.height,
-         .drm_fourcc = im.drm_fourcc,
-         .stride = im.stride,
-      };
-      gem_surface_note(dev, p.handle, s);
-   }
+   if (!any || !fd_surface(dev, fd, &gem, &s))
+      return NULL;
    for (uint32_t i = 0; i < layout_count; i++) {
       if (surface_is(&s, layouts[i]))
-         return texture_over_surface(dev, p.handle, s.res_handle, layouts[i]);
+         return texture_over_surface(dev, gem, s.res_handle, layouts[i]);
    }
    const struct kk_image_layout *layout = layouts[0];
    fprintf(stderr,
@@ -737,7 +759,7 @@ mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout
            s.width, s.height, s.drm_fourcc, s.stride, layout->width_px, layout->height_px,
            layout->format.mtl, (uint64_t)(layout->linear ? layout->linear_stride_B : 0),
            layout_count > 1 ? " or any other plane of it" : "");
-   gem_unref(dev, p.handle);
+   gem_unref(dev, gem);
    return NULL;
 }
 
