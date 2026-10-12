@@ -120,7 +120,7 @@ kk_init_wsi(struct kk_physical_device *pdev)
    VkResult result =
       wsi_device_init(wsi, kk_physical_device_to_handle(pdev), kk_wsi_proc_addr,
                       &pdev->vk.instance->alloc,
-                      0u,   // Not relevant for metal wsi
+                      -1,   // No KMS display: not relevant for metal wsi
                       NULL, // Not relevant for metal
                       &wsi_options);
    if (result != VK_SUCCESS)
