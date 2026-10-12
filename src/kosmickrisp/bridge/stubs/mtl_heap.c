@@ -58,6 +58,18 @@ mtl_new_heap_exportable(mtl_device *device, uint64_t size)
    return NULL;
 }
 
+mtl_texture *
+mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout)
+{
+   return NULL;
+}
+
+int
+mtl_texture_export_fd(mtl_texture *texture)
+{
+   return -1;
+}
+
 int
 mtl_heap_export_fd(mtl_heap *heap)
 {
