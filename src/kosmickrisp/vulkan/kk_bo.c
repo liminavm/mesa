@@ -200,6 +200,57 @@ fail_heap:
    return result;
 }
 
+#if !DETECT_OS_APPLE
+/* A BO of a whole heap someone else made; takes the heap. */
+static VkResult
+kk_bo_from_heap(struct kk_device *dev, struct vk_object_base *log_obj, mtl_heap *handle,
+                struct kk_bo **bo_out)
+{
+   uint64_t size_B = mtl_heap_get_size(handle);
+   mtl_buffer *map = mtl_new_buffer_with_length(handle, size_B, 0u);
+   struct kk_bo *bo = map ? CALLOC_STRUCT(kk_bo) : NULL;
+   if (!bo) {
+      if (map)
+         mtl_release(map);
+      mtl_release(handle);
+      return vk_errorf(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY, "%m");
+   }
+   bo->mtl_handle = handle;
+   bo->size_B = size_B;
+   bo->map = map;
+   bo->gpu = mtl_buffer_get_gpu_address(map);
+   bo->cpu = mtl_get_contents(map);
+   kk_device_add_heap_to_residency_set(dev, handle);
+   kk_bo_census_charge(size_B);
+   *bo_out = bo;
+   return VK_SUCCESS;
+}
+
+VkResult
+kk_alloc_bo_exportable(struct kk_device *dev, struct vk_object_base *log_obj, uint64_t size_B,
+                       struct kk_bo **bo_out)
+{
+   if (vk_device_is_lost_no_report(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
+   mtl_heap *handle = mtl_new_heap_exportable(dev->mtl_handle, size_B);
+   if (!handle)
+      return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "exportable heap");
+   return kk_bo_from_heap(dev, log_obj, handle, bo_out);
+}
+
+VkResult
+kk_import_bo_fd(struct kk_device *dev, struct vk_object_base *log_obj, int fd,
+                struct kk_bo **bo_out)
+{
+   if (vk_device_is_lost_no_report(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
+   mtl_heap *handle = mtl_new_heap_from_fd(dev->mtl_handle, fd);
+   if (!handle)
+      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "dma-buf import");
+   return kk_bo_from_heap(dev, log_obj, handle, bo_out);
+}
+#endif /* !DETECT_OS_APPLE */
+
 void
 kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
 {
