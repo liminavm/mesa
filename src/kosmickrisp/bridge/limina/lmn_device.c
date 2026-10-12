@@ -9,7 +9,9 @@
 
 #include "kosmickrisp/vulkan/kk_image_layout.h"
 #include "../ns_process_info.h"
+#include "drm-uapi/drm_fourcc.h"
 
+#include <drm/drm.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -492,6 +494,24 @@ uint32_t
 mtl_device_get_gpu_apple_family(mtl_device *dev)
 {
    return D(dev)->info.apple_family;
+}
+
+bool
+mtl_device_supports_shareable_textures(mtl_device *device)
+{
+   /* A module and host that have surfaces make the smallest one; it goes again at once. */
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   struct drm_virtgpu_limina_surface_create s = {
+      .width = 1,
+      .height = 1,
+      .drm_fourcc = DRM_FORMAT_ARGB8888,
+      .stride = 4,
+   };
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_CREATE, &s) != 0)
+      return false;
+   struct drm_gem_close c = {.handle = s.handle};
+   ioctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &c);
+   return true;
 }
 
 bool
