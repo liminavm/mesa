@@ -184,6 +184,9 @@ struct lmn_device {
    uint32_t next_handle;
    uint64_t arena_used[VIRTGPU_LIMINA_MAX_ARENAS / 64];
    uint64_t seqno;
+   /* A queue wait was pushed after the last commit: a signal pushed now is not known to follow
+    * that commit's completion. */
+   bool waited_since_commit;
    bool lost;
 
    /* Host-written records. */
@@ -267,6 +270,10 @@ void lmn_slot_free_after_next_commit(struct lmn_device *dev, struct lmn_slot *sl
 struct lmn_heap *lmn_heap_create(struct lmn_device *dev, uint64_t size);
 /* Returns the pooled arenas to the host; every pooled heap must be gone. */
 void lmn_pools_finish(struct lmn_device *dev);
+
+/* Notes that `event` (a shared event) is signaled to `value` on the queue right after commit
+ * `seqno`; with `dev->lock` held. What mtl_shared_event_export_sync_file goes by. */
+void lmn_shared_event_note_signal(void *event, uint64_t value, uint64_t seqno);
 
 /* -- objects -- */
 void lmn_destroy_host_object(struct lmn_obj *obj);

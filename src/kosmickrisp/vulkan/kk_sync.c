@@ -10,6 +10,8 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#include "vk_sync_binary.h"
+
 static VkResult
 kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
                  uint64_t initial_value)
@@ -81,6 +83,27 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
 
    return completed != 0 ? VK_SUCCESS : VK_TIMEOUT;
 }
+
+#if !DETECT_OS_APPLE
+VkResult
+kk_binary_export_sync_file(struct vk_device *device, struct vk_sync *sync, int *pFd)
+{
+   struct vk_sync_binary *binary = container_of(sync, struct vk_sync_binary, sync);
+   struct kk_sync_timeline *timeline =
+      container_of(&binary->timeline, struct kk_sync_timeline, base);
+
+   /* The runtime has waited for the signal to be submitted (WAIT_PENDING). */
+   int fd = mtl_shared_event_export_sync_file(timeline->mtl_handle, binary->next_point);
+   if (fd >= 0) {
+      *pFd = fd;
+      return VK_SUCCESS;
+   }
+   VkResult result = vk_sync_wait(device, &binary->timeline, binary->next_point, 0,
+                                  OS_TIMEOUT_INFINITE);
+   *pFd = -1;
+   return result;
+}
+#endif
 
 const struct vk_sync_type kk_sync_type = {
    .size = sizeof(struct kk_sync_timeline),
