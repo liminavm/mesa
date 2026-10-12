@@ -1268,6 +1268,9 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    assert(st_idx <= ARRAY_SIZE(pdev->sync_types));
    pdev->vk.supported_sync_types = pdev->sync_types;
 
+#if !DETECT_OS_APPLE
+   pdev->shareable_textures = mtl_device_supports_shareable_textures(pdev->mtl_dev_handle);
+#endif
    result = kk_init_wsi(pdev);
    if (result != VK_SUCCESS)
       goto fail_disk_cache;
