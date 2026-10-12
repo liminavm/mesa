@@ -214,8 +214,13 @@ queue_event(mtl_command_queue *queue, mtl_event *event, uint64_t value, bool wai
     * commit). */
    struct lmn_device *dev = q->dev;
    pthread_mutex_lock(&dev->lock);
-   if (lmn_push_locked(dev, LMN_OP_QUEUE_EVENT, &(struct lmn_iov){&c, sizeof(c)}, 1))
+   if (lmn_push_locked(dev, LMN_OP_QUEUE_EVENT, &(struct lmn_iov){&c, sizeof(c)}, 1)) {
+      if (wait)
+         dev->waited_since_commit = true;
+      else if (e->kind == LMN_KIND_SHARED_EVENT && !dev->waited_since_commit)
+         lmn_shared_event_note_signal(e, value, dev->seqno);
       lmn_flush_locked(dev);
+   }
    pthread_mutex_unlock(&dev->lock);
 }
 
@@ -261,6 +266,7 @@ mtl_command_queue_commit(mtl_command_queue *queue, mtl_command_buffer **command_
    struct lmn_commit w = {.seqno = c->seqno, .feedback = c->feedback.ref};
    if (ok)
       ok = lmn_push_locked(dev, LMN_OP_COMMIT, &(struct lmn_iov){&w, sizeof(w)}, 1);
+   dev->waited_since_commit = false;
    lmn_flush_locked(dev);
    pthread_mutex_unlock(&dev->lock);
    /* A failed commit still completes, as lost, so its handlers run. */
