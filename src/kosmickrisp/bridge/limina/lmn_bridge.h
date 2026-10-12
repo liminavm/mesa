@@ -36,6 +36,7 @@
 #include "virtgpu_limina_drm.h"
 
 #include "../mtl_bridge.h"
+#include "util/hash_table.h"
 #include "util/list.h"
 #include "util/vma.h"
 
@@ -118,6 +119,9 @@ struct lmn_arena {
    uint64_t gpu_base;
    uint64_t mmap_offset;
    uint8_t *map;
+   /* A shared arena's GEM object (its export, or the object it was imported from), which it is
+    * mapped and exported through; 0 for one in the arena window. */
+   uint32_t gem;
 };
 
 /* An arena shared by small heaps. */
@@ -195,6 +199,9 @@ struct lmn_device {
    /* Pooled arenas for small heaps; see lmn_memory.c. */
    pthread_mutex_t pool_lock;
    struct list_head pools;
+   /* GEM handle -> how many shared arenas hold it: importing what this file exported gives back
+    * the same handle, which must close only with the last of them. Under `pool_lock`. */
+   struct hash_table_u64 *gems;
    /* The largest placement alignment the host has reported for a texture. */
    _Atomic uint64_t max_texture_align;
 

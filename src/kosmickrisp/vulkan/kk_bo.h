@@ -9,6 +9,7 @@
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
+#include "util/detect_os.h"
 #include "vulkan/vulkan_core.h"
 
 #include <inttypes.h>
@@ -41,6 +42,15 @@ struct kk_ptr {
 
 VkResult kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
                      uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out);
+
+#if !DETECT_OS_APPLE
+/* A BO other processes can share as a dma-buf: a heap of its own. */
+VkResult kk_alloc_bo_exportable(struct kk_device *dev, struct vk_object_base *log_obj,
+                                uint64_t size_B, struct kk_bo **bo_out);
+/* The BO another one exported as dma-buf `fd`; the fd stays the caller's. */
+VkResult kk_import_bo_fd(struct kk_device *dev, struct vk_object_base *log_obj, int fd,
+                         struct kk_bo **bo_out);
+#endif
 
 void kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo);
 

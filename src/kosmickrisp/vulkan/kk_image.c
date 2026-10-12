@@ -442,6 +442,14 @@ kk_GetPhysicalDeviceImageFormatProperties2(
          ext_mem_props = &kk_host_mem_props;
          break;
       }
+#if !DETECT_OS_APPLE
+      /* Without modifiers a dma-buf image means this driver's own layout, which another
+       * KosmicKrisp context binds the same way. */
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+         ext_mem_props = &kk_fd_mem_props;
+         break;
+#endif
       default:
          /* From the Vulkan 1.3.256 spec:
           *
