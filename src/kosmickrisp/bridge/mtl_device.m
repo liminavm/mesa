@@ -112,6 +112,12 @@ mtl_device_get_gpu_apple_family(mtl_device *dev)
    }
 }
 
+bool
+mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor)
+{
+   return false;
+}
+
 uint64_t
 mtl_device_get_registry_id(mtl_device *dev)
 {
