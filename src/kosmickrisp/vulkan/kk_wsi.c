@@ -133,7 +133,7 @@ kk_init_wsi(struct kk_physical_device *pdev)
    struct wsi_device_options wsi_options = {.sw_device = false};
 #else
    struct wsi_device_options wsi_options = {
-      .sw_device = !mtl_device_supports_shareable_textures(pdev->mtl_dev_handle),
+      .sw_device = !pdev->shareable_textures,
    };
 #endif
    struct wsi_device *wsi = &pdev->wsi_device;
