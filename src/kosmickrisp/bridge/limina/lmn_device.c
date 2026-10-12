@@ -354,6 +354,8 @@ device_destroy(struct lmn_obj *obj)
       mtl_release(dev->staging);
    if (dev->records)
       mtl_release(dev->records);
+   if (dev->pools.next)
+      lmn_pools_finish(dev);
    /* The ring's arena goes last: the host reads it until the context is gone, which closing the
     * file does. */
    if (dev->doorbell)
@@ -386,6 +388,8 @@ mtl_device_create(void)
    pthread_mutex_init(&dev->slot_lock, NULL);
    pthread_mutex_init(&dev->commit_lock, NULL);
    pthread_mutex_init(&dev->cache_lock, NULL);
+   pthread_mutex_init(&dev->pool_lock, NULL);
+   list_inithead(&dev->pools);
    pthread_cond_init(&dev->commit_cond, NULL);
    /* Arena ids 0 (none) is never handed out. */
    dev->arena_used[0] = 1;
@@ -684,6 +688,9 @@ mtl_heap_texture_size_and_align_with_descriptor(mtl_device *device,
       if (r.status == 0) {
          size = r.values[0];
          align = r.values[1];
+         uint64_t seen = atomic_load(&d->max_texture_align);
+         while (align > seen && !atomic_compare_exchange_weak(&d->max_texture_align, &seen, align))
+            ;
          if (e) {
             pthread_mutex_lock(&d->cache_lock);
             e->valid = true;
