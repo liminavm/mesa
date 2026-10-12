@@ -36,6 +36,8 @@
 #include "virtgpu_limina_drm.h"
 
 #include "../mtl_bridge.h"
+#include "util/list.h"
+#include "util/vma.h"
 
 #define ARRAY_SIZE_LMN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -104,13 +106,40 @@ struct lmn_slot {
 
 #define LMN_SLOT_SIZE 64u
 
-struct lmn_heap {
-   struct lmn_obj base;
-   uint32_t arena;
+/* Arenas small heaps are carved from, and heaps above which an arena is a heap's own. */
+#define LMN_POOL_ARENA (64ull << 20)
+#define LMN_POOL_MAX_HEAP (16ull << 20)
+/* util_vma_heap takes 0 for failure; pool offsets are biased by this. */
+#define LMN_POOL_BIAS (1ull << 32)
+
+struct lmn_arena {
+   uint32_t id;
    uint64_t size;
    uint64_t gpu_base;
    uint64_t mmap_offset;
    uint8_t *map;
+};
+
+/* An arena shared by small heaps. */
+struct lmn_pool {
+   struct list_head link;
+   struct lmn_arena arena;
+   struct util_vma_heap vma;
+   uint64_t used;
+};
+
+/* A heap: `size` bytes at `offset` in arena `arena`, which is either a pool's or its own. The
+ * other fields describe the heap's first byte. */
+struct lmn_heap {
+   struct lmn_obj base;
+   uint32_t arena;
+   uint64_t offset;
+   uint64_t size;
+   uint64_t gpu_base;
+   uint64_t mmap_offset;
+   uint8_t *map;
+   struct lmn_pool *pool;
+   struct lmn_arena own;
 };
 
 struct lmn_buffer {
@@ -162,6 +191,12 @@ struct lmn_device {
 
    struct lmn_device_info info;
    _Atomic uint64_t allocated;
+
+   /* Pooled arenas for small heaps; see lmn_memory.c. */
+   pthread_mutex_t pool_lock;
+   struct list_head pools;
+   /* The largest placement alignment the host has reported for a texture. */
+   _Atomic uint64_t max_texture_align;
 
    /* Staging for texture <-> host-pointer transfers, under `lock`. */
    struct lmn_heap *staging;
@@ -221,7 +256,10 @@ void lmn_slot_free(struct lmn_device *dev, struct lmn_slot *slot);
 void lmn_slot_free_after_next_commit(struct lmn_device *dev, struct lmn_slot *slot);
 
 /* -- heaps (lmn_memory.c) -- */
+/* A heap that is a whole arena of its own. */
 struct lmn_heap *lmn_heap_create(struct lmn_device *dev, uint64_t size);
+/* Returns the pooled arenas to the host; every pooled heap must be gone. */
+void lmn_pools_finish(struct lmn_device *dev);
 
 /* -- objects -- */
 void lmn_destroy_host_object(struct lmn_obj *obj);
