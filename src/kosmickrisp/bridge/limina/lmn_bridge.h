@@ -281,7 +281,15 @@ struct lmn_command_buffer {
    uint64_t serial;
    /* An append failed for lack of memory; the commit reports a lost device. */
    bool failed;
+   /* The objects the stream names, held until the next recording: their DESTROY must not reach
+    * the ring before the commit that uses them, and KosmicKrisp releases some (depth-stencil
+    * states, meta pipelines) while still recording, as Metal encoders retain what they are set. */
+   struct lmn_obj **refs;
+   uint32_t ref_count, ref_cap;
 };
+
+/* Holds `obj` for as long as `cb`'s current recording. */
+void lmn_cb_ref(struct lmn_command_buffer *cb, void *obj);
 
 /* Appends a command to `cb`'s stream. */
 void lmn_cb_append(struct lmn_command_buffer *cb, uint16_t op, const struct lmn_iov *iov,
