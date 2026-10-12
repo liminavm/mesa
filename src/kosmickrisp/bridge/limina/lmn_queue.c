@@ -392,6 +392,7 @@ mtl_begin_command_buffer(mtl_command_buffer *command_buffer, mtl_command_allocat
    drop_refs(cb);
    cb->len = 0;
    cb->failed = false;
+   cb->resolved = false;
    cb->serial = atomic_fetch_add(&lmn_cb_serial, 1) + 1;
 }
 
@@ -404,7 +405,22 @@ void
 mtl_command_resolve_counter_heap(mtl_command_buffer *command_buffer, mtl_counter_heap *heap,
                                  uint32_t first_index, uint32_t count, uint64_t dst_addr)
 {
-   LMN_UNIMPLEMENTED();
+   struct lmn_command_buffer *cb =
+      LMN_CAST(lmn_command_buffer, command_buffer, LMN_KIND_COMMAND_BUFFER);
+   struct lmn_obj *h = lmn_cast(heap, LMN_KIND_COUNTER_HEAP, __func__);
+   struct lmn_obj *fence = atomic_load(&cb->base.dev->ts_fence);
+   lmn_cb_ref(cb, h);
+   struct lmn_resolve_counter_heap c = {
+      .heap = h->handle,
+      .first = first_index,
+      .count = count,
+      .wait_fence = fence->handle,
+      .update_fence = fence->handle,
+      .dst = dst_addr,
+   };
+   struct lmn_iov iov = {&c, sizeof(c)};
+   lmn_cb_append(cb, LMN_OP_RESOLVE_COUNTER_HEAP, &iov, 1);
+   cb->resolved = true;
 }
 
 void
