@@ -209,7 +209,14 @@ queue_event(mtl_command_queue *queue, mtl_event *event, uint64_t value, bool wai
       abort();
    }
    struct lmn_queue_event c = {.event = e->handle, .wait = wait, .value = value};
-   lmn_push(q->dev, LMN_OP_QUEUE_EVENT, &c, sizeof(c));
+   /* Published at once, like a commit: a signal is what another thread's wait may be polling
+    * for, and nothing else is bound to publish it (KosmicKrisp signals after the submit's last
+    * commit). */
+   struct lmn_device *dev = q->dev;
+   pthread_mutex_lock(&dev->lock);
+   if (lmn_push_locked(dev, LMN_OP_QUEUE_EVENT, &(struct lmn_iov){&c, sizeof(c)}, 1))
+      lmn_flush_locked(dev);
+   pthread_mutex_unlock(&dev->lock);
 }
 
 void
