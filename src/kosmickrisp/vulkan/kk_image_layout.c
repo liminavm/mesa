@@ -284,6 +284,11 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
     * render fine — the historical aborts came from the arrays-only
     * input-attachment type, handled in vk_image_to_mtl_texture_type now.) */
    layout->linear = image->tiling != VK_IMAGE_TILING_OPTIMAL;
+#if !DETECT_OS_APPLE
+   /* A window-system image with no modifier is shared with the compositor's driver, which reads
+    * it as a plain linear buffer (kk_AllocateMemory makes it a shareable texture). */
+   layout->linear |= image->wsi_legacy_scanout;
+#endif
    layout->optimized_layout = kk_image_layout_can_optimize(
       pdev, image->usage, image->tiling, image->create_flags, format);
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(

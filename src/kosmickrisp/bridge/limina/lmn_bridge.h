@@ -156,6 +156,8 @@ struct lmn_buffer {
 struct lmn_texture {
    struct lmn_obj base;
    uint64_t resource_id;
+   /* A shareable texture's GEM object: the surface it is made over. */
+   uint32_t gem;
    struct mtl_texture_props props;
    /* What keeps the memory alive: the heap or buffer it is in, or the texture it views. */
    struct lmn_obj *parent;
