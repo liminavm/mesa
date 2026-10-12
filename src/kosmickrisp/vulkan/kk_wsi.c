@@ -115,7 +115,9 @@ kk_get_blit_queue(VkDevice device)
 VkResult
 kk_init_wsi(struct kk_physical_device *pdev)
 {
-   struct wsi_device_options wsi_options = {.sw_device = false};
+   /* Off macOS, a swapchain image is presented by copying it to host memory: a bridge onto
+    * another machine's Metal has no buffers to share with a Linux compositor. */
+   struct wsi_device_options wsi_options = {.sw_device = !DETECT_OS_APPLE};
    struct wsi_device *wsi = &pdev->wsi_device;
    VkResult result =
       wsi_device_init(wsi, kk_physical_device_to_handle(pdev), kk_wsi_proc_addr,
