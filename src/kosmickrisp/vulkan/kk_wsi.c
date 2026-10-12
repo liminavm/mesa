@@ -18,6 +18,15 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#if !DETECT_OS_APPLE
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#endif
+
 static PFN_vkVoidFunction
 kk_instance_get_proc_addr_unchecked(const struct vk_instance *instance,
                                     const char *name)
@@ -57,6 +66,32 @@ kk_wsi_can_share_format(VkPhysicalDevice physicalDevice, VkFormat format)
 {
    const struct kk_va_format *va = kk_get_va_format(vk_format_to_pipe_format(format));
    return va && mtl_pixel_format_is_shareable(va->mtl_pixel_format);
+}
+
+/* The sysfs device behind DRM node major:minor, which a GPU's primary and render nodes share. */
+static bool
+kk_drm_node_device(dev_t node, char out[PATH_MAX])
+{
+   char link[64];
+   snprintf(link, sizeof(link), "/sys/dev/char/%u:%u/device", major(node), minor(node));
+   return realpath(link, out) != NULL;
+}
+
+/* Whether the X server's DRI3 device is the GPU this driver renders on. Mesa's own check only
+ * matches PCI devices, and virtio-gpu is not one: answered no, X11 WSI copies every frame into an
+ * exported buffer, which reaches the X server as a blob its driver cannot see. */
+static bool
+kk_wsi_can_present_on_device(VkPhysicalDevice physicalDevice, int fd)
+{
+   VK_FROM_HANDLE(kk_physical_device, pdev, physicalDevice);
+   int64_t maj, min;
+   struct stat st;
+   if (!mtl_device_get_drm_render_node(pdev->mtl_dev_handle, &maj, &min) || fstat(fd, &st) != 0 ||
+       !S_ISCHR(st.st_mode))
+      return false;
+   char ours[PATH_MAX], theirs[PATH_MAX];
+   return kk_drm_node_device(makedev(maj, min), ours) && kk_drm_node_device(st.st_rdev, theirs) &&
+          strcmp(ours, theirs) == 0;
 }
 #endif
 
@@ -149,6 +184,8 @@ kk_init_wsi(struct kk_physical_device *pdev)
    wsi->metal.bind_drawable_to_vkimage = kk_bind_drawable_to_vkimage;
 #if !DETECT_OS_APPLE
    wsi->can_share_format = kk_wsi_can_share_format;
+   if (pdev->shareable_textures)
+      wsi->can_present_on_device = kk_wsi_can_present_on_device;
 #endif
    wsi->metal.encode_drawable_present = kk_encode_drawable_present;
    wsi->metal.cmd_blit_image = kk_wsi_cmd_blit_image;
