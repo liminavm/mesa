@@ -106,8 +106,13 @@ kk_GetMemoryHostPointerPropertiesEXT(
    default:
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
-   pMemoryHostPointerProperties->memoryTypeBits =
-      BITFIELD_MASK(pdev->mem_type_count);
+   /* Host memory is host-visible by definition. */
+   uint32_t types = 0;
+   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+      if (pdev->mem_types[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         types |= BITFIELD_BIT(i);
+   }
+   pMemoryHostPointerProperties->memoryTypeBits = types;
 
    return VK_SUCCESS;
 }
@@ -568,7 +573,12 @@ kk_GetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits 
 
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-   pMemoryFdProperties->memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count);
+   /* A surface's pixels are the host's, so its memory is device-local only; a heap another
+    * context exported is memory like any other. */
+   pMemoryFdProperties->memoryTypeBits =
+      pdev->shareable_textures && mtl_fd_is_surface(dev->mtl_handle, fd)
+         ? BITFIELD_BIT(pdev->import_mem_type)
+         : BITFIELD_MASK(pdev->mem_type_count);
    return VK_SUCCESS;
 }
 #endif /* !DETECT_OS_APPLE */
