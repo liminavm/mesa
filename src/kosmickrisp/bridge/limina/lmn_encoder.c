@@ -96,6 +96,7 @@ bind_table(struct lmn_encoder *e, mtl_argument_table *table, uint32_t stages)
    e->tables[e->table_count].table = t;
    e->tables[e->table_count].stages = stages;
    e->table_count++;
+   lmn_cb_ref(e->cb, t);
    flush_table(e->cb, t);
    struct lmn_set_argument_table c = {.table = t->base.handle, .stages = stages};
    emit(e, LMN_OP_SET_ARGUMENT_TABLE, &c, sizeof(c));
@@ -186,6 +187,7 @@ static void
 fence_op(void *encoder, mtl_fence *fence, enum mtl_stages stages, bool wait)
 {
    struct lmn_obj *f = lmn_cast(fence, LMN_KIND_FENCE, __func__);
+   lmn_cb_ref(E(encoder)->cb, f);
    struct lmn_fence_op c = {.fence = f->handle, .stages = stages, .wait = wait};
    emit(E(encoder), LMN_OP_FENCE, &c, sizeof(c));
 }
@@ -247,6 +249,14 @@ texture_handle(mtl_texture *texture)
    return LMN_CAST(lmn_texture, texture, LMN_KIND_TEXTURE)->base.handle;
 }
 
+/* The handle of a texture the stream names, held by the command buffer. */
+static uint32_t
+texture_ref(struct lmn_encoder *e, mtl_texture *texture)
+{
+   lmn_cb_ref(e->cb, texture);
+   return texture_handle(texture);
+}
+
 void
 mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder, mtl_buffer *src_buf,
                                size_t src_offset, mtl_buffer *dst_buf, size_t dst_offset,
@@ -265,7 +275,7 @@ copy_buffer_texture(mtl_compute_encoder *encoder, struct mtl_buffer_image_copy *
                     bool to_texture)
 {
    struct lmn_copy_buffer_texture c = {
-      .texture = texture_handle(d->image),
+      .texture = texture_ref(E(encoder), d->image),
       .to_texture = to_texture,
       .level = (uint32_t)d->image_level,
       .slice = (uint32_t)d->image_slice,
@@ -300,10 +310,10 @@ mtl_copy_from_texture_to_texture(mtl_compute_encoder *encoder, mtl_texture *src_
                                  size_t dst_slice, size_t dst_level, struct mtl_origin dst_origin)
 {
    struct lmn_copy_texture c = {
-      .src = texture_handle(src_tex_handle),
+      .src = texture_ref(E(encoder), src_tex_handle),
       .src_slice = (uint32_t)src_slice,
       .src_level = (uint32_t)src_level,
-      .dst = texture_handle(dst_tex_handle),
+      .dst = texture_ref(E(encoder), dst_tex_handle),
       .dst_slice = (uint32_t)dst_slice,
       .dst_level = (uint32_t)dst_level,
       .src_origin = {(uint32_t)src_origin.x, (uint32_t)src_origin.y, (uint32_t)src_origin.z},
@@ -318,6 +328,7 @@ mtl_compute_set_pipeline_state(mtl_compute_encoder *encoder,
                                mtl_compute_pipeline_state *state_handle)
 {
    struct lmn_obj *p = lmn_cast(state_handle, LMN_KIND_COMPUTE_PIPELINE, __func__);
+   lmn_cb_ref(E(encoder)->cb, p);
    struct lmn_set_compute_pipeline c = {.handle = p->handle};
    emit(E(encoder), LMN_OP_SET_COMPUTE_PIPELINE, &c, sizeof(c));
 }
@@ -370,6 +381,8 @@ mtl_compute_write_timestamp(mtl_compute_encoder *encoder, mtl_counter_heap *heap
 struct lmn_rp_attachment {
    uint32_t kind;
    struct lmn_render_attachment *a;
+   /* What a.texture and a.resolve_texture name, for the command buffer to hold. */
+   void *texture, *resolve;
 };
 
 struct lmn_render_pass_desc {
@@ -441,6 +454,7 @@ mtl_render_pass_attachment_descriptor_set_texture(mtl_render_pass_attachment_des
                                                   mtl_texture *texture)
 {
    A(d)->texture = texture ? texture_handle(texture) : 0;
+   ((struct lmn_rp_attachment *)d)->texture = texture;
 }
 
 void
@@ -511,6 +525,7 @@ mtl_render_pass_attachment_descriptor_set_resolve_texture(
    mtl_render_pass_attachment_descriptor *d, mtl_texture *resolve_texture)
 {
    A(d)->resolve_texture = resolve_texture ? texture_handle(resolve_texture) : 0;
+   ((struct lmn_rp_attachment *)d)->resolve = resolve_texture;
 }
 
 void
@@ -590,9 +605,19 @@ mtl_render_encoder *
 mtl_new_render_command_encoder_with_descriptor(mtl_command_buffer *command_buffer,
                                                mtl_render_pass_descriptor *descriptor)
 {
+   struct lmn_render_pass_desc *rp = RP(descriptor);
    struct lmn_encoder *e = encoder_new(command_buffer, true);
-   if (e)
-      emit(e, LMN_OP_BEGIN_RENDER_PASS, &RP(descriptor)->p, sizeof(RP(descriptor)->p));
+   if (!e)
+      return NULL;
+   for (unsigned i = 0; i < LMN_MAX_COLOR_ATTACHMENTS; i++) {
+      lmn_cb_ref(e->cb, rp->colors[i].texture);
+      lmn_cb_ref(e->cb, rp->colors[i].resolve);
+   }
+   lmn_cb_ref(e->cb, rp->depth.texture);
+   lmn_cb_ref(e->cb, rp->depth.resolve);
+   lmn_cb_ref(e->cb, rp->stencil.texture);
+   lmn_cb_ref(e->cb, rp->stencil.resolve);
+   emit(e, LMN_OP_BEGIN_RENDER_PASS, &rp->p, sizeof(rp->p));
    return e;
 }
 
@@ -639,6 +664,7 @@ void
 mtl_render_set_pipeline_state(mtl_render_encoder *encoder, mtl_render_pipeline_state *pipeline)
 {
    struct lmn_obj *p = lmn_cast(pipeline, LMN_KIND_RENDER_PIPELINE, __func__);
+   lmn_cb_ref(E(encoder)->cb, p);
    struct lmn_set_render_pipeline c = {.handle = p->handle};
    emit(E(encoder), LMN_OP_SET_RENDER_PIPELINE, &c, sizeof(c));
 }
@@ -646,9 +672,9 @@ mtl_render_set_pipeline_state(mtl_render_encoder *encoder, mtl_render_pipeline_s
 void
 mtl_set_depth_stencil_state(mtl_render_encoder *encoder, mtl_depth_stencil_state *state)
 {
-   struct lmn_set_depth_stencil c = {
-      .handle = state ? lmn_cast(state, LMN_KIND_DEPTH_STENCIL, __func__)->handle : 0,
-   };
+   struct lmn_obj *ds = state ? lmn_cast(state, LMN_KIND_DEPTH_STENCIL, __func__) : NULL;
+   lmn_cb_ref(E(encoder)->cb, ds);
+   struct lmn_set_depth_stencil c = {.handle = ds ? ds->handle : 0};
    emit(E(encoder), LMN_OP_SET_DEPTH_STENCIL, &c, sizeof(c));
 }
 
