@@ -892,9 +892,19 @@ mtl_sampler_get_gpu_resource_id(mtl_sampler *sampler)
 
 /* -- sync objects -- */
 
+/* How many queue signals of one event are remembered; a forgotten one only makes a later
+ * export wait for a later commit. */
+#define LMN_EVENT_SIGNALS 16
+
 struct lmn_shared_event {
    struct lmn_obj base;
    struct lmn_slot mirror;
+   /* Queue signals not reached yet, in push order: value and the commit they follow. Under
+    * `dev->lock`. */
+   struct {
+      uint64_t value, seqno;
+   } signals[LMN_EVENT_SIGNALS];
+   unsigned signal_count;
 };
 
 static mtl_fence *
@@ -991,6 +1001,53 @@ mtl_shared_event_wait_until_signaled_value(mtl_shared_event *event_handle, uint6
       }
       lmn_backoff(round);
    }
+}
+
+void
+lmn_shared_event_note_signal(void *event, uint64_t value, uint64_t seqno)
+{
+   struct lmn_shared_event *e = event;
+   uint64_t reached = __atomic_load_n(mirror(e), __ATOMIC_ACQUIRE);
+   unsigned n = 0;
+   for (unsigned i = 0; i < e->signal_count; i++) {
+      if (e->signals[i].value > reached)
+         e->signals[n++] = e->signals[i];
+   }
+   if (n == LMN_EVENT_SIGNALS) {
+      memmove(&e->signals[0], &e->signals[1], sizeof(e->signals[0]) * (n - 1));
+      n--;
+   }
+   e->signals[n].value = value;
+   e->signals[n].seqno = seqno;
+   e->signal_count = n + 1;
+}
+
+int
+mtl_shared_event_export_sync_file(mtl_shared_event *event_handle, uint64_t value)
+{
+   struct lmn_shared_event *e = LMN_CAST(lmn_shared_event, event_handle, LMN_KIND_SHARED_EVENT);
+   struct lmn_device *dev = e->base.dev;
+   bool known = false;
+   uint64_t seqno = 0;
+   pthread_mutex_lock(&dev->lock);
+   if (__atomic_load_n(mirror(e), __ATOMIC_ACQUIRE) >= value) {
+      known = true;
+   } else {
+      for (unsigned i = 0; i < e->signal_count && !known; i++) {
+         if (e->signals[i].value >= value) {
+            seqno = e->signals[i].seqno;
+            known = true;
+         }
+      }
+   }
+   pthread_mutex_unlock(&dev->lock);
+   if (!known)
+      return -1;
+   /* Seqno 0 is complete from the start: an already reached value gets a signaled fence. */
+   struct drm_virtgpu_limina_fence f = {.seqno = seqno, .flags = VIRTGPU_LIMINA_FENCE_FD};
+   if (ioctl(dev->fd, DRM_IOCTL_VIRTGPU_LIMINA_FENCE, &f) != 0)
+      return -1;
+   return f.fence_fd;
 }
 
 uint64_t
