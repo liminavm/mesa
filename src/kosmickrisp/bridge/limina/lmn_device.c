@@ -594,18 +594,10 @@ mtl_device_timestamp_frequency(mtl_device *dev)
    return D(dev)->info.timestamp_frequency;
 }
 
-/* The transport carries no counter heaps: the device advertises no timestamps, and a pool an app
- * makes anyway is refused rather than aborting it. */
 bool
 mtl_device_supports_timestamps(mtl_device *dev)
 {
-   return false;
-}
-
-mtl_counter_heap *
-mtl_new_timestamp_counter_heap(mtl_device *dev, uint32_t count)
-{
-   return NULL;
+   return true;
 }
 
 bool
