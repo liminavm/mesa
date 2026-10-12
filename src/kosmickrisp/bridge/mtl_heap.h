@@ -28,6 +28,11 @@ mtl_texture *mtl_new_texture_with_descriptor(
    mtl_heap *heap, const struct kk_image_layout *layout, uint64_t offset);
 
 void mtl_heap_set_label(mtl_heap *heap, const char *label);
+
+/* Maps the first `size_B` bytes of a heap's memory at `addr` (anywhere when NULL) and returns the
+ * mapping, or NULL. Only for bridges whose heap memory is a file the process can map again: the
+ * Metal bridge remaps Metal's own mapping in kk_bo.c instead. */
+void *mtl_heap_map_at(mtl_heap *heap, void *addr, uint64_t size_B);
 void mtl_resource_set_label(mtl_resource *resource, const char *label);
 
 #endif /* MTL_HEAP_H */
