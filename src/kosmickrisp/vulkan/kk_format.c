@@ -400,10 +400,12 @@ VkFormatFeatureFlags2
 kk_get_drm_format_modifier_features(struct kk_physical_device *pdevice,
                                     VkFormat vk_format)
 {
-   /* A 4:2:0 picture shared plane by plane (a video decoder's output) is the one multi-plane
-    * shape another driver hands us, and only as one surface per plane (limina bridge). */
+   /* A 4:2:0 picture shared plane by plane (a video decoder's output: NV12, or I420 as ffmpeg's
+    * VA frames come) is the one multi-plane shape another driver hands us, and only as one
+    * surface per plane (limina bridge). */
    if (vk_format_get_plane_count(vk_format) != 1 &&
-       !(pdevice->shareable_textures && vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM))
+       !(pdevice->shareable_textures && (vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
+                                         vk_format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM)))
       return 0;
    if (vk_format_is_compressed(vk_format))
       return 0;
