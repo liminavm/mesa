@@ -77,6 +77,12 @@ mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout
    return NULL;
 }
 
+bool
+mtl_fd_is_surface(mtl_device *device, int fd)
+{
+   return false;
+}
+
 int
 mtl_heap_export_fd(mtl_heap *heap)
 {
