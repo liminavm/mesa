@@ -237,7 +237,8 @@ static struct lmn_buf_ref
 buf_ref(mtl_buffer *buffer, uint64_t offset)
 {
    struct lmn_buffer *b = LMN_CAST(lmn_buffer, buffer, LMN_KIND_BUFFER);
-   return (struct lmn_buf_ref){.arena = b->heap->arena, .offset = b->offset + offset};
+   return (struct lmn_buf_ref){.arena = b->heap->arena,
+                               .offset = b->heap->offset + b->offset + offset};
 }
 
 static uint32_t
