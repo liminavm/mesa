@@ -573,6 +573,12 @@ shareable_fourcc(enum mtl_pixel_format format)
    }
 }
 
+bool
+mtl_pixel_format_is_shareable(enum mtl_pixel_format format)
+{
+   return shareable_fourcc(format) != 0;
+}
+
 mtl_texture *
 mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout)
 {
