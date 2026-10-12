@@ -80,6 +80,8 @@ struct kk_physical_device {
 
    /* The bridge makes textures over surfaces other drivers read (limina). */
    bool shareable_textures;
+   /* With shareable_textures: the memory type a dma-buf import gets, device-local only. */
+   uint8_t import_mem_type;
 };
 
 static inline uint32_t

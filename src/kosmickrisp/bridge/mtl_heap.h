@@ -10,6 +10,7 @@
 #include "mtl_types.h"
 
 #include <inttypes.h>
+#include <stdbool.h>
 
 /* TODO_KOSMICKRISP We should move this struct to the bridge side. */
 struct kk_image_layout;
@@ -55,6 +56,9 @@ int mtl_texture_export_fd(mtl_texture *texture);
 mtl_texture *mtl_new_texture_from_fd(mtl_device *device, int fd,
                                      const struct kk_image_layout *const *layouts,
                                      uint32_t layout_count);
+/* Whether dma-buf `fd` names a surface -- pixels the host holds, which this guest's CPU cannot map
+ * -- rather than a heap. The fd stays the caller's. */
+bool mtl_fd_is_surface(mtl_device *device, int fd);
 void mtl_resource_set_label(mtl_resource *resource, const char *label);
 
 #endif /* MTL_HEAP_H */
