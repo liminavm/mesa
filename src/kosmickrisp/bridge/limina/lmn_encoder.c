@@ -26,6 +26,8 @@ struct lmn_encoder {
    struct lmn_obj base;
    struct lmn_command_buffer *cb;
    bool render;
+   /* A timestamp was written: the encoder updates the timestamp fence as it ends. */
+   bool stamped;
    struct {
       struct lmn_argument_table *table;
       uint32_t stages;
@@ -119,10 +121,45 @@ encoder_new(mtl_command_buffer *command_buffer, bool render)
 
 /* -- every encoder -- */
 
+/* The device's timestamp fence, waited on (`wait`) or updated by `e` at every stage. */
+static void
+ts_fence_op(struct lmn_encoder *e, bool wait)
+{
+   struct lmn_fence_op c = {
+      .fence = atomic_load(&e->base.dev->ts_fence)->handle,
+      .stages = MTL_STAGE_ALL,
+      .wait = wait,
+   };
+   emit(e, LMN_OP_FENCE, &c, sizeof(c));
+}
+
+/* After an encoder's BEGIN: one that follows a resolve reads after it. */
+static void
+encoder_begun(struct lmn_encoder *e)
+{
+   if (e->cb->resolved)
+      ts_fence_op(e, true);
+   e->cb->resolved = false;
+}
+
 void
 mtl_end_encoding(void *encoder)
 {
-   emit(E(encoder), LMN_OP_END_ENCODING, NULL, 0);
+   struct lmn_encoder *e = E(encoder);
+   if (e->stamped)
+      ts_fence_op(e, false);
+   emit(e, LMN_OP_END_ENCODING, NULL, 0);
+}
+
+static void
+write_timestamp(struct lmn_encoder *e, uint32_t stage, mtl_counter_heap *heap, uint32_t index)
+{
+   struct lmn_obj *h = lmn_cast(heap, LMN_KIND_COUNTER_HEAP, __func__);
+   lmn_cb_ref(e->cb, h);
+   /* Relaxed, as the Metal bridge asks. */
+   struct lmn_write_timestamp c = {.heap = h->handle, .index = index, .stage = stage};
+   emit(e, LMN_OP_WRITE_TIMESTAMP, &c, sizeof(c));
+   e->stamped = true;
 }
 
 void
@@ -230,8 +267,10 @@ mtl_compute_encoder *
 mtl_new_compute_command_encoder(mtl_command_buffer *cmd_buffer)
 {
    struct lmn_encoder *e = encoder_new(cmd_buffer, false);
-   if (e)
+   if (e) {
       emit(e, LMN_OP_BEGIN_COMPUTE, NULL, 0);
+      encoder_begun(e);
+   }
    return e;
 }
 
@@ -373,7 +412,7 @@ mtl_dispatch_threadgroups_with_indirect_buffer(mtl_compute_encoder *encoder, uin
 void
 mtl_compute_write_timestamp(mtl_compute_encoder *encoder, mtl_counter_heap *heap, uint32_t index)
 {
-   LMN_UNIMPLEMENTED();
+   write_timestamp(E(encoder), 0, heap, index);
 }
 
 /* -- render pass descriptors -- */
@@ -618,6 +657,7 @@ mtl_new_render_command_encoder_with_descriptor(mtl_command_buffer *command_buffe
    lmn_cb_ref(e->cb, rp->stencil.texture);
    lmn_cb_ref(e->cb, rp->stencil.resolve);
    emit(e, LMN_OP_BEGIN_RENDER_PASS, &rp->p, sizeof(rp->p));
+   encoder_begun(e);
    return e;
 }
 
@@ -818,7 +858,7 @@ void
 mtl_render_write_timestamp(mtl_render_encoder *encoder, enum mtl_render_stages stage,
                            mtl_counter_heap *heap, uint32_t index)
 {
-   LMN_UNIMPLEMENTED();
+   write_timestamp(E(encoder), stage, heap, index);
 }
 
 void
