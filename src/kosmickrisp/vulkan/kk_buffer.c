@@ -133,6 +133,12 @@ kk_GetPhysicalDeviceExternalBufferProperties(
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT:
       pExternalBufferProperties->externalMemoryProperties = kk_host_mem_props;
       return;
+#if !DETECT_OS_APPLE
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+      pExternalBufferProperties->externalMemoryProperties = kk_fd_mem_props;
+      return;
+#endif
    default:
       goto unsupported;
    }
