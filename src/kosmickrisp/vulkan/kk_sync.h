@@ -25,6 +25,7 @@ extern const struct vk_sync_type kk_sync_type;
 /* The binary semaphores' sync_file export: a kernel fence for the commit the signal follows,
  * where the generic one waits on the CPU. */
 VkResult kk_binary_export_sync_file(struct vk_device *device, struct vk_sync *sync, int *pFd);
+VkResult kk_binary_import_sync_file(struct vk_device *device, struct vk_sync *sync, int fd);
 #endif
 
 #endif
