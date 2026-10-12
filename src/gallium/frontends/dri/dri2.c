@@ -913,6 +913,13 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
       case 0x52474241: /* 'RGBA' */
          pf = PIPE_FORMAT_R8G8B8A8_UNORM;
          break;
+      /* One plane of a picture a guest's video decoder shares plane by plane. */
+      case 0x4c303038: /* 'L008' */
+         pf = PIPE_FORMAT_R8_UNORM;
+         break;
+      case 0x32433038: /* '2C08' */
+         pf = PIPE_FORMAT_R8G8_UNORM;
+         break;
       default:
          mesa_loge("dri2_from_iosurface_limina: unhandled IOSurface pixel format "
                    "0x%08x", osfmt);
@@ -960,6 +967,24 @@ dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
    img->in_fence_fd = -1;
    img->loader_private = loaderPrivate;
    img->screen = screen;
+   /* A texture over an image with no internal format is typed RGB or RGBA, which GLES will not
+    * upload one or two channels into: name the sized format a one- or two-channel plane is. */
+   switch (pf) {
+   case PIPE_FORMAT_R8_UNORM:
+      img->internal_format = GL_R8;
+      break;
+   case PIPE_FORMAT_R8G8_UNORM:
+      img->internal_format = GL_RG8;
+      break;
+   case PIPE_FORMAT_R16_UNORM:
+      img->internal_format = GL_R16;
+      break;
+   case PIPE_FORMAT_R16G16_UNORM:
+      img->internal_format = GL_RG16;
+      break;
+   default:
+      break;
+   }
 
    return img;
 }
