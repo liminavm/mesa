@@ -23,6 +23,10 @@ int mtl_shared_event_wait_until_signaled_value(mtl_shared_event *event_handle,
                                                uint64_t value,
                                                uint64_t timeout_ms);
 uint64_t mtl_shared_event_get_signaled_value(mtl_shared_event *event_handle);
+/* A sync_file that signals once the event reaches `value`, or -1 when the bridge cannot make one
+ * (the caller then waits on the CPU). Only bridges on a DRM device make them; the Metal bridge
+ * does not define this. */
+int mtl_shared_event_export_sync_file(mtl_shared_event *event_handle, uint64_t value);
 void mtl_shared_event_set_signaled_value(mtl_shared_event *event_handle,
                                          uint64_t value);
 
