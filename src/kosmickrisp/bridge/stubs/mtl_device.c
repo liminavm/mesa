@@ -42,6 +42,12 @@ mtl_device_get_gpu_apple_family(mtl_device *dev)
 }
 
 bool
+mtl_pixel_format_is_shareable(enum mtl_pixel_format format)
+{
+   return false;
+}
+
+bool
 mtl_device_supports_shareable_textures(mtl_device *dev)
 {
    return false;

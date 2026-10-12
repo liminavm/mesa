@@ -10,9 +10,11 @@
 #include "kk_device.h"
 #include "kk_dispatch_trampolines.h"
 #include "kk_entrypoints.h"
+#include "kk_format.h"
 #include "kk_image.h"
 #include "kk_instance.h"
 #include "wsi_common.h"
+#include "vk_format.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
@@ -47,6 +49,16 @@ kk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
    VK_FROM_HANDLE(kk_physical_device, pdev, physicalDevice);
    return kk_instance_get_proc_addr_unchecked(pdev->vk.instance, pName);
 }
+
+#if !DETECT_OS_APPLE
+/* Only formats a host surface takes reach the compositor's driver. */
+static bool
+kk_wsi_can_share_format(VkPhysicalDevice physicalDevice, VkFormat format)
+{
+   const struct kk_va_format *va = kk_get_va_format(vk_format_to_pipe_format(format));
+   return va && mtl_pixel_format_is_shareable(va->mtl_pixel_format);
+}
+#endif
 
 static VkResult
 kk_bind_drawable_to_vkimage(VkImage vk_image, void *drawable)
@@ -135,6 +147,9 @@ kk_init_wsi(struct kk_physical_device *pdev)
       return result;
 
    wsi->metal.bind_drawable_to_vkimage = kk_bind_drawable_to_vkimage;
+#if !DETECT_OS_APPLE
+   wsi->can_share_format = kk_wsi_can_share_format;
+#endif
    wsi->metal.encode_drawable_present = kk_encode_drawable_present;
    wsi->metal.cmd_blit_image = kk_wsi_cmd_blit_image;
    wsi->metal.get_mtl4_command_queue = kk_get_mtl4_command_queue;
