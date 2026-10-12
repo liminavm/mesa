@@ -162,15 +162,21 @@ libkk = static_library(
   gnu_symbol_visibility : 'hidden',
 )
 
-# Happens with macOS ld linker:
-# "-Wl,-undefined,dynamic_lookup" required, otherwise, linker will complain about undefined symbols
-libvulkan_kosmickrisp = shared_library(
-  'vulkan_kosmickrisp',
-  link_whole: [libkk],
+kk_link_args = [ld_args_build_id]
+if host_machine.system() == 'darwin'
+  # Happens with macOS ld linker:
+  # "-Wl,-undefined,dynamic_lookup" required, otherwise, linker will complain about undefined
+  # symbols.
   # limina: IOSurface for the IOSurfaceRef import path (mtl_device.m); explicit
   # because -undefined,dynamic_lookup would otherwise defer a missing framework
   # to runtime.
-  link_args: [ld_args_build_id, '-Wl,-undefined,dynamic_lookup', '-Wl,-framework,IOSurface'],
+  kk_link_args += ['-Wl,-undefined,dynamic_lookup', '-Wl,-framework,IOSurface']
+endif
+
+libvulkan_kosmickrisp = shared_library(
+  'vulkan_kosmickrisp',
+  link_whole: [libkk],
+  link_args: kk_link_args,
   gnu_symbol_visibility : 'hidden',
   install : true,
 )

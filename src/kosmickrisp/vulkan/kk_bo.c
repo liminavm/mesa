@@ -22,6 +22,8 @@
 #if DETECT_OS_APPLE
 #include <mach/mach_init.h>
 #include <mach/mach_vm.h>
+#else
+#include <sys/mman.h>
 #endif /* DETECT_OS_APPLE */
 
 /* limina: BO census — LIMINA_KK_BOCENSUS=<secs>, 0/unset = off.
@@ -318,6 +320,12 @@ kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr)
                        "mach_vm_remap failed: %d", ret);
 
    *addr = (void *)dst_addr;
+#else
+   /* A second mapping of the heap's memory, for the same reason. */
+   void *map = mtl_heap_map_at(bo->mtl_handle, *addr, bo->size_B);
+   if (!map)
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "mapping a heap failed");
+   *addr = map;
 #endif /* DETECT_OS_APPLE */
 
    return VK_SUCCESS;
@@ -341,6 +349,16 @@ kk_bo_unmap(struct kk_device *dev, struct kk_bo *bo, void *addr, bool reserved)
       /* According to spec, we can only return a fail code here if the reserve
        * flag is set, so ignore the result */
       mach_vm_deallocate(mach_task_self(), unmap_addr, bo->size_B);
+   }
+#else
+   if (reserved) {
+      /* Replace with an inaccessible reservation. */
+      void *r = mmap(addr, bo->size_B, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+      if (r == MAP_FAILED)
+         return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "reserving %p failed", addr);
+   } else {
+      munmap(addr, bo->size_B);
    }
 #endif /* DETECT_OS_APPLE */
 
