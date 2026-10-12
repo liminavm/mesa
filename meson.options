@@ -924,3 +924,12 @@ option(
   value : true,
   description : 'Build panfrost disassemblers. Explicitly setting this option to false will cause the panfrost stack to build without disassemblers. This should be left enabled for distro builds.'
 )
+
+option(
+  'kosmickrisp-bridge',
+  type : 'combo',
+  value : 'auto',
+  choices : ['auto', 'metal', 'stubs', 'limina'],
+  description : 'What KosmicKrisp\'s mtl_* bridge calls: Metal itself (auto on macOS), ' +
+                'nothing (auto elsewhere), or the Metal-level GPU protocol of a limina guest.'
+)

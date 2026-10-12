@@ -45,3 +45,9 @@ void
 mtl_resource_set_label(mtl_resource *resource, const char *label)
 {
 }
+
+void *
+mtl_heap_map_at(mtl_heap *heap, void *addr, uint64_t size_B)
+{
+   return NULL;
+}
