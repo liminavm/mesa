@@ -33,6 +33,15 @@ void mtl_heap_set_label(mtl_heap *heap, const char *label);
  * mapping, or NULL. Only for bridges whose heap memory is a file the process can map again: the
  * Metal bridge remaps Metal's own mapping in kk_bo.c instead. */
 void *mtl_heap_map_at(mtl_heap *heap, void *addr, uint64_t size_B);
+
+/* Heaps other processes share as dma-bufs. Only for bridges on a DRM device; the Metal bridge
+ * does not define them. */
+/* A heap of exactly `size` bytes (rounded up by the device) that can be exported. */
+mtl_heap *mtl_new_heap_exportable(mtl_device *device, uint64_t size);
+/* A new dma-buf fd for an exportable or imported heap, or -1. */
+int mtl_heap_export_fd(mtl_heap *heap);
+/* The heap another heap exported as dma-buf `fd`, or NULL. The fd stays the caller's. */
+mtl_heap *mtl_new_heap_from_fd(mtl_device *device, int fd);
 void mtl_resource_set_label(mtl_resource *resource, const char *label);
 
 #endif /* MTL_HEAP_H */

@@ -23,6 +23,7 @@
 
 #include <inttypes.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* Supports mtlheap only */
 const VkExternalMemoryProperties kk_mtlheap_mem_props = {
@@ -52,6 +53,14 @@ const VkExternalMemoryProperties kk_host_mem_props = {
    .compatibleHandleTypes =
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT,
+};
+
+/* Linux: a bridge heap shared through DRM, as a dma-buf. */
+const VkExternalMemoryProperties kk_fd_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes = KK_FD_HANDLE_TYPES,
+   .compatibleHandleTypes = KK_FD_HANDLE_TYPES,
 };
 
 #ifdef VK_USE_PLATFORM_METAL_EXT
@@ -128,6 +137,40 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    bool import_metal = metal_info && metal_info->handleType;
    bool import_host = host_info && host_info->handleType;
+
+#if !DETECT_OS_APPLE
+   /* Shared memory is a heap of its own, never suballocated. */
+   const VkImportMemoryFdInfoKHR *fd_info =
+      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+   const VkExportMemoryAllocateInfo *export_info =
+      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
+   if (fd_info && fd_info->handleType) {
+      if (!(fd_info->handleType & KK_FD_HANDLE_TYPES)) {
+         result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+         goto fail_alloc;
+      }
+      result = kk_import_bo_fd(dev, &dev->vk.base, fd_info->fd, &mem->bo);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
+      if (mem->bo->size_B < pAllocateInfo->allocationSize) {
+         kk_destroy_bo(dev, mem->bo);
+         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "dma-buf smaller than the allocation");
+         goto fail_alloc;
+      }
+      /* A successful import owns the fd. */
+      close(fd_info->fd);
+      *pMem = kk_device_memory_to_handle(mem);
+      return VK_SUCCESS;
+   }
+   if (export_info && (export_info->handleTypes & KK_FD_HANDLE_TYPES)) {
+      result = kk_alloc_bo_exportable(dev, &dev->vk.base, aligned_size, &mem->bo);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
+      *pMem = kk_device_memory_to_handle(mem);
+      return VK_SUCCESS;
+   }
+#endif
 
    if (import_metal || import_host) {
       /* limina: metal_info is NULL on a host-pointer-only import — don't deref it. */
@@ -437,6 +480,36 @@ kk_GetMemoryMetalHandleEXT(
    return VK_SUCCESS;
 }
 #endif /* VK_USE_PLATFORM_METAL_EXT */
+
+#if !DETECT_OS_APPLE
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   VK_FROM_HANDLE(kk_device, dev, device);
+   VK_FROM_HANDLE(kk_device_memory, mem, pGetFdInfo->memory);
+
+   if (!(pGetFdInfo->handleType & KK_FD_HANDLE_TYPES) || !mem->bo->mtl_handle)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   int fd = mtl_heap_export_fd(mem->bo->mtl_handle);
+   if (fd < 0)
+      return vk_error(dev, VK_ERROR_TOO_MANY_OBJECTS);
+   *pFd = fd;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+                            int fd, VkMemoryFdPropertiesKHR *pMemoryFdProperties)
+{
+   VK_FROM_HANDLE(kk_device, dev, device);
+   struct kk_physical_device *pdev = kk_device_physical(dev);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   pMemoryFdProperties->memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count);
+   return VK_SUCCESS;
+}
+#endif /* !DETECT_OS_APPLE */
 
 VKAPI_ATTR uint64_t VKAPI_CALL
 kk_GetDeviceMemoryOpaqueCaptureAddress(
