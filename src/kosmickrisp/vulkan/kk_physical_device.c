@@ -688,7 +688,7 @@ kk_get_device_properties(
       .sampledImageStencilSampleCounts = sample_counts,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
-      .timestampComputeAndGraphics = true,
+      .timestampComputeAndGraphics = pdev->timestamps,
       .timestampPeriod = timestamp_period,
       .maxClipDistances = 8,
       .maxCullDistances = 8,
@@ -1183,6 +1183,11 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    }
 
    pdev->mtl_dev_handle = mtl_device_create();
+#if DETECT_OS_APPLE
+   pdev->timestamps = true;
+#else
+   pdev->timestamps = pdev->mtl_dev_handle && mtl_device_supports_timestamps(pdev->mtl_dev_handle);
+#endif
    if (!pdev->mtl_dev_handle) {
       result = VK_SUCCESS;
       goto fail_alloc;
@@ -1410,7 +1415,7 @@ kk_GetPhysicalDeviceQueueFamilyProperties2(
       {
          p->queueFamilyProperties.queueFlags = queue_family->queue_flags;
          p->queueFamilyProperties.queueCount = queue_family->queue_count;
-         p->queueFamilyProperties.timestampValidBits = 64;
+         p->queueFamilyProperties.timestampValidBits = pdev->timestamps ? 64 : 0;
          p->queueFamilyProperties.minImageTransferGranularity =
             (VkExtent3D){1, 1, 1};
 
