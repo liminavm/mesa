@@ -1175,6 +1175,37 @@ mtl_new_event(mtl_device *device)
    return sync_create(device, LMN_KIND_EVENT, LMN_SYNC_EVENT);
 }
 
+mtl_counter_heap *
+mtl_new_timestamp_counter_heap(mtl_device *device, uint32_t count)
+{
+   struct lmn_device *dev = LMN_CAST(lmn_device, device, LMN_KIND_DEVICE);
+   if (!atomic_load(&dev->ts_fence)) {
+      struct lmn_obj *fence = sync_create(device, LMN_KIND_FENCE, LMN_SYNC_FENCE);
+      struct lmn_obj *none = NULL;
+      if (fence && !atomic_compare_exchange_strong(&dev->ts_fence, &none, fence))
+         mtl_release(fence);
+      if (!atomic_load(&dev->ts_fence))
+         return NULL;
+   }
+   struct lmn_obj *h = lmn_obj_new(dev, LMN_KIND_COUNTER_HEAP, sizeof(*h), lmn_destroy_host_object);
+   struct lmn_slot slot;
+   if (!h)
+      return NULL;
+   if (!lmn_slot_alloc(dev, &slot)) {
+      free(h);
+      return NULL;
+   }
+   h->handle = lmn_new_handle(dev);
+   struct lmn_create_counter_heap c = {.handle = h->handle, .count = count, .reply = slot.ref};
+   struct lmn_iov iov = {&c, sizeof(c)};
+   uint64_t unused;
+   if (!create_with_id(dev, LMN_OP_CREATE_COUNTER_HEAP, &iov, 1, &slot, &unused, "counter heap")) {
+      free(h);
+      return NULL;
+   }
+   return h;
+}
+
 static void
 shared_event_destroy(struct lmn_obj *obj)
 {
