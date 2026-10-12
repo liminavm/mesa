@@ -33,6 +33,8 @@ uint64_t mtl_device_get_registry_id(mtl_device *dev);
 bool mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor);
 /* Whether mtl_new_texture_shareable can succeed. Only for bridges on a DRM device. */
 bool mtl_device_supports_shareable_textures(mtl_device *dev);
+/* Whether mtl_new_timestamp_counter_heap can succeed. Only for bridges on a DRM device. */
+bool mtl_device_supports_timestamps(mtl_device *dev);
 /* Whether mtl_new_texture_shareable takes `format`. */
 bool mtl_pixel_format_is_shareable(enum mtl_pixel_format format);
 bool mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count);
