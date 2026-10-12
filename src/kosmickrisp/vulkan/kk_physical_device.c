@@ -1261,6 +1261,9 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
 
    pdev->sync_binary_type = vk_sync_binary_get_type(&kk_sync_type);
+#if !DETECT_OS_APPLE
+   pdev->sync_binary_type.sync.export_sync_file = kk_binary_export_sync_file;
+#endif
    unsigned st_idx = 0;
    pdev->sync_types[st_idx++] = &kk_sync_type;
    pdev->sync_types[st_idx++] = &pdev->sync_binary_type.sync;
