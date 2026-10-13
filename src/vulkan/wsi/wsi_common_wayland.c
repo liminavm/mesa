@@ -59,6 +59,7 @@
 #include <util/u_dynarray.h>
 #include <util/anon_file.h>
 #include <util/os_time.h>
+#include <util/stack_array.h>
 
 #include <loader/loader_wayland_helper.h>
 
@@ -2312,10 +2313,43 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    vk_free2(&instance->alloc, pAllocator, wsi_wl_surface);
 }
 
+/* Whether the driver can allocate vk_format with any of the modifiers in f. */
+static bool
+format_has_driver_modifier(struct wsi_device *wsi_device, VkFormat vk_format,
+                           struct wsi_wl_format *f)
+{
+   VkDrmFormatModifierPropertiesListEXT list = {
+      .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+   };
+   VkFormatProperties2 format_props = {
+      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+      .pNext = &list,
+   };
+   wsi_device->GetPhysicalDeviceFormatProperties2(wsi_device->pdevice, vk_format,
+                                                  &format_props);
+   if (list.drmFormatModifierCount == 0)
+      return false;
+
+   STACK_ARRAY(VkDrmFormatModifierPropertiesEXT, props, list.drmFormatModifierCount);
+   list.pDrmFormatModifierProperties = props;
+   wsi_device->GetPhysicalDeviceFormatProperties2(wsi_device->pdevice, vk_format,
+                                                  &format_props);
+
+   bool found = false;
+   uint64_t *modifier;
+   u_vector_foreach(modifier, &f->modifiers) {
+      for (uint32_t i = 0; i < list.drmFormatModifierCount && !found; i++)
+         found = props[i].drmFormatModifier == *modifier;
+   }
+   STACK_ARRAY_FINISH(props);
+   return found;
+}
+
 static struct wsi_wl_format *
 pick_format_from_surface_dmabuf_feedback(struct wsi_wl_surface *wsi_wl_surface,
                                          VkFormat vk_format)
 {
+   struct wsi_device *wsi_device = wsi_wl_surface->display->wsi_wl->wsi;
    struct wsi_wl_format *f = NULL;
 
    /* If the main_device was not advertised, we don't have valid feedback */
@@ -2325,6 +2359,12 @@ pick_format_from_surface_dmabuf_feedback(struct wsi_wl_surface *wsi_wl_surface,
    util_dynarray_foreach(&wsi_wl_surface->dmabuf_feedback.tranches,
                          struct dmabuf_feedback_tranche, tranche) {
       f = find_format(&tranche->formats, vk_format);
+      /* A tranche offering only modifiers we cannot allocate, such as a scanout tranche of
+       * DRM_FORMAT_MOD_INVALID alone, would leave the image without a modifier: skip to the next
+       * one rather than fall back to an implicit layout the compositor may refuse. */
+      if (f && wsi_device->supports_modifiers &&
+          !format_has_driver_modifier(wsi_device, vk_format, f))
+         f = NULL;
       if (f)
          break;
    }
