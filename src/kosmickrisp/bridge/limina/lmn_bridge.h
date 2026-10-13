@@ -218,7 +218,10 @@ struct lmn_device {
    /* The largest placement alignment the host has reported for a texture. */
    _Atomic uint64_t max_texture_align;
 
-   /* Staging for texture <-> host-pointer transfers, under `lock`. */
+   /* Staging for texture <-> host-pointer transfers. `staging_lock` is held for a whole transfer:
+    * the heap is one range every transfer copies through, and replacing it releases an arena,
+    * which takes `lock`. */
+   pthread_mutex_t staging_lock;
    struct lmn_heap *staging;
 
    /* Commits waiting for their feedback; see lmn_queue.c. */
