@@ -215,10 +215,21 @@ queue_event(mtl_command_queue *queue, mtl_event *event, uint64_t value, bool wai
    struct lmn_device *dev = q->dev;
    pthread_mutex_lock(&dev->lock);
    if (lmn_push_locked(dev, LMN_OP_QUEUE_EVENT, &(struct lmn_iov){&c, sizeof(c)}, 1)) {
-      if (wait)
+      if (wait) {
          dev->waited_since_commit = true;
-      else if (e->kind == LMN_KIND_SHARED_EVENT && !dev->waited_since_commit)
-         lmn_shared_event_note_signal(e, value, dev->seqno);
+      } else if (e->kind == LMN_KIND_SHARED_EVENT) {
+         /* A signal behind a wait is not reached when the last commit completes. A commit after
+          * it is: its command buffer runs only once the wait is met and earlier work is done. So
+          * give the signal an empty one to be exportable by, rather than leave whoever exports it
+          * a sync file to wait for it on the CPU. */
+         if (dev->waited_since_commit) {
+            struct lmn_commit w = {.seqno = ++dev->seqno};
+            if (lmn_push_locked(dev, LMN_OP_COMMIT, &(struct lmn_iov){&w, sizeof(w)}, 1))
+               dev->waited_since_commit = false;
+         }
+         if (!dev->waited_since_commit)
+            lmn_shared_event_note_signal(e, value, dev->seqno);
+      }
       lmn_flush_locked(dev);
    }
    pthread_mutex_unlock(&dev->lock);
