@@ -36,6 +36,7 @@ elif kk_bridge == 'limina'
     'limina/lmn_bridge.h',
     'limina/lmn_device.c',
     'limina/lmn_encoder.c',
+    'limina/lmn_probe.h',
     'limina/lmn_memory.c',
     'limina/lmn_queue.c',
     'limina/limina_gpu_ring.h',
@@ -66,6 +67,10 @@ mtl_bridge_dependencies = [
   idep_vulkan_lite_runtime_headers,
   idep_vulkan_util
 ]
+
+if kk_bridge == 'limina'
+  mtl_bridge_dependencies += dep_libdrm
+endif
 
 if kk_bridge == 'metal'
   mtl_bridge_dependencies += dependency(
