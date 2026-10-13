@@ -1774,17 +1774,32 @@ zink_picks_device(int dev_major, uint64_t adapter_luid)
    return (dev_major > 0 && dev_major < 255) || adapter_luid;
 }
 
+#ifdef LIMINA_VENDOR
+/* KosmicKrisp on the limina bridge. venus drives the same render node and may report the host
+ * driver's ID, so its device name tells it apart too. */
+static bool
+zink_limina_vendor_device(const struct zink_screen *screen, VkPhysicalDevice pdev)
+{
+   VkPhysicalDeviceDriverProperties driver_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+   };
+   VkPhysicalDeviceProperties2 props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = &driver_props,
+   };
+   VKSCR(GetPhysicalDeviceProperties2)(pdev, &props);
+   return driver_props.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP &&
+          strncmp(props.properties.deviceName, "Virtio-GPU Venus", 16) != 0;
+}
+#endif
+
 static int
 zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
                         const VkPhysicalDevice *pdevs, int64_t dev_major,
                         int64_t dev_minor)
 {
-   VkPhysicalDeviceDriverProperties driver_props = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
-   };
    VkPhysicalDeviceDrmPropertiesEXT drm_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
-      .pNext = &driver_props,
    };
    VkPhysicalDeviceProperties2 props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -1795,7 +1810,7 @@ zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
       VKSCR(GetPhysicalDeviceProperties2)(pdevs[i], &props);
 #ifdef LIMINA_VENDOR
       /* venus drives the same render node; a vendor build is for the transport only. */
-      if (driver_props.driverID != VK_DRIVER_ID_MESA_KOSMICKRISP)
+      if (!zink_limina_vendor_device(screen, pdevs[i]))
          continue;
 #endif
       if (drm_props.renderMajor == dev_major &&
@@ -1917,6 +1932,15 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
       screen->pdev = pdev;
    }
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
+
+#ifdef LIMINA_VENDOR
+   /* Whichever way the device was picked (a single device is taken without asking, and no
+    * display device means the first one), a vendor build drives KosmicKrisp alone. */
+   if (!zink_limina_vendor_device(screen, screen->pdev)) {
+      screen->pdev = VK_NULL_HANDLE;
+      return;
+   }
+#endif
 
    /* allow software rendering only if forced by the user */
    if (((!cpu || screen->driver_name_is_inferred) && screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)) {
