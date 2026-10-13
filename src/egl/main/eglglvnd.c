@@ -34,6 +34,13 @@
 #include "egldispatchstubs.h"
 #include "eglglobals.h"
 
+#ifdef LIMINA_VENDOR
+#include "loader.h"
+#ifdef HAVE_DRM_PLATFORM
+#include <gbm.h>
+#endif
+#endif
+
 static const __EGLapiExports *__eglGLVNDApiExports = NULL;
 
 static const char *EGLAPIENTRY
@@ -61,6 +68,13 @@ static EGLDisplay
 __eglGLVNDGetPlatformDisplay(EGLenum platform, void *native_display,
                              const EGLAttrib *attrib_list)
 {
+#if defined(LIMINA_VENDOR) && defined(HAVE_DRM_PLATFORM)
+   /* A GBM device is ours only if our backend made it; the system's EGL drives the rest. */
+   if ((platform == EGL_PLATFORM_GBM_KHR || platform == EGL_PLATFORM_GBM_MESA) &&
+       native_display &&
+       strcmp(gbm_device_get_backend_name(native_display), "limina") != 0)
+      return EGL_NO_DISPLAY;
+#endif
    if (platform == EGL_NONE) {
       assert(native_display == (void *)EGL_DEFAULT_DISPLAY);
       assert(attrib_list == NULL);
@@ -86,6 +100,12 @@ __egl_Main(uint32_t version, const __EGLapiExports *exports,
    if (EGL_VENDOR_ABI_GET_MAJOR_VERSION(version) !=
        EGL_VENDOR_ABI_MAJOR_VERSION)
       return EGL_FALSE;
+
+#ifdef LIMINA_VENDOR
+   /* Without a transport this build speaks to, glvnd never routes a call here. */
+   if (!loader_limina_present())
+      return EGL_FALSE;
+#endif
 
    __eglGLVNDApiExports = exports;
    __eglInitDispatchStubs(exports);
