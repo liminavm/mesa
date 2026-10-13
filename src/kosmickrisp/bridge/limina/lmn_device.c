@@ -393,6 +393,7 @@ mtl_device_create(void)
    pthread_mutex_init(&dev->commit_lock, NULL);
    pthread_mutex_init(&dev->cache_lock, NULL);
    pthread_mutex_init(&dev->pool_lock, NULL);
+   pthread_mutex_init(&dev->staging_lock, NULL);
    list_inithead(&dev->pools);
    pthread_cond_init(&dev->commit_cond, NULL);
    /* Arena ids 0 (none) is never handed out. */
