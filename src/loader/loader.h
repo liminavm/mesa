@@ -73,6 +73,13 @@ loader_fd_is_limina(int fd);
 /* Whether any render node is. */
 bool
 loader_limina_present(void);
+
+/* Whether the client names drivers other than this build's: a Vulkan driver list without ours
+ * (zink here runs on our Vulkan driver alone), or software rendering. Such a client is the
+ * system's drivers' to serve. GALLIUM_DRIVER is not asked: a system Mesa's configuration sets it
+ * for itself (GALLIUM_DRIVER=virgl on the enhanced tier), for every client. */
+bool
+loader_limina_client_names_other_drivers(void);
 #endif
 
 void *
