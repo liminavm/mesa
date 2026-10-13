@@ -68,6 +68,10 @@ static EGLDisplay
 __eglGLVNDGetPlatformDisplay(EGLenum platform, void *native_display,
                              const EGLAttrib *attrib_list)
 {
+#ifdef LIMINA_VENDOR
+   if (loader_limina_client_names_other_drivers())
+      return EGL_NO_DISPLAY;
+#endif
 #if defined(LIMINA_VENDOR) && defined(HAVE_DRM_PLATFORM)
    /* A GBM device is ours only if our backend made it; the system's EGL drives the rest. */
    if ((platform == EGL_PLATFORM_GBM_KHR || platform == EGL_PLATFORM_GBM_MESA) &&
