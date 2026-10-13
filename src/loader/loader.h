@@ -65,6 +65,16 @@ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id);
 char *
 loader_get_driver_for_fd(int fd);
 
+#ifdef LIMINA_VENDOR
+/* Whether `fd` is a limina transport this build speaks to. A vendor build drives nothing else. */
+bool
+loader_fd_is_limina(int fd);
+
+/* Whether any render node is. */
+bool
+loader_limina_present(void);
+#endif
+
 void *
 loader_open_driver_lib(const char *driver_name,
                        const char *lib_suffix,
