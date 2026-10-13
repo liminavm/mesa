@@ -949,26 +949,27 @@ texture_transfer(struct lmn_texture *t, void *host_ptr, struct mtl_texture_memor
    if (len == 0)
       len = data->buffer_2d_image_size_B ? data->buffer_2d_image_size_B : data->buffer_stride_B;
 
-   pthread_mutex_lock(&dev->lock);
+   /* Held to the end: every transfer copies through the one staging range, and growing it
+    * releases the old heap, whose arena takes `dev->lock` on the way out. */
+   pthread_mutex_lock(&dev->staging_lock);
    if (!dev->staging || dev->staging->size < len) {
       if (dev->staging)
          mtl_release(dev->staging);
-      pthread_mutex_unlock(&dev->lock);
-      struct lmn_heap *s = lmn_heap_create(dev, len < (4u << 20) ? (4u << 20) : len);
-      pthread_mutex_lock(&dev->lock);
-      dev->staging = s;
+      dev->staging = lmn_heap_create(dev, len < (4u << 20) ? (4u << 20) : len);
    }
    struct lmn_heap *s = dev->staging;
-   pthread_mutex_unlock(&dev->lock);
    if (!s) {
       fprintf(stderr, "[limina-kk] no staging memory for a %llu-byte texture transfer\n",
               (unsigned long long)len);
+      pthread_mutex_unlock(&dev->staging_lock);
       return;
    }
 
    struct lmn_slot slot;
-   if (!lmn_slot_alloc(dev, &slot))
+   if (!lmn_slot_alloc(dev, &slot)) {
+      pthread_mutex_unlock(&dev->staging_lock);
       return;
+   }
    if (to_texture)
       memcpy(s->map, host_ptr, len);
    struct lmn_texture_transfer c = {
@@ -988,12 +989,11 @@ texture_transfer(struct lmn_texture *t, void *host_ptr, struct mtl_texture_memor
    struct lmn_iov iov = {&c, sizeof(c)};
    struct lmn_reply r = lmn_call(dev, LMN_OP_TEXTURE_TRANSFER, &iov, 1, &slot);
    lmn_slot_free(dev, &slot);
-   if (r.status != 0) {
+   if (r.status != 0)
       fprintf(stderr, "[limina-kk] texture transfer failed (error %u)\n", r.status);
-      return;
-   }
-   if (!to_texture)
+   else if (!to_texture)
       memcpy(host_ptr, s->map, len);
+   pthread_mutex_unlock(&dev->staging_lock);
 }
 
 void
