@@ -78,6 +78,18 @@ loader_fd_is_limina(int fd)
 }
 
 bool
+loader_limina_client_names_other_drivers(void)
+{
+   const char *vk = getenv("VK_DRIVER_FILES");
+   if (!vk)
+      vk = getenv("VK_ICD_FILENAMES");
+   if (vk && !strstr(vk, "limina"))
+      return true;
+   const char *sw = getenv("LIBGL_ALWAYS_SOFTWARE");
+   return sw && strcmp(sw, "0") != 0 && strcmp(sw, "false") != 0;
+}
+
+bool
 loader_limina_present(void)
 {
    for (int n = 128; n < 192; n++) {
