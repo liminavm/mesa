@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "lmn_probe.h"
 #include "virtgpu_limina_drm.h"
 
 uint32_t lmn_host_os_version[3];
@@ -343,6 +344,11 @@ open_node(struct drm_virtgpu_limina_ctx_create *ctx)
       else
          snprintf(path, sizeof(path), "/dev/dri/renderD%d", n);
       int fd = open(path, O_RDWR | O_CLOEXEC);
+      /* Ask what the host speaks before a context costs it anything. */
+      if (fd >= 0 && !lmn_probe_fd(fd)) {
+         close(fd);
+         fd = -1;
+      }
       if (fd >= 0) {
          memset(ctx, 0, sizeof(*ctx));
          if (ioctl(fd, DRM_IOCTL_VIRTGPU_LIMINA_CTX_CREATE, ctx) == 0)
