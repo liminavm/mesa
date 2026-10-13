@@ -184,8 +184,12 @@ kk_init_wsi(struct kk_physical_device *pdev)
    wsi->metal.bind_drawable_to_vkimage = kk_bind_drawable_to_vkimage;
 #if !DETECT_OS_APPLE
    wsi->can_share_format = kk_wsi_can_share_format;
-   if (pdev->shareable_textures)
+   if (pdev->shareable_textures) {
       wsi->can_present_on_device = kk_wsi_can_present_on_device;
+      /* Name LINEAR on the buffers we share. Without a modifier a compositor's importer has to
+       * guess the layout, and zink refuses to for any driver not on its list. */
+      wsi->supports_modifiers = true;
+   }
 #endif
    wsi->metal.encode_drawable_present = kk_encode_drawable_present;
    wsi->metal.cmd_blit_image = kk_wsi_cmd_blit_image;
