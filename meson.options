@@ -925,6 +925,16 @@ option(
 )
 
 option(
+  'limina-vendor',
+  type : 'boolean',
+  value : false,
+  description : 'Build as limina\'s vendor driver: GL through zink on KosmicKrisp over the ' +
+                'limina bridge only, installed beside the system Mesa. Every entry point ' +
+                '(EGL vendor, GBM backend, the DRI loader) declines a device that is not a ' +
+                'limina transport speaking this build\'s protocol, so the system drivers take it.'
+)
+
+option(
   'kosmickrisp-bridge',
   type : 'combo',
   value : 'auto',
