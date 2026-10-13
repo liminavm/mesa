@@ -1772,8 +1772,12 @@ zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
                         const VkPhysicalDevice *pdevs, int64_t dev_major,
                         int64_t dev_minor)
 {
+   VkPhysicalDeviceDriverProperties driver_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+   };
    VkPhysicalDeviceDrmPropertiesEXT drm_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
+      .pNext = &driver_props,
    };
    VkPhysicalDeviceProperties2 props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -1782,6 +1786,11 @@ zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
 
    for (uint32_t i = 0; i < pdev_count; ++i) {
       VKSCR(GetPhysicalDeviceProperties2)(pdevs[i], &props);
+#ifdef LIMINA_VENDOR
+      /* venus drives the same render node; a vendor build is for the transport only. */
+      if (driver_props.driverID != VK_DRIVER_ID_MESA_KOSMICKRISP)
+         continue;
+#endif
       if (drm_props.renderMajor == dev_major &&
           drm_props.renderMinor == dev_minor)
          return i;

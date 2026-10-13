@@ -827,6 +827,9 @@ else
 endif
 if dep_libdrm.found()
   pre_args += '-DHAVE_LIBDRM'
+  if get_option('limina-vendor')
+    pre_args += '-DLIMINA_VENDOR'
+  endif
   if with_dri_platform == 'drm' and with_dri
     with_gallium_drisw_kms = true
   endif

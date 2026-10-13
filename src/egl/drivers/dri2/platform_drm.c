@@ -664,6 +664,17 @@ dri2_initialize_drm(_EGLDisplay *disp)
          goto cleanup;
       }
    }
+   /* Before anything reads the device as a gbm_dri_device, which only ours are. */
+#ifdef LIMINA_VENDOR
+   const char *gbm_backend_ours = "limina";
+#else
+   const char *gbm_backend_ours = "drm";
+#endif
+   if (strcmp(gbm_device_get_backend_name(gbm), gbm_backend_ours) != 0) {
+      err = "DRI2: gbm device using incorrect/incompatible backend";
+      goto cleanup;
+   }
+
    dri2_dpy->gbm_dri = gbm_dri_device(gbm);
    if (!dri2_dpy->gbm_dri->software) {
       dri2_dpy->fd_render_gpu =
@@ -672,11 +683,6 @@ dri2_initialize_drm(_EGLDisplay *disp)
          err = "DRI2: failed to get compatible render device";
          goto cleanup;
       }
-   }
-
-   if (strcmp(gbm_device_get_backend_name(gbm), "drm") != 0) {
-      err = "DRI2: gbm device using incorrect/incompatible backend";
-      goto cleanup;
    }
 
    dri2_dpy->driver_name = strdup(dri2_dpy->gbm_dri->driver_name);
