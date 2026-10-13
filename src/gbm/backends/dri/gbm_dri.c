@@ -1182,6 +1182,13 @@ dri_device_create(int fd, uint32_t gbm_backend_version)
    int ret;
    bool force_sw;
 
+#ifdef LIMINA_VENDOR
+   /* Installed as the backend of the device's DRM driver (virtio_gpu_gbm.so), so libgbm asks us
+    * first about every virtio-gpu: a device that is not ours goes to its built-in backend. */
+   if (!loader_fd_is_limina(fd))
+      return NULL;
+#endif
+
    dri = calloc(1, sizeof *dri);
    if (!dri)
       return NULL;
@@ -1208,7 +1215,13 @@ dri_device_create(int fd, uint32_t gbm_backend_version)
    dri->base.v0.surface_create = gbm_dri_surface_create;
    dri->base.v0.surface_destroy = gbm_dri_surface_destroy;
 
+#ifdef LIMINA_VENDOR
+   /* Not "drm": a system EGL takes a "drm" device for one of its own, and would reach into
+    * this build's gbm_dri_device as if it were. */
+   dri->base.v0.name = "limina";
+#else
    dri->base.v0.name = "drm";
+#endif
 
    dri->visual_table = gbm_dri_visuals_table;
    dri->num_visuals = ARRAY_SIZE(gbm_dri_visuals_table);
