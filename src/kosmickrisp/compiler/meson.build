@@ -5,6 +5,7 @@
 libmsl_compiler_files = files(
     'nir_to_msl.c',
     'msl_type_inference.c',
+    'msl_float.c',
     'msl_iomap.c',
     'msl_nir_gather_common.c',
     'msl_nir_lower_common.c',
@@ -35,3 +36,17 @@ idep_msl_to_nir = declare_dependency(
   link_with : libmsl_compiler,
 )
 
+
+if with_tests
+  test(
+    'msl_float',
+    executable(
+      'msl_float_test',
+      files('tests/msl_float_test.cpp'),
+      link_with : libmsl_compiler,
+      dependencies : [idep_gtest, idep_mesautil],
+    ),
+    suite : ['kosmickrisp'],
+    protocol : 'gtest',
+  )
+endif
