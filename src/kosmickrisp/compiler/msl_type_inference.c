@@ -6,6 +6,7 @@
 
 #include "vulkan/vulkan_core.h"
 #include "msl_private.h"
+#include "msl_float.h"
 
 typedef enum ti_type {
    /* We haven't been able to assign a type yet */
@@ -775,7 +776,9 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
          } else {
             P(ctx, "float(");
          }
-         P(ctx, "%.*le", DBL_DECIMAL_DIG, nir_src_comp_as_float(*src, comp));
+         char digits[64];
+         msl_format_float(digits, sizeof(digits), v);
+         P(ctx, "%s", digits);
       }
       break;
    }
