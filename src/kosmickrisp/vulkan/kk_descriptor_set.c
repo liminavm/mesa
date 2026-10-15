@@ -127,6 +127,64 @@ kk_descriptor_update_in_bounds(const struct kk_descriptor_set *set,
           set->size;
 }
 
+/* A position in an update that may span bindings. A write, copy or template
+ * entry whose count runs past the end of its binding goes on into the next
+ * binding at element 0, skipping bindings with no descriptors (the spec's
+ * consecutive binding updates; for an inline uniform block, in bytes). ggml's
+ * Vulkan backend writes all of a dispatch's buffers this way. */
+struct kk_span {
+   uint32_t binding;
+   uint32_t elem;
+};
+
+/* Moves `s` past the end of its binding and past bindings with no descriptors.
+ * Returns false when that runs off the layout. */
+static bool
+kk_span_settle(const struct kk_descriptor_set_layout *layout, struct kk_span *s)
+{
+   while (s->binding < layout->binding_count &&
+          s->elem >= layout->binding[s->binding].array_size) {
+      s->binding++;
+      s->elem = 0;
+   }
+   return s->binding < layout->binding_count;
+}
+
+/* The slot the next descriptor of a span lands in; advances `s` past it. The
+ * span was bounded first, so it never runs off the layout here. */
+static struct kk_span
+kk_span_next(const struct kk_descriptor_set_layout *layout, struct kk_span *s)
+{
+   kk_span_settle(layout, s);
+   struct kk_span at = *s;
+   s->elem++;
+   return at;
+}
+
+/* Whether an update of `count` slots from (binding, elem) stays inside the
+ * set, following the span across bindings: each binding it reaches is bounded
+ * by kk_descriptor_update_in_bounds, which also refuses one whose type differs
+ * from the update's. */
+static bool
+kk_descriptor_span_in_bounds(const struct kk_descriptor_set *set,
+                             uint32_t dyn_capacity, VkDescriptorType type,
+                             uint32_t binding, uint32_t elem, uint32_t count)
+{
+   struct kk_span s = {binding, elem};
+   while (count > 0) {
+      if (!kk_span_settle(set->layout, &s))
+         return false;
+      const uint32_t n =
+         MIN2(count, set->layout->binding[s.binding].array_size - s.elem);
+      if (!kk_descriptor_update_in_bounds(set, dyn_capacity, type, s.binding,
+                                          s.elem, n))
+         return false;
+      count -= n;
+      s.elem += n;
+   }
+   return true;
+}
+
 /* A VkWriteDescriptorSet's slots, bounded; count is descriptorCount, or the
  * inline block's dataSize (both in the units kk_descriptor_update_in_bounds
  * expects). */
@@ -134,9 +192,9 @@ static bool
 kk_write_in_bounds(const struct kk_descriptor_set *set, uint32_t dyn_capacity,
                    const VkWriteDescriptorSet *write, uint32_t count)
 {
-   if (!kk_descriptor_update_in_bounds(set, dyn_capacity, write->descriptorType,
-                                       write->dstBinding,
-                                       write->dstArrayElement, count)) {
+   if (!kk_descriptor_span_in_bounds(set, dyn_capacity, write->descriptorType,
+                                     write->dstBinding, write->dstArrayElement,
+                                     count)) {
       mesa_loge(
          "kk: refusing a descriptor write of %u to binding %u element %u",
          count, write->dstBinding, write->dstArrayElement);
@@ -166,6 +224,26 @@ kk_descriptor_slots_in_bounds(const struct kk_descriptor_set *set,
              set->layout->vk.dynamic_descriptor_count;
    return (uint64_t)bl->offset + ((uint64_t)elem + count) * bl->stride <=
           set->size;
+}
+
+/* kk_descriptor_slots_in_bounds, following the span across bindings. */
+static bool
+kk_descriptor_slot_span_in_bounds(const struct kk_descriptor_set *set,
+                                  uint32_t binding, uint32_t elem,
+                                  uint32_t count)
+{
+   struct kk_span s = {binding, elem};
+   while (count > 0) {
+      if (!kk_span_settle(set->layout, &s))
+         return false;
+      const uint32_t n =
+         MIN2(count, set->layout->binding[s.binding].array_size - s.elem);
+      if (!kk_descriptor_slots_in_bounds(set, s.binding, s.elem, n))
+         return false;
+      count -= n;
+      s.elem += n;
+   }
+   return true;
 }
 
 /* limina: LIMINA_KK_DESCLOG -- report each distinct descriptor SLOT, not each
@@ -435,12 +513,22 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
    write_desc(set, binding, elem, &desc, sizeof(desc));
 }
 
+/* An inline uniform block update of `size` bytes from byte `offset` of
+ * `binding`, spread over the blocks it spans. Bounded first. */
 static void
-write_inline_uniform_data(struct kk_descriptor_set *set,
-                          const VkWriteDescriptorSetInlineUniformBlock *info,
-                          uint32_t binding, uint32_t offset)
+write_inline_span(struct kk_descriptor_set *set, uint32_t binding,
+                  uint32_t offset, const void *data, uint32_t size)
 {
-   write_desc(set, binding, offset, info->pData, info->dataSize);
+   struct kk_span s = {binding, offset};
+   const uint8_t *src = data;
+   while (size > 0 && kk_span_settle(set->layout, &s)) {
+      const uint32_t n =
+         MIN2(size, set->layout->binding[s.binding].array_size - s.elem);
+      write_desc(set, s.binding, s.elem, src, n);
+      src += n;
+      size -= n;
+      s.elem += n;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -455,6 +543,7 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       if (set == NULL)
          continue;
       const uint32_t dyn_capacity = set->layout->vk.dynamic_descriptor_count;
+      struct kk_span s;
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -464,10 +553,12 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          if (!kk_write_in_bounds(set, dyn_capacity, write,
                                  write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_sampled_image_view_desc(
-               set, write->pImageInfo + j, write->dstBinding,
-               write->dstArrayElement + j, write->descriptorType);
+            const struct kk_span at = kk_span_next(set->layout, &s);
+            write_sampled_image_view_desc(set, write->pImageInfo + j,
+                                          at.binding, at.elem,
+                                          write->descriptorType);
          }
          break;
 
@@ -475,10 +566,11 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          if (!kk_write_in_bounds(set, dyn_capacity, write,
                                  write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            const struct kk_span at = kk_span_next(set->layout, &s);
             write_storage_image_view_desc(set, write->pImageInfo + j,
-                                          write->dstBinding,
-                                          write->dstArrayElement + j);
+                                          at.binding, at.elem);
          }
          break;
 
@@ -487,10 +579,11 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          if (!kk_write_in_bounds(set, dyn_capacity, write,
                                  write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_buffer_view_desc(set, write->pTexelBufferView[j],
-                                   write->dstBinding,
-                                   write->dstArrayElement + j);
+            const struct kk_span at = kk_span_next(set->layout, &s);
+            write_buffer_view_desc(set, write->pTexelBufferView[j], at.binding,
+                                   at.elem);
          }
          break;
 
@@ -499,9 +592,10 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          if (!kk_write_in_bounds(set, dyn_capacity, write,
                                  write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_buffer_desc(set, write->pBufferInfo + j, write->dstBinding,
-                              write->dstArrayElement + j);
+            const struct kk_span at = kk_span_next(set->layout, &s);
+            write_buffer_desc(set, write->pBufferInfo + j, at.binding, at.elem);
          }
          break;
 
@@ -510,10 +604,11 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          if (!kk_write_in_bounds(set, dyn_capacity, write,
                                  write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_dynamic_buffer_desc(set, write->pBufferInfo + j,
-                                      write->dstBinding,
-                                      write->dstArrayElement + j);
+            const struct kk_span at = kk_span_next(set->layout, &s);
+            write_dynamic_buffer_desc(set, write->pBufferInfo + j, at.binding,
+                                      at.elem);
          }
          break;
 
@@ -526,8 +621,8 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          if (!kk_write_in_bounds(set, dyn_capacity, write,
                                  write_inline->dataSize))
             break;
-         write_inline_uniform_data(set, write_inline, write->dstBinding,
-                                   write->dstArrayElement);
+         write_inline_span(set, write->dstBinding, write->dstArrayElement,
+                           write_inline->pData, write_inline->dataSize);
          break;
       }
 
@@ -543,12 +638,12 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       if (src == NULL || dst == NULL)
          continue;
 
-      if (!kk_descriptor_slots_in_bounds(src, copy->srcBinding,
-                                         copy->srcArrayElement,
-                                         copy->descriptorCount) ||
-          !kk_descriptor_slots_in_bounds(dst, copy->dstBinding,
-                                         copy->dstArrayElement,
-                                         copy->descriptorCount)) {
+      if (!kk_descriptor_slot_span_in_bounds(src, copy->srcBinding,
+                                             copy->srcArrayElement,
+                                             copy->descriptorCount) ||
+          !kk_descriptor_slot_span_in_bounds(dst, copy->dstBinding,
+                                             copy->dstArrayElement,
+                                             copy->descriptorCount)) {
          mesa_loge("kk: refusing a descriptor copy of %u from binding %u "
                    "element %u to binding %u element %u, outside a set",
                    copy->descriptorCount, copy->srcBinding,
@@ -557,46 +652,50 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          continue;
       }
 
-      const struct kk_descriptor_set_binding_layout *src_binding_layout =
-         &src->layout->binding[copy->srcBinding];
-      const struct kk_descriptor_set_binding_layout *dst_binding_layout =
-         &dst->layout->binding[copy->dstBinding];
+      /* Slot by slot, since either side may move on to its next binding at a
+       * different point. */
+      struct kk_span src_s = {copy->srcBinding, copy->srcArrayElement};
+      struct kk_span dst_s = {copy->dstBinding, copy->dstArrayElement};
+      for (uint32_t j = 0; j < copy->descriptorCount; j++) {
+         const struct kk_span src_at = kk_span_next(src->layout, &src_s);
+         const struct kk_span dst_at = kk_span_next(dst->layout, &dst_s);
+         const struct kk_descriptor_set_binding_layout *src_binding_layout =
+            &src->layout->binding[src_at.binding];
+         const struct kk_descriptor_set_binding_layout *dst_binding_layout =
+            &dst->layout->binding[dst_at.binding];
 
-      if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
-         for (uint32_t j = 0; j < copy->descriptorCount; j++) {
+         if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
             uint32_t dst_max_size, src_max_size;
-            void *dst_map = desc_ubo_data(
-               dst, copy->dstBinding, copy->dstArrayElement + j, &dst_max_size);
-            const void *src_map = desc_ubo_data(
-               src, copy->srcBinding, copy->srcArrayElement + j, &src_max_size);
+            void *dst_map =
+               desc_ubo_data(dst, dst_at.binding, dst_at.elem, &dst_max_size);
+            const void *src_map =
+               desc_ubo_data(src, src_at.binding, src_at.elem, &src_max_size);
             const uint32_t copy_size =
                MIN2(dst_binding_layout->stride, src_binding_layout->stride);
-            if (dst_map == NULL || src_map == NULL ||
-                copy_size > dst_max_size || copy_size > src_max_size)
-               continue;
-            memcpy(dst_map, src_map, copy_size);
+            if (dst_map != NULL && src_map != NULL &&
+                copy_size <= dst_max_size && copy_size <= src_max_size)
+               memcpy(dst_map, src_map, copy_size);
          }
-      }
 
-      /* Dynamic buffers live in a separate array; copy them only when both
-       * bindings are dynamic -- the slot check above bounded each within its
-       * own dynamic_descriptor_count. */
-      const bool src_dynamic =
-         src_binding_layout->type ==
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-         src_binding_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-      const bool dst_dynamic =
-         dst_binding_layout->type ==
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-         dst_binding_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-      if (src_dynamic && dst_dynamic) {
-         const uint32_t dst_dyn_start =
-            dst_binding_layout->dynamic_buffer_index + copy->dstArrayElement;
-         const uint32_t src_dyn_start =
-            src_binding_layout->dynamic_buffer_index + copy->srcArrayElement;
-         typed_memcpy(&dst->dynamic_buffers[dst_dyn_start],
-                      &src->dynamic_buffers[src_dyn_start],
-                      copy->descriptorCount);
+         /* Dynamic buffers live in a separate array; copy them only when both
+          * bindings are dynamic -- the slot check above bounded each within
+          * its own dynamic_descriptor_count. */
+         const bool src_dynamic =
+            src_binding_layout->type ==
+               VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+            src_binding_layout->type ==
+               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+         const bool dst_dynamic =
+            dst_binding_layout->type ==
+               VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+            dst_binding_layout->type ==
+               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+         if (src_dynamic && dst_dynamic) {
+            dst->dynamic_buffers[dst_binding_layout->dynamic_buffer_index +
+                                 dst_at.elem] =
+               src->dynamic_buffers[src_binding_layout->dynamic_buffer_index +
+                                    src_at.elem];
+         }
       }
    }
 }
@@ -617,6 +716,7 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
 
    for (uint32_t w = 0; w < write_count; w++) {
       const VkWriteDescriptorSet *write = &writes[w];
+      struct kk_span s;
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -625,20 +725,23 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
          if (!kk_write_in_bounds(&set, 0, write, write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_sampled_image_view_desc(
-               &set, write->pImageInfo + j, write->dstBinding,
-               write->dstArrayElement + j, write->descriptorType);
+            const struct kk_span at = kk_span_next(set.layout, &s);
+            write_sampled_image_view_desc(&set, write->pImageInfo + j,
+                                          at.binding, at.elem,
+                                          write->descriptorType);
          }
          break;
 
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
          if (!kk_write_in_bounds(&set, 0, write, write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            const struct kk_span at = kk_span_next(set.layout, &s);
             write_storage_image_view_desc(&set, write->pImageInfo + j,
-                                          write->dstBinding,
-                                          write->dstArrayElement + j);
+                                          at.binding, at.elem);
          }
          break;
 
@@ -646,10 +749,11 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
          if (!kk_write_in_bounds(&set, 0, write, write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_buffer_view_desc(&set, write->pTexelBufferView[j],
-                                   write->dstBinding,
-                                   write->dstArrayElement + j);
+            const struct kk_span at = kk_span_next(set.layout, &s);
+            write_buffer_view_desc(&set, write->pTexelBufferView[j], at.binding,
+                                   at.elem);
          }
          break;
 
@@ -657,9 +761,11 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
          if (!kk_write_in_bounds(&set, 0, write, write->descriptorCount))
             break;
+         s = (struct kk_span){write->dstBinding, write->dstArrayElement};
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_buffer_desc(&set, write->pBufferInfo + j, write->dstBinding,
-                              write->dstArrayElement + j);
+            const struct kk_span at = kk_span_next(set.layout, &s);
+            write_buffer_desc(&set, write->pBufferInfo + j, at.binding,
+                              at.elem);
          }
          break;
 
@@ -1008,9 +1114,9 @@ kk_template_entry_in_bounds(const struct kk_descriptor_set *set,
                             uint32_t dyn_capacity,
                             const struct vk_descriptor_template_entry *entry)
 {
-   if (!kk_descriptor_update_in_bounds(set, dyn_capacity, entry->type,
-                                       entry->binding, entry->array_element,
-                                       entry->array_count)) {
+   if (!kk_descriptor_span_in_bounds(set, dyn_capacity, entry->type,
+                                     entry->binding, entry->array_element,
+                                     entry->array_count)) {
       mesa_loge("kk: refusing a template update of %u to binding %u element %u",
                 entry->array_count, entry->binding, entry->array_element);
       return false;
@@ -1025,6 +1131,7 @@ kk_descriptor_set_write_template(
 {
    for (uint32_t i = 0; i < template->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      struct kk_span s;
 
       switch (entry->type) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -1033,12 +1140,13 @@ kk_descriptor_set_write_template(
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
          if (!kk_template_entry_in_bounds(set, dyn_capacity, entry))
             break;
+         s = (struct kk_span){entry->binding, entry->array_element};
          for (uint32_t j = 0; j < entry->array_count; j++) {
+            const struct kk_span at = kk_span_next(set->layout, &s);
             const VkDescriptorImageInfo *info =
                data + entry->offset + j * entry->stride;
 
-            write_sampled_image_view_desc(set, info, entry->binding,
-                                          entry->array_element + j,
+            write_sampled_image_view_desc(set, info, at.binding, at.elem,
                                           entry->type);
          }
          break;
@@ -1046,12 +1154,13 @@ kk_descriptor_set_write_template(
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
          if (!kk_template_entry_in_bounds(set, dyn_capacity, entry))
             break;
+         s = (struct kk_span){entry->binding, entry->array_element};
          for (uint32_t j = 0; j < entry->array_count; j++) {
+            const struct kk_span at = kk_span_next(set->layout, &s);
             const VkDescriptorImageInfo *info =
                data + entry->offset + j * entry->stride;
 
-            write_storage_image_view_desc(set, info, entry->binding,
-                                          entry->array_element + j);
+            write_storage_image_view_desc(set, info, at.binding, at.elem);
          }
          break;
 
@@ -1059,12 +1168,13 @@ kk_descriptor_set_write_template(
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
          if (!kk_template_entry_in_bounds(set, dyn_capacity, entry))
             break;
+         s = (struct kk_span){entry->binding, entry->array_element};
          for (uint32_t j = 0; j < entry->array_count; j++) {
+            const struct kk_span at = kk_span_next(set->layout, &s);
             const VkBufferView *bview =
                data + entry->offset + j * entry->stride;
 
-            write_buffer_view_desc(set, *bview, entry->binding,
-                                   entry->array_element + j);
+            write_buffer_view_desc(set, *bview, at.binding, at.elem);
          }
          break;
 
@@ -1072,12 +1182,13 @@ kk_descriptor_set_write_template(
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
          if (!kk_template_entry_in_bounds(set, dyn_capacity, entry))
             break;
+         s = (struct kk_span){entry->binding, entry->array_element};
          for (uint32_t j = 0; j < entry->array_count; j++) {
+            const struct kk_span at = kk_span_next(set->layout, &s);
             const VkDescriptorBufferInfo *info =
                data + entry->offset + j * entry->stride;
 
-            write_buffer_desc(set, info, entry->binding,
-                              entry->array_element + j);
+            write_buffer_desc(set, info, at.binding, at.elem);
          }
          break;
 
@@ -1085,20 +1196,21 @@ kk_descriptor_set_write_template(
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
          if (!kk_template_entry_in_bounds(set, dyn_capacity, entry))
             break;
+         s = (struct kk_span){entry->binding, entry->array_element};
          for (uint32_t j = 0; j < entry->array_count; j++) {
+            const struct kk_span at = kk_span_next(set->layout, &s);
             const VkDescriptorBufferInfo *info =
                data + entry->offset + j * entry->stride;
 
-            write_dynamic_buffer_desc(set, info, entry->binding,
-                                      entry->array_element + j);
+            write_dynamic_buffer_desc(set, info, at.binding, at.elem);
          }
          break;
 
       case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
          if (!kk_template_entry_in_bounds(set, dyn_capacity, entry))
             break;
-         write_desc(set, entry->binding, entry->array_element,
-                    data + entry->offset, entry->array_count);
+         write_inline_span(set, entry->binding, entry->array_element,
+                           data + entry->offset, entry->array_count);
          break;
 
       default:
