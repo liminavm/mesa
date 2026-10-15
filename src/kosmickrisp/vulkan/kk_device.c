@@ -130,7 +130,7 @@ kk_alloc_pool_finish(struct kk_device *dev)
 
    /* One line per device, so a high-water mark is on record for every client that came and went
     * (the pool is per VkDevice: under venus, one per guest Vulkan device). */
-   if (pool->acquires) {
+   if (pool->acquires && kk_limina_diag()) {
       fprintf(stderr,
               "[LIMINA-ALLOC-POOL] teardown: pool=%p live=%u peak=%u released=%u ceiling-waits=%llu "
               "ceiling-fails=%llu\n",
@@ -502,6 +502,17 @@ kk_release_compiler(struct kk_device *dev)
 
 uint32_t kk_limina_sampler_retires = 0u;
 
+bool
+kk_limina_diag(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("LIMINA_KK_DIAG");
+      cached = (e && *e) ? strcmp(e, "0") != 0 : mtl_diag_default();
+   }
+   return cached == 1;
+}
+
 /* limina: keep every sampler slot alive for the process lifetime. The hash table dedupes on
  * the packed descriptor, so the leak is bounded by the number of distinct sampler states. */
 static bool
@@ -652,7 +663,7 @@ kk_sampler_heap_remove_locked(struct kk_device *dev, struct kk_sampler_heap *h,
       if (kk_limina_sampler_leak())
          return;
       uint32_t n = p_atomic_inc_return(&kk_limina_sampler_retires);
-      if ((n & 0xffu) == 1u)
+      if ((n & 0xffu) == 1u && kk_limina_diag())
          fprintf(stderr, "[LIMINA] KK sampler slot retired (#%u, index %u)\n", n,
                  rc->index);
       mtl_release(rc->handle);
