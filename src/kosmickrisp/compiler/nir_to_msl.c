@@ -254,6 +254,33 @@ alu_funclike_precise(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
       alu_src_to_msl(ctx, instr, 1);                                           \
    } while (0)
 
+/* NIR takes a shift count modulo the shifted value's bit size, and its
+ * algebraic passes rely on it: `(b >> (4 * (i & 1)))` on a byte becomes
+ * `b >> (i << 2)`. MSL shifts by the whole count, after promoting a char or a
+ * short to int, so a count past the operand's width shifts its bits away
+ * instead of wrapping (and is undefined at 32 and 64 bits). Mask the count,
+ * unless it is a constant already in range. */
+static void
+alu_shift_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
+                 const char *op)
+{
+   const unsigned bits = instr->def.bit_size;
+   bool in_range = nir_src_is_const(instr->src[1].src);
+   for (unsigned i = 0; in_range && i < instr->def.num_components; i++)
+      in_range = nir_src_comp_as_uint(instr->src[1].src,
+                                      instr->src[1].swizzle[i]) < bits;
+
+   alu_src_to_msl(ctx, instr, 0);
+   P(ctx, " %s ", op);
+   if (in_range) {
+      alu_src_to_msl(ctx, instr, 1);
+   } else {
+      P(ctx, "(");
+      alu_src_to_msl(ctx, instr, 1);
+      P(ctx, " & %uu)", bits - 1u);
+   }
+}
+
 static void
 alu_fcmp_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
                 const char *op)
@@ -311,11 +338,11 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
       ALU_BINOP("%");
       break;
    case nir_op_ishl:
-      ALU_BINOP("<<");
+      alu_shift_to_msl(ctx, instr, "<<");
       break;
    case nir_op_ishr:
    case nir_op_ushr:
-      ALU_BINOP(">>");
+      alu_shift_to_msl(ctx, instr, ">>");
       break;
    case nir_op_ige:
    case nir_op_uge:
