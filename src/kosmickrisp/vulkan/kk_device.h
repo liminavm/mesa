@@ -231,6 +231,11 @@ extern uint32_t kk_limina_resident_heaps, kk_limina_resident_buffers,
 /* limina: how many device sampler-table slots have been zeroed and returned to the free list. */
 extern uint32_t kk_limina_sampler_retires;
 
+/* limina: whether to print KK's own diagnostics, the lines that report on a
+ * healthy driver rather than a fault: LIMINA_KK_DIAG=1 or 0, else the bridge's
+ * default (mtl_diag_default). */
+bool kk_limina_diag(void);
+
 void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
 void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
                                               mtl_heap *heap);

@@ -217,6 +217,12 @@ limina_mtl_class_census_dump(void)
               rows[i].name, rows[i].live, rows[i].made);
 }
 
+bool
+mtl_diag_default(void)
+{
+   return true;
+}
+
 void *
 mtl_retain(void *handle)
 {

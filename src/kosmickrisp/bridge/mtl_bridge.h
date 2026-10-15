@@ -41,6 +41,13 @@ mtl_texture *mtl_drawable_get_texture(void *drawable_ptr);
 void *mtl_retain(void *handle);
 void mtl_release(void *handle);
 
+/* limina: whether KK's own diagnostics -- periodic counts, per-device teardown
+ * summaries, investigation counters -- go to stderr unless LIMINA_KK_DIAG says
+ * otherwise. The Metal bridge runs inside limina's worker, whose stderr is our
+ * log; the limina bridge runs inside a guest application, whose stderr belongs
+ * to that application. */
+bool mtl_diag_default(void);
+
 /* limina: per-class live-object census (LIMINA_KK_BOCENSUS=<secs> prints it). Every
  * mtl_new_* passes its result through this — it returns the handle unchanged, so it wraps
  * a return expression in place. NULL-tolerant, so failure paths need no special casing.
