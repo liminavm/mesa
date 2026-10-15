@@ -643,7 +643,13 @@ kk_get_device_properties(
       .maxFragmentDualSrcAttachments = 1,
       .maxFragmentCombinedOutputResources = KK_MAX_DESCRIPTORS,
       .maxComputeSharedMemorySize = pdev->info.max_compute_shared_memory_size,
-      .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
+      /* limina: Metal takes far more threadgroups per grid dimension than
+       * 65535: on an M1 Max, 2^24 + 1 in y or z each ran every workgroup
+       * exactly once (limina spikes/kk-workgroup-count), and ggml sizes
+       * row-wise dispatches to this limit and aborts above it. y and z stop
+       * where a dispatch of the largest workgroup still counts its threads
+       * in 32 bits, which is how vkCmdDispatch hands Metal its grid. */
+      .maxComputeWorkGroupCount = {0x7fffffff, 0x3fffff, 0x3fffff},
       .maxComputeWorkGroupInvocations = pdev->info.max_workgroup_invocations,
       .maxComputeWorkGroupSize = {pdev->info.max_workgroup_count[0],
                                   pdev->info.max_workgroup_count[1],
