@@ -412,6 +412,9 @@ static uint64_t kk_limina_enc_refused_close;
 static void
 kk_limina_guard_report_maybe(void)
 {
+   if (!kk_limina_diag())
+      return;
+
    static uint64_t next_ns;
    const uint64_t now = os_time_get_nano();
    const uint64_t due = p_atomic_read(&next_ns);
