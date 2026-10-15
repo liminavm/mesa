@@ -63,8 +63,9 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
                    uint32_t groupCountX, uint32_t groupCountY,
                    uint32_t groupCountZ)
 {
-   /* Metal validation dislikes empty disptaches */
-   if (groupCountX * groupCountY * groupCountZ == 0)
+   /* Metal validation dislikes empty disptaches. Test each count: their
+    * product wraps to 0 in 32 bits for a grid of 2^32 workgroups. */
+   if (groupCountX == 0 || groupCountY == 0 || groupCountZ == 0)
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
