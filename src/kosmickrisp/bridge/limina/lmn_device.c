@@ -68,6 +68,12 @@ lmn_cast(void *p, uint32_t kind, const char *fn)
    return o;
 }
 
+bool
+mtl_diag_default(void)
+{
+   return false;
+}
+
 void *
 mtl_retain(void *handle)
 {
