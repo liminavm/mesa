@@ -12,6 +12,12 @@ mtl_drawable_get_texture(void *drawable_ptr)
    return NULL;
 }
 
+bool
+mtl_diag_default(void)
+{
+   return false;
+}
+
 void *
 mtl_retain(void *handle)
 {
