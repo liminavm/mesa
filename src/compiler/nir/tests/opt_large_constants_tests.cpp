@@ -385,3 +385,58 @@ TEST_F(nir_large_constants_test, bcsel_vec)
       }
    )"));
 }
+
+static unsigned
+count_intrinsics(nir_shader *shader, nir_intrinsic_op op)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               count++;
+         }
+      }
+   }
+   return count;
+}
+
+/* glslang gives a dynamically indexed const array an initializer and also
+ * stores the same constant into it where it is used; after merge-return that
+ * second store sits inside a loop, a block away from the first.
+ */
+TEST_F(nir_large_constants_test, identical_store_in_another_block)
+{
+   uint32_t length = 64;
+   array = nir_local_variable_create(b->impl, glsl_array_type(glsl_uint_type(), length, 0), "array");
+   for (uint32_t i = 0; i < length; i++)
+      nir_store_array_var_imm(b, array, i, nir_imm_int(b, 0x10000 + i * 0x101), 0x1);
+
+   nir_push_if(b, nir_ieq_imm(b, nir_load_workgroup_index(b), 0));
+   for (uint32_t i = 0; i < length; i++)
+      nir_store_array_var_imm(b, array, i, nir_imm_int(b, 0x10000 + i * 0x101), 0x1);
+   nir_pop_if(b, NULL);
+
+   run_test();
+
+   EXPECT_EQ(count_intrinsics(b->shader, nir_intrinsic_load_constant), 1);
+   EXPECT_EQ(count_intrinsics(b->shader, nir_intrinsic_load_deref), 0);
+}
+
+TEST_F(nir_large_constants_test, different_store_in_another_block)
+{
+   uint32_t length = 64;
+   array = nir_local_variable_create(b->impl, glsl_array_type(glsl_uint_type(), length, 0), "array");
+   for (uint32_t i = 0; i < length; i++)
+      nir_store_array_var_imm(b, array, i, nir_imm_int(b, 0x10000 + i * 0x101), 0x1);
+
+   nir_push_if(b, nir_ieq_imm(b, nir_load_workgroup_index(b), 0));
+   nir_store_array_var_imm(b, array, 7, nir_imm_int(b, 0x7777), 0x1);
+   nir_pop_if(b, NULL);
+
+   run_test();
+
+   EXPECT_EQ(count_intrinsics(b->shader, nir_intrinsic_load_constant), 0);
+   EXPECT_EQ(count_intrinsics(b->shader, nir_intrinsic_load_deref), 1);
+}
