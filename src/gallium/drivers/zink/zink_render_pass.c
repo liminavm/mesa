@@ -187,6 +187,8 @@ zink_render_attachment_shadow(struct zink_context *ctx, uint32_t attachment_shad
    assert(attachment_shadow_mask);
 
    bool blitting = ctx->blitting;
+   struct zink_resource *populated[PIPE_MAX_COLOR_BUFS + 1];
+   uint32_t populated_mask = 0;
    u_foreach_bit(i, attachment_shadow_mask) {
       zink_create_transient_surface(ctx, &ctx->fb_state.cbufs[i], ctx->fb_state.cbufs[i].nr_samples);
       struct pipe_resource *src = ctx->fb_state.cbufs[i].texture;
@@ -248,8 +250,14 @@ zink_render_attachment_shadow(struct zink_context *ctx, uint32_t attachment_shad
       }
       ctx->blitting = blitting;
       pipe_sampler_view_reference(&src_view, NULL);
-      transient->valid = true;
+      populated[i] = transient;
+      populated_mask |= BITFIELD_BIT(i);
    }
+   /* each blit rebinds the fb, which marks the transients populated before it invalid,
+    * but nothing has rendered to them since
+    */
+   u_foreach_bit(i, populated_mask)
+      populated[i]->valid = true;
 }
 
 void
