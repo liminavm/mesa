@@ -240,6 +240,38 @@ handle_constant_store(void *mem_ctx, struct var_info *info,
    }
 }
 
+/* Whether a store writes only the values the variable already holds, so
+ * executing it or not changes nothing a read can see.
+ */
+static bool
+store_matches_constant_data(struct var_info *info, nir_deref_instr *deref,
+                            nir_def *val, nir_component_mask_t write_mask,
+                            glsl_type_size_align_func size_align)
+{
+   if (info->constant_data_size == 0)
+      return false;
+
+   const unsigned bit_size = glsl_get_bit_size(deref->type);
+   const unsigned num_components = glsl_get_vector_elements(deref->type);
+   const unsigned offset = nir_deref_instr_get_const_offset(deref, size_align);
+   if (offset >= info->constant_data_size)
+      return true;
+
+   /* Booleans are special-cased to be 32-bit. */
+   const unsigned comp_bytes = bit_size == 1 ? 4 : bit_size / 8;
+   uint64_t value[NIR_MAX_VEC_COMPONENTS];
+
+   write_mask &= nir_component_mask(num_components);
+   u_foreach_bit(i, write_mask) {
+      nir_const_value constant = nir_scalar_as_const_value(nir_scalar_resolved(val, i));
+      write_const_value(value, constant, i, bit_size);
+      if (memcmp((char *)info->constant_data + offset + i * comp_bytes,
+                 (char *)value + i * comp_bytes, comp_bytes))
+         return false;
+   }
+   return true;
+}
+
 #define NIR_SMALL_CONSTANT_MAX_ABS_VALUE 255
 
 static bool
@@ -590,11 +622,18 @@ opt_large_constants_impl(nir_function_impl *impl,
 
             /* We only consider variables constant if they only have constant
              * stores, all the stores come before any reads, and all stores
-             * come from the same block.  We also can't handle indirect stores.
+             * come from the same block, except for stores elsewhere of the
+             * values that block already wrote.  We also can't handle
+             * indirect stores.
              */
-            if (!src_is_const || info->found_read || block != info->block ||
+            if (!src_is_const || info->found_read ||
                 nir_deref_instr_has_indirect(dst_deref)) {
                info->is_constant = false;
+            } else if (block != info->block) {
+               if (!store_matches_constant_data(info, dst_deref,
+                                                intrin->src[1].ssa,
+                                                write_mask, size_align))
+                  info->is_constant = false;
             } else {
                handle_constant_store(var_infos, info, dst_deref, intrin->src[1].ssa,
                                      write_mask, size_align);
