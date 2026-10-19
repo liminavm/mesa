@@ -65,6 +65,23 @@ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id);
 char *
 loader_get_driver_for_fd(int fd);
 
+#ifdef LIMINA_VENDOR
+/* Whether `fd` is a limina transport this build speaks to. A vendor build drives nothing else. */
+bool
+loader_fd_is_limina(int fd);
+
+/* Whether any render node is. */
+bool
+loader_limina_present(void);
+
+/* Whether the client names drivers other than this build's: a Vulkan driver list without ours
+ * (zink here runs on our Vulkan driver alone), or software rendering. Such a client is the
+ * system's drivers' to serve. GALLIUM_DRIVER is not asked: a system Mesa's configuration sets it
+ * for itself (GALLIUM_DRIVER=virgl on the enhanced tier), for every client. */
+bool
+loader_limina_client_names_other_drivers(void);
+#endif
+
 void *
 loader_open_driver_lib(const char *driver_name,
                        const char *lib_suffix,

@@ -68,6 +68,45 @@
 #define __IS_LOADER
 #include "pci_id_driver_map.h"
 
+#ifdef LIMINA_VENDOR
+#include "../kosmickrisp/bridge/limina/lmn_probe.h"
+
+bool
+loader_fd_is_limina(int fd)
+{
+   return lmn_probe_fd(fd);
+}
+
+bool
+loader_limina_client_names_other_drivers(void)
+{
+   const char *vk = getenv("VK_DRIVER_FILES");
+   if (!vk)
+      vk = getenv("VK_ICD_FILENAMES");
+   if (vk && !strstr(vk, "limina"))
+      return true;
+   const char *sw = getenv("LIBGL_ALWAYS_SOFTWARE");
+   return sw && strcmp(sw, "0") != 0 && strcmp(sw, "false") != 0;
+}
+
+bool
+loader_limina_present(void)
+{
+   for (int n = 128; n < 192; n++) {
+      char path[32];
+      snprintf(path, sizeof(path), "/dev/dri/renderD%d", n);
+      int fd = open(path, O_RDWR | O_CLOEXEC);
+      if (fd < 0)
+         continue;
+      bool ours = lmn_probe_fd(fd);
+      close(fd);
+      if (ours)
+         return true;
+   }
+   return false;
+}
+#endif
+
 /* For systems like Hurd */
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -780,6 +819,14 @@ char *
 loader_get_driver_for_fd(int fd)
 {
    char *driver;
+
+#ifdef LIMINA_VENDOR
+   /* The only driver a vendor build has, and only for the device it is for: anything else
+    * belongs to the system's own drivers. Ahead of the override, which a system Mesa's
+    * configuration sets for itself (MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu on the enhanced
+    * tier) and which names a driver this build does not have. */
+   return loader_fd_is_limina(fd) ? strdup("zink") : NULL;
+#endif
 
    /* Allow an environment variable to force choosing a different driver
     * binary.  If that driver binary can't survive on this FD, that's the
