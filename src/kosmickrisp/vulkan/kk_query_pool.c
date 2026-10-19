@@ -31,15 +31,33 @@ kk_pool_index_ptr(const struct kk_query_pool *pool)
    return (uint16_t *)((uint8_t *)pool->bo->cpu + pool->index_start);
 }
 
+/* The query types KK serves. A venus guest's vkCreateQueryPool reaches KK
+ * unvalidated, so any other type is refused at creation rather than reaching
+ * the per-type switches below.
+ */
+static bool
+kk_query_type_supported(VkQueryType type)
+{
+   switch (type) {
+   case VK_QUERY_TYPE_OCCLUSION:
+   case VK_QUERY_TYPE_TIMESTAMP:
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static uint32_t
 kk_reports_per_query(struct kk_query_pool *pool)
 {
    switch (pool->vk.query_type) {
-   case VK_QUERY_TYPE_OCCLUSION:
-   case VK_QUERY_TYPE_TIMESTAMP:
-      return 1;
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      /* primitives written, primitives needed */
+      return 2;
    default:
-      UNREACHABLE("Unsupported query type");
+      return 1;
    }
 }
 
@@ -69,6 +87,20 @@ kk_pool_is_ts(struct kk_query_pool *pool)
    return pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
 }
 
+/* The first report of a query, counted in reports from the results base.
+ * Occlusion results live in the device-wide visibility table, through the
+ * pool's remap; every other pool keeps its reports in its own BO, query after
+ * query. Matches query_report()/libkk_copy_queries in libkk/kk_query.cl, which
+ * remap only when given an oq_index.
+ */
+static uint32_t
+kk_query_report_index(struct kk_query_pool *pool, uint32_t query)
+{
+   if (kk_pool_is_oq(pool))
+      return kk_pool_index_ptr(pool)[query];
+   return query * kk_reports_per_query(pool);
+}
+
 static uint64_t
 kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
                      uint32_t query)
@@ -76,9 +108,8 @@ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
    struct kk_bo *bo =
       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
 
-   uint32_t index =
-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
-   return bo->gpu + pool->query_start + (index * sizeof(uint64_t));
+   return bo->gpu + pool->query_start +
+          kk_query_report_index(pool, query) * sizeof(struct kk_query_report);
 }
 
 static uint64_t
@@ -95,11 +126,9 @@ kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
    struct kk_bo *bo =
       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
 
-   uint64_t *queries = (uint64_t *)(bo->cpu + pool->query_start);
-   uint32_t index =
-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
-
-   return (struct kk_query_report *)&queries[index];
+   struct kk_query_report *reports =
+      (struct kk_query_report *)(bo->cpu + pool->query_start);
+   return &reports[kk_query_report_index(pool, query)];
 }
 
 static void
@@ -136,24 +165,24 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    struct kk_query_pool *pool;
    VkResult result = VK_SUCCESS;
 
+   if (!kk_query_type_supported(pCreateInfo->queryType) ||
+       pCreateInfo->queryCount == 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
    pool =
       vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /* VUID-VkQueryPoolCreateInfo-queryCount-02763: queryCount must be greater
-    * than 0 */
-   assert(pool->vk.query_count > 0);
-
    /* We place the availability, then index, and then data (if in this buffer).
     * Timestamp pools carry availability in the report itself, so they need no
-    * availability array. */
+    * availability array; only occlusion pools remap through an index. */
    uint32_t availability_size = 0;
    uint32_t index_size = 0;
-   if (!kk_pool_is_ts(pool)) {
+   if (!kk_pool_is_ts(pool))
       availability_size = pool->vk.query_count * sizeof(uint32_t);
+   if (kk_pool_is_oq(pool))
       index_size = sizeof(uint16_t) * pool->vk.query_count;
-   }
 
    pool->index_start = align(availability_size, sizeof(struct kk_query_report));
    uint32_t bo_size =
@@ -261,7 +290,7 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
    struct libkk_reset_query_args info = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
       .results = results_bo->gpu + pool->query_start,
-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
+      .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
 
       .first_query = first_index,
       .reports_per_query = kk_reports_per_query(pool),
@@ -360,6 +389,12 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    assert(kk_pool_is_ts(pool) && pool->ts.heap);
 
+   /* limina: query is the guest's. The Metal counter heap and the pool BO both hold
+    * exactly query_count entries; refuse a base index past the pool before sampling
+    * the heap or writing the report. */
+   if (query >= pool->vk.query_count)
+      return;
+
    uint32_t count = kk_mv_query_count(cmd);
    enum mtl_render_stages mtl_stage =
       kk_pipeline_stages_to_mtl_render_stage(stage);
@@ -404,7 +439,10 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 
    /* Resolve the Metal timestamp value to all multiview query indices so that
     * they all become available. */
-   for (uint32_t i = 0; i < count; i++) {
+   /* Multiview resolves the one sample to N consecutive reports (N = views). A guest
+    * can name a base query within range but a view count that runs past the pool;
+    * stop at the last valid query so no resolve targets a report outside the BO. */
+   for (uint32_t i = 0; i < count && query + i < pool->vk.query_count; i++) {
       struct kk_ts_resolve resolve = {
          .heap = pool->ts.heap,
          .index = heap_index,
@@ -420,12 +458,83 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   switch (pool->vk.query_type) {
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+      /* Accumulated CPU-side per draw (command replay is sequential). */
+      cmd->state.gfx.xfb.pg_pool = pool;
+      cmd->state.gfx.xfb.pg_query = query;
+      cmd->state.gfx.xfb.pg_count = 0;
+      cmd->state.gfx.xfb.pg_gpu = 0;
+      return;
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      cmd->state.gfx.xfb.tf_pool = pool;
+      cmd->state.gfx.xfb.tf_query = query;
+      cmd->state.gfx.xfb.tf_written = 0;
+      cmd->state.gfx.xfb.tf_needed = 0;
+      cmd->state.gfx.xfb.tf_gpu = 0;
+      if (getenv("LIMINA_KK_RTLOG"))
+         fprintf(stderr, "[LIMINA-KK-XFB] BeginQuery(tf) q=%u\n", query);
+      return;
+   default:
+      break;
+   }
+
    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+   /* limina: query is the guest's and indexes the occlusion remap array (query_count
+    * entries). Refuse an out-of-range index rather than read it out of bounds. */
+   if (query >= pool->vk.query_count)
+      return;
    uint16_t *remap_index = kk_pool_index_ptr(pool);
    cmd->state.gfx.occlusion.index = remap_index[query];
+}
+
+/* Write a CPU-computed query result. The value is final at replay time, but
+ * it must be written in GPU command order: vkCmdResetQueryPool is a GPU
+ * dispatch, so a host-side store here would be clobbered when the GPU later
+ * executes a reset recorded BEFORE this query. Route the stores through the
+ * imm-write list (flushed before query copies at every encoder transition).
+ */
+static void
+kk_query_write_cpu_result(struct kk_cmd_buffer *cmd,
+                          struct kk_query_pool *pool, uint32_t query,
+                          const uint64_t *values, uint32_t value_count)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   uint64_t report_addr = kk_query_report_addr(dev, pool, query);
+
+   assert(value_count == kk_reports_per_query(pool));
+   for (uint32_t i = 0; i < value_count; i++) {
+      kk_cmd_write(cmd, (struct libkk_imm_write){
+                           report_addr + i * sizeof(struct kk_query_report),
+                           (uint32_t)values[i]});
+      kk_cmd_write(cmd, (struct libkk_imm_write){
+                           report_addr + i * sizeof(struct kk_query_report) +
+                              sizeof(uint32_t),
+                           (uint32_t)(values[i] >> 32)});
+   }
+
+   uint64_t addr = kk_query_available_addr(pool, query);
+   kk_cmd_write(cmd, (struct libkk_imm_write){addr, 1});
+}
+
+/* Write a result that geometry shader draws added to on the GPU: the CPU-known
+ * values plus the GPU accumulators at gpu. */
+static void
+kk_query_write_gpu_sum(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+                       uint32_t query, uint64_t gpu, const uint64_t *values,
+                       uint32_t value_count)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   assert(value_count == kk_reports_per_query(pool));
+   libkk_write_query_sum(cmd, kk_grid_1d(1u), true,
+                         kk_query_report_addr(dev, pool, query),
+                         kk_query_available_addr(pool, query), gpu, values[0],
+                         value_count > 1 ? values[1] : 0u, value_count);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -434,8 +543,47 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   switch (pool->vk.query_type) {
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      uint64_t value = cmd->state.gfx.xfb.pg_count;
+      if (cmd->state.gfx.xfb.pg_gpu)
+         kk_query_write_gpu_sum(cmd, pool, query, cmd->state.gfx.xfb.pg_gpu,
+                                &value, 1);
+      else
+         kk_query_write_cpu_result(cmd, pool, query, &value, 1);
+      cmd->state.gfx.xfb.pg_pool = NULL;
+      cmd->state.gfx.xfb.pg_gpu = 0;
+      return;
+   }
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
+      uint64_t values[2] = {cmd->state.gfx.xfb.tf_written,
+                            cmd->state.gfx.xfb.tf_needed};
+      if (cmd->state.gfx.xfb.tf_gpu)
+         kk_query_write_gpu_sum(cmd, pool, query, cmd->state.gfx.xfb.tf_gpu,
+                                values, 2);
+      else
+         kk_query_write_cpu_result(cmd, pool, query, values, 2);
+      cmd->state.gfx.xfb.tf_gpu = 0;
+      if (getenv("LIMINA_KK_RTLOG"))
+         fprintf(stderr, "[LIMINA-KK-XFB] EndQuery(tf) q=%u written=%llu needed=%llu\n",
+                 query, (unsigned long long)values[0],
+                 (unsigned long long)values[1]);
+      cmd->state.gfx.xfb.tf_pool = NULL;
+      return;
+   }
+   default:
+      break;
+   }
+
    cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+
+   /* limina: query is the guest's and indexes the availability array (query_count
+    * entries). Refuse an out-of-range base before kk_query_available_addr(), which
+    * asserts the bound. Occlusion is already disabled above, so the query stops. */
+   if (query >= pool->vk.query_count)
+      return;
 
    /* Make the query available. The Vulkan spec states:
     * If queries are used while executing a render pass instance that has
@@ -447,13 +595,38 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
     * ...
     * Queries used with multiview rendering must not span subpasses, i.e.
     * they must begin and end in the same subpass.
+    *
+    * A guest can name a base query within range but a view count that runs past
+    * the pool; stop at the last valid query so the availability writes stay in
+    * the BO.
     */
    uint64_t addr = kk_query_available_addr(pool, query);
    uint32_t count = kk_mv_query_count(cmd);
-   for (uint32_t i = 0; i < count; i++) {
+   for (uint32_t i = 0; i < count && query + i < pool->vk.query_count; i++) {
       kk_cmd_write(cmd, (struct libkk_imm_write){addr, true});
       addr += sizeof(uint32_t);
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer,
+                           VkQueryPool queryPool, uint32_t query,
+                           VkQueryControlFlags flags, uint32_t index)
+{
+   /* Only vertex stream 0 exists (maxTransformFeedbackStreams is 1). A guest
+    * naming another stream is invalid; record nothing for it. */
+   if (index != 0)
+      return;
+   kk_CmdBeginQuery(commandBuffer, queryPool, query, flags);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                         uint32_t query, uint32_t index)
+{
+   if (index != 0)
+      return;
+   kk_CmdEndQuery(commandBuffer, queryPool, query);
 }
 
 static bool
@@ -581,7 +754,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
    struct libkk_copy_queries_args args = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
       .results = results_bo->gpu + pool->query_start,
-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
+      .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
       .dst_addr = pDstRange->address,
       .dst_stride = pDstRange->stride,
       .first_query = firstQuery,

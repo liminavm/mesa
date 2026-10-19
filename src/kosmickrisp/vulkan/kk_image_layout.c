@@ -21,12 +21,28 @@ vk_image_to_mtl_texture_type(const struct vk_image *image)
 {
    uint32_t array_layers = image->array_layers;
    uint32_t samples = image->samples;
+   /* Metal forbids array types for linear textures, so a non-OPTIMAL image
+    * (plain LINEAR or a DRM-format-modifier image, which for us is always
+    * DRM_FORMAT_MOD_LINEAR) must stay non-array. Input-attachment READS go
+    * through the arrays-only lowering and therefore do not work on linear
+    * images — that matches the feature envelope we advertise (plain LINEAR
+    * withholds attachment features entirely; the LINEAR modifier advertises
+    * COLOR_ATTACHMENT, whose render path is proven, while a subpass read on
+    * one would fail loudly at view creation rather than make the base
+    * texture un-creatable here). */
+   bool can_array = image->tiling == VK_IMAGE_TILING_OPTIMAL;
+#if !DETECT_OS_APPLE
+   /* A legacy WSI scanout image is laid out linear whatever its tiling says (see
+    * kk_image_layout_init), so it is held to the same rule. */
+   can_array &= !image->wsi_legacy_scanout;
+#endif
    switch (image->image_type) {
    case VK_IMAGE_TYPE_1D:
    case VK_IMAGE_TYPE_2D:
       /* We require input attachments to be arrays */
-      if (array_layers > 1 ||
-          (image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+      if (can_array &&
+          (array_layers > 1 ||
+           (image->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
          return samples > 1u ? MTL_TEXTURE_TYPE_2D_ARRAY_MULTISAMPLE
                              : MTL_TEXTURE_TYPE_2D_ARRAY;
       return samples > 1u ? MTL_TEXTURE_TYPE_2D_MULTISAMPLE
@@ -254,7 +270,9 @@ kk_image_layout_calc_offsets(const struct kk_device *dev,
 void
 kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
                      enum pipe_format format, const uint8_t width_scale,
-                     const uint8_t height_scale, struct kk_image_layout *layout)
+                     const uint8_t height_scale,
+                     const uint32_t explicit_row_stride_B,
+                     struct kk_image_layout *layout)
 {
    const struct kk_physical_device *pdev = kk_device_physical(dev);
    const struct kk_va_format *supported_format = kk_get_va_format(format);
@@ -264,7 +282,18 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
    layout->depth_px = image->extent.depth;
    layout->layers = image->array_layers;
    layout->levels = image->mip_levels;
+   /* A DRM-format-modifier image is always DRM_FORMAT_MOD_LINEAR for us, so it
+    * takes the linear path like plain VK_IMAGE_TILING_LINEAR. (An earlier
+    * carve-out laid modifier *attachments* out tiled to dodge a nil render
+    * encoder; the checkpoint of 2026-08-04 showed linear color attachments
+    * render fine — the historical aborts came from the arrays-only
+    * input-attachment type, handled in vk_image_to_mtl_texture_type now.) */
    layout->linear = image->tiling != VK_IMAGE_TILING_OPTIMAL;
+#if !DETECT_OS_APPLE
+   /* A window-system image with no modifier is shared with the compositor's driver, which reads
+    * it as a plain linear buffer (kk_AllocateMemory makes it a shareable texture). */
+   layout->linear |= image->wsi_legacy_scanout;
+#endif
    layout->optimized_layout = kk_image_layout_can_optimize(
       pdev, image->usage, image->tiling, image->create_flags, format);
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
@@ -289,6 +318,18 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
 
    if (layout->linear) {
       kk_image_layout_calc_linear(dev, layout);
+      /* VK_EXT_image_drm_format_modifier EXPLICIT create: adopt the caller's
+       * rowPitch when it is compatible (at least as wide as ours, and meeting
+       * Metal's linear-texture alignment). The caller validates/rejects an
+       * incompatible pitch; here an unusable value is simply ignored so the
+       * layout is never internally inconsistent. */
+      if (explicit_row_stride_B >= layout->linear_stride_B &&
+          (explicit_row_stride_B % layout->align_B) == 0) {
+         layout->linear_stride_B = explicit_row_stride_B;
+         layout->layer_stride_B = layout->linear_stride_B * layout->height_px;
+         layout->size_B = layout->layer_stride_B;
+         layout->level_offsets_B[1] = layout->layer_stride_B;
+      }
    } else {
       kk_image_layout_calc_tiled(dev, layout);
    }

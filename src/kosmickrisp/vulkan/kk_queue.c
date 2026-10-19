@@ -10,6 +10,7 @@
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_limina_work.h"
 #include "kk_physical_device.h"
 #include "kk_sync.h"
 
@@ -18,9 +19,19 @@
 
 #include "vk_cmd_queue.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 struct kk_commit_data {
    struct kk_queue *queue;
    struct kk_cmd_buffer *cmd;
+};
+
+/* limina: what one plain commit submitted, so the device-loss report can mark the GPU's last
+ * work. Allocated per commit and freed by the callback, which Metal invokes exactly once. */
+struct kk_commit_note {
+   struct kk_device *dev;
+   uint64_t seq_lo, seq_hi;
 };
 
 static void
@@ -41,9 +52,36 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
 }
 
 static void
-check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
+check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data,
+                  uint64_t seq_lo, uint64_t seq_hi)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+      /* limina: vk_device_set_lost's report reaches nothing the worker log captures,
+       * so a device loss arrives as an unexplained abort several layers downstream.
+       * Metal names the fault here; say it. The first few in full — a loss cascades. */
+      static uint32_t reported = 0u;
+      if (reported < 3u) {
+         ++reported;
+         fprintf(stderr,
+                 "[LIMINA-DEVICE-LOST] %s (code %u) gpu=%.6f..%.6f (%.3f ms)\n"
+                 "  message: %s\n"
+                 "  details: %s\n",
+                 mtl_command_queue_error_to_string(data->error),
+                 (unsigned)data->error, data->gpu_start, data->gpu_end,
+                 (data->gpu_end - data->gpu_start) * 1000.0,
+                 data->error_message ? data->error_message : "(none)",
+                 data->error_details ? data->error_details : "(none)");
+         kk_limina_work_dump(stderr, 24u, seq_lo, seq_hi);
+
+         fprintf(stderr, "  residency set: %u heaps, %u buffers, %u textures\n",
+                 p_atomic_read(&kk_limina_resident_heaps),
+                 p_atomic_read(&kk_limina_resident_buffers),
+                 p_atomic_read(&kk_limina_resident_textures));
+         fprintf(stderr, "  sampler table: %u slots retired\n",
+                 p_atomic_read(&kk_limina_sampler_retires));
+         fflush(stderr);
+      }
+
       vk_device_set_lost(
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);
@@ -53,7 +91,9 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
-   check_device_lost((struct kk_device *)data->user_data, data);
+   struct kk_commit_note *note = (struct kk_commit_note *)data->user_data;
+   check_device_lost(note->dev, data, note->seq_lo, note->seq_hi);
+   free(note);
 }
 
 static void
@@ -63,7 +103,7 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    struct kk_queue *queue = commit->queue;
    struct kk_device *dev = kk_queue_device(queue);
 
-   check_device_lost(dev, data);
+   check_device_lost(dev, data, commit->cmd->work_seq_lo, commit->cmd->work_seq_hi);
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
@@ -89,18 +129,75 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
    return cmd->metal.cmd_buf;
 }
 
+/* limina: GPU completion for one commit: discharge the allocator charge its command buffer took
+ * at begin, which is what lets an over-budget allocator drain and be released. Metal
+ * snapshots the feedback-handler list per commit (measured, mtl4-repro T4), so this fires once. */
+struct kk_submit_discharge {
+   struct kk_device *dev;
+   struct kk_pooled_alloc *pa;
+};
+
 static void
+discharge_callback(struct mtl_feedback_data *data)
+{
+   struct kk_submit_discharge *d = (struct kk_submit_discharge *)data->user_data;
+   kk_alloc_pool_discharge(d->dev, d->pa);
+   free(d);
+}
+
+/* limina: fault injection for the discharge-payload allocation. It is a few dozen bytes and
+ * effectively never fails, which is exactly why its recovery path once carried a use-after-free
+ * unnoticed: an untestable error path is an unreviewed one. LIMINA_KK_FAIL_DISCHARGE_ALLOC=<n>
+ * fails the first <n>. The counter is deliberately plain: a race can only change how many
+ * injections land, never whether the path under test is correct. */
+static bool
+kk_discharge_alloc_should_fail(void)
+{
+   static int remaining = -1;
+   if (remaining < 0) {
+      const char *e = getenv("LIMINA_KK_FAIL_DISCHARGE_ALLOC");
+      remaining = (e && *e) ? atoi(e) : 0;
+   }
+   if (remaining > 0) {
+      remaining--;
+      fprintf(stderr, "[LIMINA-KK] injecting discharge-payload allocation failure\n");
+      return true;
+   }
+   return false;
+}
+
+/* On failure nothing has been committed and `user_data` still belongs to the caller. */
+static VkResult
 kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
                 mtl_feedback_handler_callback callback, void *user_data)
 {
    assert(kk_cmd_buffer_has_work(cmd));
 
+   /* limina: build the discharge payload BEFORE anything is committed. The charge must be
+    * released at GPU completion; if this allocation could fail after the commit, the charge
+    * would be left for command-buffer reset, which the rerecord path reaches while this
+    * submission is still executing, and the pool could then release heaps the GPU is
+    * reading. Failing first means the GPU never receives the work, so the charge discharging at
+    * reset is exactly right. */
+   struct kk_submit_discharge *d = NULL;
+   if (cmd->charged) {
+      d = kk_discharge_alloc_should_fail() ? NULL : malloc(sizeof(*d));
+      if (d == NULL)
+         return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+      d->dev = kk_queue_device(queue);
+      d->pa = cmd->charged;
+      cmd->charged = NULL;
+   }
+
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, callback, user_data);
+   if (d)
+      mtl_commit_options_add_feedback_handler(options, discharge_callback, d);
 
    mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
                             options);
    mtl_release(options);
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -111,6 +208,13 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    struct vk_command_buffer *vk_cmd = NULL;
    struct kk_cmd_buffer *rerecord;
    VkResult result = VK_SUCCESS;
+
+   /* limina: take the allocator before queue->mutex. An acquire at the pool's ceiling waits for
+    * commits to complete, and rerecord_commit_callback takes queue->mutex, so waiting with it held
+    * could stall the very completions the wait needs. */
+   struct kk_pooled_alloc *pa = kk_alloc_pool_acquire(dev);
+   if (pa == NULL)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
@@ -123,11 +227,17 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    } else {
       result = kk_cmd_buffer_ops.create(
          &queue->cmd_pool->vk, VK_COMMAND_BUFFER_LEVEL_PRIMARY, &vk_cmd);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         kk_alloc_pool_release(dev, pa);
          goto unlock;
+      }
    }
 
    rerecord = container_of(vk_cmd, struct kk_cmd_buffer, vk);
+   /* kk_BeginCommandBuffer uses an allocator already in place instead of acquiring one. */
+   assert(rerecord->metal.pa == NULL);
+   rerecord->metal.pa = pa;
+   rerecord->metal.allocator = pa->handle;
    VkCommandBuffer rerecord_handle = kk_cmd_buffer_to_handle(rerecord);
    const VkCommandBufferBeginInfo begin_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -160,7 +270,12 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    kk_device_make_resources_resident(dev);
 
    queue->commits_in_flight++;
-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   result = kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   if (result != VK_SUCCESS) {
+      queue->commits_in_flight--;
+      vk_free(&dev->vk.alloc, commit);
+      goto release;
+   }
 
    mtx_unlock(&queue->mutex);
    return VK_SUCCESS;
@@ -178,7 +293,9 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
    struct kk_device *dev = kk_queue_device(queue);
 
-   if (vk_queue_is_lost(&queue->vk))
+   /* limina: the device is marked lost from the commit feedback handler, which does not mark
+    * the queue. Without this the queue keeps accepting submissions that can never complete. */
+   if (vk_queue_is_lost(&queue->vk) || vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
    for (struct vk_sync_wait *wait = submit->waits,
@@ -210,7 +327,18 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          if (result != VK_SUCCESS)
             return result;
       } else if (kk_cmd_buffer_has_work(cmd_buffer)) {
-         kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
+         /* limina: a failing commit has to say which encoders it carried. */
+         struct kk_commit_note *note = malloc(sizeof(*note));
+         if (note == NULL)
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         note->dev = dev;
+         note->seq_lo = cmd_buffer->work_seq_lo;
+         note->seq_hi = cmd_buffer->work_seq_hi;
+         VkResult result = kk_queue_commit(queue, cmd_buffer, commit_callback, note);
+         if (result != VK_SUCCESS) {
+            free(note);
+            return result;
+         }
       }
 
       cmd_buffer->submitted = true;

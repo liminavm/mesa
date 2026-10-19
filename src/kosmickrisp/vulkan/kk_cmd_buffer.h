@@ -43,6 +43,33 @@ struct kk_root_descriptor_table {
          float viewport_z_range[KK_MAX_VIEWPORTS * 2];
          bool emulate_depth_clamp;
          bool emulate_viewport_z;
+
+         /* Transform feedback: per-buffer write base for THIS draw,
+          * pre-adjusted so the vertex shader stores at
+          * xfb_base[b] + vertex_id * stride + output_offset
+          * (bound base + current append offset - firstVertex * stride).
+          * xfb_active_mask has bit b set when capture to buffer b is on.
+          */
+         uint64_t xfb_base[4];
+         uint32_t xfb_active_mask;
+         /* For instanced capture: slot = (instance_id - first_instance) *
+          * verts_per_instance + vertex_id. */
+         uint32_t xfb_verts_per_instance;
+         uint32_t xfb_first_instance;
+         /* Capture stores only slots below this: the whole primitives that
+          * fit in every active buffer. */
+         uint32_t xfb_slot_limit;
+         /* Primitive-vertex remap (kk_nir_lower_xfb.c). While transform
+          * feedback is on, a draw is issued as a non-indexed list of
+          * primitive vertices from vertex 0, and the vertex shader finds its
+          * source vertex from these: the original topology, index size and
+          * provoking convention (KK_XFB_REMAP_*), the original vertex or
+          * index count, firstVertex (non-indexed) or vertexOffset (indexed),
+          * and the address of the draw's first index. 0 = no remap. */
+         uint32_t xfb_remap;
+         uint32_t xfb_remap_count;
+         int32_t xfb_remap_base;
+         uint64_t xfb_remap_index_addr;
       } draw;
       struct {
          uint32_t base_group[3];
@@ -87,6 +114,18 @@ struct kk_per_draw_data {
 
    uint64_t base_vertex_addr;
    uint64_t base_instance_addr;
+
+   /* Address of geometry param buffer if a geometry shader is bound, else 0 */
+   uint64_t geometry_params;
+
+   /* Writable scratch for the geometry shader's counters nothing reads: the
+    * statistics, primitives-generated and overflow counters of inactive
+    * queries. */
+   uint64_t gs_sink;
+
+   /* Nonzero when the last vertex of a primitive is its provoking vertex. */
+   uint32_t provoking_last;
+   uint32_t pad;
 };
 
 struct kk_attachment {
@@ -172,6 +211,24 @@ struct kk_graphics_state {
       struct kk_addr_range addr_range[KK_MAX_VBUFS];
    } vb;
 
+   /* limina: per-attribute format block size, cached when VI dirties so the
+    * per-VB-bind clamp recompute (per draw on zink streams) skips the
+    * util_format_description chain. */
+   uint8_t attrib_elsize_B[KK_MAX_ATTRIBS];
+
+   /* limina: per-encoder binding cache for the hot per-draw buffer binds
+    * (root table at index 0, per-draw data at index 2). The bound buffers
+    * live in the upload pool, so consecutive draws rebind the SAME MTLBuffer
+    * at a new offset — Metal's setBufferOffset skips the residency/binding-
+    * table work of setBuffer, and a fully unchanged bind is skipped outright.
+    * Zeroed when a new render encoder is created (fresh binding tables). */
+   /* limina: last-uploaded per-draw data + its pool location; non-tess draws
+    * usually repeat the same content (draw_id varies only across multidraw),
+    * so the per-draw pool upload can be skipped (pool data is immutable).
+    * .gpu == 0 = invalid (cmd->state is zeroed at Begin). */
+   struct kk_per_draw_data last_per_draw_data;
+   struct kk_ptr per_draw_gpu;
+
    /* Tessellation state */
    struct {
       /* Grid buffer for when the draw is indirect */
@@ -180,6 +237,74 @@ struct kk_graphics_state {
       struct kk_tess_info info;
       enum mesa_prim prim;
    } tess;
+
+   /* Geometry shader state of the draw being recorded */
+   struct {
+      /* Input topology and provoking convention of the API draw */
+      enum mesa_prim in_prim;
+      bool flatshade_first;
+
+      /* Parameter buffers; their CPU view is where an indirect dispatch fills
+       * in its threadgroup size (KK_GRID_INDIRECT_THREADS). */
+      struct kk_ptr params;
+      struct kk_ptr vertex_params;
+
+      /* Index buffer of the rasterization draw, if it is indexed */
+      uint64_t index_buffer;
+      uint32_t index_buffer_range_B;
+
+      /* Rasterization draw size, for a direct draw */
+      uint32_t index_count;
+      uint32_t instance_count;
+
+      /* Primitives generated and written by the draw (uint32_t[2]) when
+       * queries are active, else 0 */
+      uint64_t counts;
+   } gs;
+
+   /* Transform feedback state (CPU-tracked; command replay is sequential).
+    * Capture is lowered to vertex-shader global stores, and every direct
+    * draw is reissued as a list of primitive vertices while it is on
+    * (kk_xfb_draw); indirect draws do not capture.
+    */
+   struct {
+      bool enabled;
+      struct {
+         uint64_t gpu_base; /* bound buffer GPU address (0 = unbound) */
+         uint64_t size;
+         mtl_buffer *counter_handle; /* counter buffer from Begin, for End */
+         uint64_t counter_offset;
+         uint64_t offset_B; /* current append offset within the buffer */
+      } buf[4];
+
+      /* Query accumulation while queries are active (CPU-side; counts are
+       * known at replay time for direct draws). */
+      struct kk_query_pool *pg_pool; /* PRIMITIVES_GENERATED / pipeline stats */
+      uint32_t pg_query;
+      uint64_t pg_count;
+      struct kk_query_pool *tf_pool; /* TRANSFORM_FEEDBACK_STREAM */
+      uint32_t tf_query;
+      uint64_t tf_written, tf_needed;
+      bool warned_indirect;
+
+      /* Geometry shader draws count primitives and append captured vertices
+       * on the GPU (poly's pre-GS program). Once a session or query has seen
+       * one, its values continue in these GPU words; the CPU fields above
+       * hold only what other draws added. 0 = not on the GPU. */
+      uint64_t gpu_offsets; /* uint32_t[4] append offsets, by buffer */
+      uint64_t pg_gpu;      /* uint32_t primitives generated */
+      uint64_t tf_gpu;      /* uint32_t[2] primitives written, needed */
+      bool warned_gpu_offsets;
+
+      /* The remap the draw in flight was issued with (kk_xfb_draw); mode 0
+       * outside it. Mirrors the root table's xfb_remap* fields. */
+      struct {
+         uint32_t mode;
+         uint32_t count;
+         int32_t base;
+         uint64_t index_addr;
+      } remap;
+   } xfb;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
@@ -224,12 +349,38 @@ struct kk_ts_stage_entry {
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;
 
+   /* limina: the pool charge taken when the Metal command buffer began. It outlives the borrow:
+    * it moves to the commit's discharge payload at submit, and is discharged at reset or destroy
+    * for a command buffer that is never submitted, or it would strand its allocator draining. */
+   struct kk_pooled_alloc *charged;
+
    struct {
+      /* limina: BORROWED from the device allocator pool between vkBeginCommandBuffer and
+       * vkEndCommandBuffer, not owned. `allocator` is just pa->handle. */
+      struct kk_pooled_alloc *pa;
       mtl_command_allocator *allocator;
       mtl_command_buffer *cmd_buf;
       mtl_render_encoder *render;
       mtl_compute_encoder *compute;
+      /* limina: one line describing the open render encoder, recorded into the work ring as it
+       * closes so a device loss can name the work. Written at encoder open. */
+      char render_what[112];
+      /* limina: the incarnation of `compute`'s ADDRESS that we were handed. Encoder addresses
+       * are recycled fast, so `compute` alone cannot tell a live pointer from a stale one
+       * pointing at a new tenant -- which is the standing reading of the AGX use-before-begin
+       * fault. Checked before every handout and before the close; 0 when the bridge's liveness
+       * table is not tracking this encoder. */
+      uint64_t compute_gen;
    } metal;
+   /* limina: work-ring sequence range this command buffer's encoders recorded, so a failing
+    * commit marks exactly its own work rather than "the last N recorded", which another
+    * thread's encoding can interleave with. Zero until the first encoder closes. */
+   uint64_t work_seq_lo, work_seq_hi;
+
+   /* limina: what the open render pass has encoded so far, so a device-loss report can say
+    * whether the failing work drew at all and whether its geometry was unrolled. Cleared at
+    * pass start. */
+   uint32_t limina_draws, limina_unrolls;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;
    /* Timestamps already sampled by the current render encoder. (struct
@@ -351,7 +502,19 @@ bool kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
 
 enum kk_grid_mode {
    KK_GRID_DIRECT = 0u,
+   /* Threadgroup counts at addr (MTLDispatchThreadgroupsIndirectArguments) */
    KK_GRID_INDIRECT,
+   /* Thread counts at addr, followed by the threadgroup counts that cover them
+    * (MTLDispatchThreadgroupsIndirectArguments), both written on the GPU. The
+    * poly kernels size grids in threads, as AGX dispatches do; the dispatch
+    * reads the threadgroup counts, and a kernel whose thread count is not a
+    * multiple of its threadgroup bounds-checks its own invocations.
+    *
+    * Not MTLDispatchThreadsIndirectArguments: under
+    * dispatchThreadsWithIndirectBuffer, a kernel whose private array spills to
+    * stack memory loses stores on the threads past the first two of each
+    * threadgroup. */
+   KK_GRID_INDIRECT_THREADS,
 };
 struct kk_grid {
    enum kk_grid_mode mode;
@@ -360,6 +523,13 @@ struct kk_grid {
       uint64_t addr;
    };
 };
+
+/* An indirect thread grid takes six words: three of threads, three of
+ * threadgroups. */
+#define KK_GRID_INDIRECT_THREADS_SIZE_B (6u * sizeof(uint32_t))
+
+/* Threadgroup size of the software vertex shader that feeds tessellation. */
+#define KK_SW_VS_LOCAL_SIZE 64u
 
 static struct kk_grid
 kk_grid_3d(uint32_t x, uint32_t y, uint32_t z)
@@ -390,6 +560,18 @@ kk_grid_indirect(uint64_t addr)
       .addr = addr,
    };
 }
+
+static struct kk_grid
+kk_grid_indirect_threads(uint64_t addr)
+{
+   return (struct kk_grid){
+      .mode = KK_GRID_INDIRECT_THREADS,
+      .addr = addr,
+   };
+}
+
+void kk_dispatch_grid(mtl_compute_encoder *encoder, struct kk_grid grid,
+                      struct mtl_size local_size);
 
 static bool
 kk_grid_is_indirect(struct kk_grid grid)

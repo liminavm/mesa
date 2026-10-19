@@ -25,6 +25,7 @@
  */
 
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
 #include "zink_resource.h"
@@ -143,7 +144,8 @@ check_unordered_exec(struct zink_context *ctx, struct zink_resource *res, bool i
 }
 
 VkCommandBuffer
-zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst)
+zink_get_cmdbuf_at(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst,
+                   const char *site)
 {
    bool unordered_exec = !ctx->no_reorder;
 
@@ -156,13 +158,13 @@ zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink
       dst->obj->unordered_write = unordered_exec;
 
    if (!unordered_exec || ctx->unordered_blitting)
-      zink_batch_no_rp(ctx);
+      zink_batch_no_rp_at(ctx, site);
 
    if (unordered_exec) {
       ctx->bs->has_reordered_work = true;
       return ctx->bs->reordered_cmdbuf;
    }
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    return ctx->bs->cmdbuf;
 }
 
@@ -441,9 +443,12 @@ zink_resource_image_barrier(struct zink_context *ctx, struct zink_resource *res,
    bool has_usage = zink_resource_has_usage(res);
    bool completed = !has_usage || zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res, ZINK_RESOURCE_ACCESS_RW);
    bool usage_matches = zink_resource_usage_matches(res, ctx->bs);
+   bool was_in_rp = ctx->in_rp;
    VkCommandBuffer cmdbuf = GENERAL && new_layout == VK_IMAGE_LAYOUT_GENERAL ?
                             (UNSYNCHRONIZED ? ctx->bs->unsynchronized_cmdbuf : is_write ? zink_get_cmdbuf(ctx, NULL, res) : zink_get_cmdbuf(ctx, res, NULL)) :
                             update_unordered_access_and_get_cmdbuf<UNSYNCHRONIZED>::apply(ctx, res, usage_matches, is_write);
+   if (unlikely(ctx->limina_rp) && was_in_rp && !ctx->in_rp)
+      zink_limina_rp_split(ctx, ZINK_LIMINA_SPLIT_LAYOUT, res->fb_bind_count > 0);
 
    assert(new_layout);
    bool marker = zink_cmd_debug_marker_begin(ctx, cmdbuf, "image_barrier(%s->%s)", vk_ImageLayout_to_str(res->layout), vk_ImageLayout_to_str(new_layout));
@@ -664,8 +669,17 @@ zink_resource_memory_barrier(struct zink_context *ctx, struct zink_resource *res
       can_skip_unordered = can_skip_ordered = false;
 
    if (!can_skip_unordered && !can_skip_ordered) {
+      bool was_in_rp = ctx->in_rp;
       VkCommandBuffer cmdbuf = UNSYNCHRONIZED ? ctx->bs->unsynchronized_cmdbuf :
                                                 is_write ? zink_get_cmdbuf(ctx, NULL, res) : zink_get_cmdbuf(ctx, res, NULL);
+      if (unlikely(ctx->limina_rp) && was_in_rp && !ctx->in_rp) {
+         enum zink_limina_rp_split what =
+            is_write ? ZINK_LIMINA_SPLIT_WRITE :
+            zink_resource_access_is_write(prev_access) ? ZINK_LIMINA_SPLIT_READ_AFTER_WRITE :
+            needs_access ? ZINK_LIMINA_SPLIT_READ_WIDENS_AFTER_WRITE :
+            ZINK_LIMINA_SPLIT_READ_AFTER_READ;
+         zink_limina_rp_split(ctx, what, res->fb_bind_count > 0);
+      }
       bool marker = false;
       ctx->bs->has_unsync |= UNSYNCHRONIZED;
       if (unlikely(zink_tracing)) {

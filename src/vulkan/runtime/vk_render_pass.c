@@ -2650,6 +2650,84 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(vk_framebuffer, framebuffer,
                   pRenderPassBeginInfo->framebuffer);
 
+/* Invalid-usage mismatches between the framebuffer's image views and the
+ * render pass reach this code from untrusted sources (a virtio-gpu venus
+ * guest replays app command streams through the common runtime), so a
+ * VU violation here must not abort the process.  Log loudly (capped per
+ * site) and continue: rendering is undefined but contained.
+ */
+#define VU_VIOLATION_LOGW(fmt, ...)                                           \
+   do {                                                                       \
+      static int _vu_logged = 0;                                              \
+      if (_vu_logged < 8) {                                                   \
+         _vu_logged++;                                                        \
+         mesa_logw("render-pass begin VU violation (%s:%d): " fmt "%s",       \
+                   __FILE__, __LINE__, ##__VA_ARGS__,                         \
+                   _vu_logged == 8 ? " (further reports suppressed)" : "");   \
+      }                                                                       \
+   } while (0)
+
+   /* Both handles are required, and a venus guest can still send
+    * VK_NULL_HANDLE for either.  The framebuffer is needed even when the
+    * views come from VkRenderPassAttachmentBeginInfo: begin_subpass() and
+    * the layout transitions read its layer count.
+    */
+   if (unlikely(pass == NULL || framebuffer == NULL)) {
+      VU_VIOLATION_LOGW("%s is VK_NULL_HANDLE; render pass not begun",
+                        pass == NULL ? "renderPass" : "framebuffer");
+      vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
+      return;
+   }
+
+   const VkRenderPassAttachmentBeginInfo *attach_begin =
+      vk_find_struct_const(pRenderPassBeginInfo,
+                           RENDER_PASS_ATTACHMENT_BEGIN_INFO);
+
+   const VkImageView *image_views;
+   uint32_t view_count;
+   if (attach_begin && attach_begin->attachmentCount != 0) {
+      image_views = attach_begin->pAttachments;
+      view_count = attach_begin->attachmentCount;
+   } else {
+      image_views = framebuffer->attachments;
+      view_count = framebuffer->attachment_count;
+   }
+
+   /* Valid usage requires exactly one image view per render pass
+    * attachment, whether they come from the framebuffer or, for an imageless
+    * framebuffer, from VkRenderPassAttachmentBeginInfo.  Extra views are
+    * never read, but with too few every later access to the missing ones --
+    * the attachment state below, begin_subpass() and the final layout
+    * transitions in vkCmdEndRenderPass2() -- would read past the end of the
+    * array.  Refuse the begin instead: leave the command buffer outside a
+    * render pass, so vkCmdNextSubpass2() and vkCmdEndRenderPass2() do
+    * nothing, and fail vkEndCommandBuffer().
+    */
+   if (unlikely(view_count != pass->attachment_count)) {
+      VU_VIOLATION_LOGW("%u attachment image views supplied for a render "
+                        "pass with %u attachments%s",
+                        view_count, pass->attachment_count,
+                        view_count < pass->attachment_count ?
+                        "; render pass not begun" : "");
+      if (view_count < pass->attachment_count) {
+         vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
+         return;
+      }
+   }
+
+   /* Every view the pass uses must be a real one: the attachment state
+    * below dereferences each of them.  A framebuffer's views are not
+    * checked at creation, so this covers both sources.
+    */
+   for (uint32_t a = 0; a < pass->attachment_count; ++a) {
+      if (unlikely(image_views[a] == VK_NULL_HANDLE)) {
+         VU_VIOLATION_LOGW("attachment %u has a VK_NULL_HANDLE image view; "
+                           "render pass not begun", a);
+         vk_command_buffer_set_error(cmd_buffer, VK_ERROR_UNKNOWN);
+         return;
+      }
+   }
+
    assert(cmd_buffer->render_pass == NULL);
    cmd_buffer->render_pass = pass;
    cmd_buffer->subpass_idx = 0;
@@ -2665,21 +2743,6 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                                        sizeof(*cmd_buffer->attachments));
    } else {
       cmd_buffer->attachments = cmd_buffer->_attachments;
-   }
-
-   const VkRenderPassAttachmentBeginInfo *attach_begin =
-      vk_find_struct_const(pRenderPassBeginInfo,
-                           RENDER_PASS_ATTACHMENT_BEGIN_INFO);
-   if (!attach_begin)
-      assert(pass->attachment_count == framebuffer->attachment_count);
-
-   const VkImageView *image_views;
-   if (attach_begin && attach_begin->attachmentCount != 0) {
-      assert(attach_begin->attachmentCount == pass->attachment_count);
-      image_views = attach_begin->pAttachments;
-   } else {
-      assert(framebuffer->attachment_count >= pass->attachment_count);
-      image_views = framebuffer->attachments;
    }
 
    for (uint32_t a = 0; a < pass->attachment_count; ++a) {
@@ -2720,8 +2783,11 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *   - has_external_format is false
        */
       if (!pass_att->has_external_format &&
-          !vk_format_get_ycbcr_info(image_view->format))
-         assert(image_view->format == pass_att->format);
+          !vk_format_get_ycbcr_info(image_view->format) &&
+          unlikely(image_view->format != pass_att->format))
+         VU_VIOLATION_LOGW("attachment %u: image view format (%u) != render "
+                           "pass attachment format (%u)",
+                           a, image_view->format, pass_att->format);
 
       /* From the Vulkan 1.3.204 spec:
        *
@@ -2745,7 +2811,10 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    VkImageCreateInfo::samples equal to the corresponding value of
        *    VkAttachmentDescription::samples in renderPass"
        */
-      assert(image_view->image->samples == pass_att->samples);
+      if (unlikely(image_view->image->samples != pass_att->samples))
+         VU_VIOLATION_LOGW("attachment %u: image samples (%u) != render "
+                           "pass attachment samples (%u)",
+                           a, image_view->image->samples, pass_att->samples);
 
       /* From the Vulkan 1.3.204 spec:
        *
@@ -2758,8 +2827,11 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    Otherwise, the texel is unconditionally selected from the first
        *    layer of the attachment.
        */
-      if (!(image_view->usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR))
-         assert(util_last_bit(pass_att->view_mask) <= image_view->layer_count);
+      if (!(image_view->usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
+          unlikely(util_last_bit(pass_att->view_mask) > image_view->layer_count))
+         VU_VIOLATION_LOGW("attachment %u: view_mask 0x%x exceeds image view "
+                           "layer count (%u)",
+                           a, pass_att->view_mask, image_view->layer_count);
 
       *att_state = (struct vk_attachment_state) {
          .image_view = image_view,
@@ -2776,6 +2848,7 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
       if (a < pRenderPassBeginInfo->clearValueCount)
          att_state->clear_value = pRenderPassBeginInfo->pClearValues[a];
    }
+#undef VU_VIOLATION_LOGW
 
    const VkRenderPassSampleLocationsBeginInfoEXT *rp_sl_info =
       vk_find_struct_const(pRenderPassBeginInfo->pNext,
@@ -2828,6 +2901,10 @@ vk_common_CmdNextSubpass2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(vk_command_buffer, cmd_buffer, commandBuffer);
 
+   /* The render pass begin was refused (or never recorded) */
+   if (unlikely(cmd_buffer->render_pass == NULL))
+      return;
+
    end_subpass(cmd_buffer, pSubpassEndInfo);
    cmd_buffer->subpass_idx++;
    begin_subpass(cmd_buffer, pSubpassBeginInfo);
@@ -2841,6 +2918,10 @@ vk_common_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
    const struct vk_render_pass *pass = cmd_buffer->render_pass;
    struct vk_device_dispatch_table *disp =
       &cmd_buffer->base.device->dispatch_table;
+
+   /* The render pass begin was refused (or never recorded) */
+   if (unlikely(pass == NULL))
+      return;
 
    end_subpass(cmd_buffer, pSubpassEndInfo);
 

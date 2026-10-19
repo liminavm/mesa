@@ -202,6 +202,14 @@ struct wsi_device {
    bool (*can_present_on_device)(VkPhysicalDevice pdevice, int fd);
 
    /*
+    * If this is set, a format the driver answers false for is not offered
+    * for images shared with the compositor (it stays offered when the
+    * device presents by copying through host memory). For drivers that
+    * share only some renderable formats across devices.
+    */
+   bool (*can_share_format)(VkPhysicalDevice pdevice, VkFormat format);
+
+   /*
     * A driver can implement this callback to return a special queue to execute
     * buffer blits.
     */

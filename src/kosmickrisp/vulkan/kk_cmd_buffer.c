@@ -7,12 +7,22 @@
 
 #include "kk_cmd_buffer.h"
 
+#include "util/log.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
+
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_entrypoints.h"
 #include "kk_format.h"
+#include "kk_image.h"
 #include "kk_image_view.h"
+#include "kk_limina_work.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_command_buffer.h"
@@ -54,6 +64,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    }
    util_dynarray_clear(&cmd->large_bos);
    util_dynarray_clear(&cmd->post_render_writes);
+   cmd->work_seq_lo = cmd->work_seq_hi = 0u;
    util_dynarray_clear(&cmd->ts_resolves);
    util_dynarray_clear(&cmd->ts_stage_map);
 }
@@ -66,8 +77,16 @@ end_recording(struct kk_cmd_buffer *cmd)
       return;
 
    cs_end(cmd);
-   mtl_end_command_buffer(cmd->metal.cmd_buf);
-   kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
+   /* limina: a Metal command buffer is begun exactly when it holds an allocator. A Begin that
+    * found no allocator leaves this command buffer RECORDING with none begun, and ending a Metal 4
+    * command buffer that was never begun asserts in IOGPUMetal4CommandBuffer. */
+   if (cmd->metal.pa)
+      mtl_end_command_buffer(cmd->metal.cmd_buf);
+   /* limina: reuse is legal the moment the command buffer ends (Apple: "You can safely reuse
+    * command allocators after ending the command buffer"); only releasing one needs GPU completion,
+    * which the pool gates on the charge taken at begin. So the borrow goes back now. */
+   kk_alloc_pool_release(kk_cmd_buffer_device(cmd), cmd->metal.pa);
+   cmd->metal.pa = NULL;
    cmd->metal.allocator = NULL;
 }
 
@@ -83,6 +102,8 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    /* Ensure closed command buffer for safe returns to pool */
    end_recording(cmd);
+   kk_alloc_pool_discharge(kk_cmd_buffer_device(cmd), cmd->charged);
+   cmd->charged = NULL;
    if (cmd->metal.cmd_buf)
       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
@@ -165,6 +186,10 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
    end_recording(cmd);
    kk_cmd_release_resources(dev, cmd);
 
+   /* limina: a charge still held here belongs to a recording that was never submitted. */
+   kk_alloc_pool_discharge(dev, cmd->charged);
+   cmd->charged = NULL;
+
    cmd->uploader.bo = NULL;
    cmd->uploader.offset = 0;
 
@@ -197,6 +222,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    /* If this is the first time starting the command buffer allocate Metal
     * resources */
@@ -217,13 +243,21 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */
-   if (cmd->metal.allocator == NULL) {
-      cmd->metal.allocator = kk_cmd_pool_get_allocator(pool);
-
-      if (cmd->metal.allocator == NULL)
+   /* limina: a recording that began and was never submitted still holds its charge. */
+   kk_alloc_pool_discharge(dev, cmd->charged);
+   cmd->charged = NULL;
+   if (cmd->metal.pa == NULL) {
+      cmd->metal.pa = kk_alloc_pool_acquire(dev);
+      if (cmd->metal.pa == NULL)
          goto fail_allocator;
+      cmd->metal.allocator = cmd->metal.pa->handle;
    }
    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
+   /* limina: charge at BEGIN, not commit: the borrow goes back at vkEndCommandBuffer while this
+    * command buffer still sits uncommitted, and releasing the allocator in that window would free
+    * heaps the GPU has not been handed yet. */
+   kk_alloc_pool_charge(dev, cmd->metal.pa);
+   cmd->charged = cmd->metal.pa;
 
    return VK_SUCCESS;
 
@@ -231,6 +265,10 @@ fail_allocator:
    kk_cmd_pool_return_cmd_buf(kk_cmd_buffer_pool(cmd), cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
 fail_cmd:
+   /* limina: the queue's rerecord path hands in an allocator before Begin; return it. */
+   kk_alloc_pool_release(dev, cmd->metal.pa);
+   cmd->metal.pa = NULL;
+   cmd->metal.allocator = NULL;
    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
@@ -257,6 +295,24 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
       mtl_encoder_push_debug_group(encoder, label->pLabelName);
 }
 
+/* limina: the GPU address a view's first plane actually renders into. The kernel's gpuEvent
+ * report names a faulting VA, so a pass has to carry the address of what it wrote for the two
+ * to be matched. */
+static uint64_t
+kk_limina_view_addr(const struct kk_image_view *view)
+{
+   if (view == NULL || view->vk.image == NULL)
+      return 0ull;
+
+   const struct kk_image *image =
+      container_of(view->vk.image, const struct kk_image, vk);
+   uint8_t plane = view->planes[0].image_plane;
+   if (plane >= image->plane_count)
+      return 0ull;
+
+   return image->planes[plane].addr;
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
@@ -271,6 +327,28 @@ cs_start_render(struct kk_cmd_buffer *cmd)
       cmd->metal.cmd_buf, state->render_pass_descriptor);
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
+   cmd->limina_draws = 0u;
+   cmd->limina_unrolls = 0u;
+
+   /* limina: the pass's shape is what tells a device-loss report apart -- a 4-sample colour
+    * target resolving into a single-sample one is a WebGL MSAA resolve, and the compositor's own
+    * passes look nothing like it. */
+   const struct kk_image_view *civ =
+      state->render.color_att_count ? state->render.color_att[0].iview : NULL;
+   const struct kk_image_view *div = state->render.depth_att.iview;
+   snprintf(cmd->metal.render_what, sizeof(cmd->metal.render_what),
+            "render %ux%u s%u rts%u fmt%u c=%p a=0x%llx d=%u%s%s",
+            state->render.area.extent.width, state->render.area.extent.height,
+            state->render.samples, state->render.color_att_count,
+            state->render.color_att_count ? (unsigned)state->render.color_att[0].vk_format : 0u,
+            civ ? (void *)civ->planes[0].mtl_handle_render : NULL,
+            (unsigned long long)kk_limina_view_addr(civ),
+            div ? (unsigned)state->render.depth_att.vk_format : 0u,
+            div && civ && kk_limina_view_addr(div) == kk_limina_view_addr(civ) ? "!same" : "",
+            state->render.color_att_count && state->render.color_att[0].resolve_iview
+               ? " +resolve"
+               : "");
+
    /* Starting a new render pass means we already flushed and no barrier is
     * needed. */
    state->render.write_available = false;
@@ -300,7 +378,14 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
    if (gfx->need_to_start_render_pass) {
-      gfx->render.samples = gfx->pipeline_sample_count;
+      /* limina: Metal requires defaultRasterSampleCount >= 1; an attachment-less
+       * render pass has no attachment to derive it from and a draw can reach
+       * here before a pipeline set it, leaving 0 -> the render command encoder
+       * comes back nil and the pass start crashes (observed pre-MTL4 as a
+       * worker-killing assert; on the live-record path the nil propagates to
+       * mtl_set_vertex_amplification_count). Clamp. */
+      gfx->render.samples =
+         gfx->pipeline_sample_count ? gfx->pipeline_sample_count : 1u;
       mtl_render_pass_descriptor_set_default_raster_sample_count(
          cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
       gfx->need_to_start_render_pass = false;
@@ -308,6 +393,65 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    }
 
    return cmd->metal.render;
+}
+
+/* limina: how often each generation check refused. The messages they gate are rate-limited, so
+ * the log alone cannot be read as a total; kk_limina_guard_report_maybe prints these
+ * unconditionally. */
+static uint64_t kk_limina_enc_refused_handout;
+static uint64_t kk_limina_enc_refused_close;
+
+/* limina: the encoder guard's positive control. Its messages are rate-limited and only appear
+ * when something is wrong, so an uneventful log cannot be told apart from a guard that is not
+ * running -- the same trap as a crash class whose only evidence is that it stopped happening.
+ * Paced by compute-encoder closes, which move with what the guard measures, and limited to one
+ * line every 30 s. Deliberately not tagged [LIMINA-ENC], which is the grep for a refusal.
+ *
+ * `untracked` is the guard's own blind spot made visible: an address the table has evicted passes
+ * every check by default, and `table` says how close we are to causing that. */
+static void
+kk_limina_guard_report_maybe(void)
+{
+   if (!kk_limina_diag())
+      return;
+
+   static uint64_t next_ns;
+   const uint64_t now = os_time_get_nano();
+   const uint64_t due = p_atomic_read(&next_ns);
+   if (now < due ||
+       p_atomic_cmpxchg(&next_ns, due, now + 30ull * 1000000000ull) != due)
+      return;
+
+   struct mtl_encoder_guard_stats g;
+   mtl_encoder_guard_stats(&g);
+   fprintf(stderr,
+           "[LIMINA-KK-GUARD] periodic encoder guard: checks=%llu untracked=%llu | bad: "
+           "null=%llu ended=%llu released=%llu | refused: handout=%llu close=%llu | "
+           "encoders=%llu table=%u/%u | context: %s born-broken=%llu died=%llu swapped=%llu "
+           "alloc-mismatch=%llu skipped=%llu\n",
+           (unsigned long long)g.checks, (unsigned long long)g.untracked,
+           (unsigned long long)g.bad_null, (unsigned long long)g.bad_ended,
+           (unsigned long long)g.bad_released,
+           (unsigned long long)p_atomic_read(&kk_limina_enc_refused_handout),
+           (unsigned long long)p_atomic_read(&kk_limina_enc_refused_close),
+           (unsigned long long)g.encoders_seen, g.slots_used, g.slots_total, g.ctx_mode,
+           (unsigned long long)g.ctx_born_broken, (unsigned long long)g.ctx_died,
+           (unsigned long long)g.ctx_swapped, (unsigned long long)g.ctx_alloc_mismatch,
+           (unsigned long long)g.ctx_skipped);
+   fflush(stderr);
+}
+
+/* limina: same knob the bridge's use-site check honours, so whichever site catches the stale
+ * pointer first can take a core with our own frame on top of it. */
+static bool
+kk_enc_guard_aborts(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_ENC_GUARD");
+      v = (e && !strcmp(e, "abort")) ? 1 : 0;
+   }
+   return v == 1;
 }
 
 mtl_compute_encoder *
@@ -323,8 +467,38 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
 
    if (cmd->metal.compute == NULL) {
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
+      cmd->metal.compute_gen = mtl_encoder_generation(cmd->metal.compute);
+      /* limina: no reset or op counts to give -- upstream's per-command-pool allocators keep
+       * none -- so the guard's report names the allocator alone. */
+      mtl_encoder_note_allocator(cmd->metal.compute, cmd->metal.allocator, 0u, 0u);
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
+   }
+
+   /* limina: the stale-pointer check. If this encoder's address has been re-tenanted since we
+    * were handed it, recording into it is exactly the AGX use-before-begin fault -- name it
+    * here, in our own code, instead of segfaulting inside the driver several ops later.
+    *
+    * gen_now == 0 means the table is no longer tracking this address (its slot was evicted), not
+    * that anything is wrong; treating that as stale would drop real work. */
+   const uint64_t gen_now = mtl_encoder_generation(cmd->metal.compute);
+   if (unlikely(cmd->metal.compute_gen != 0 && gen_now != 0 &&
+                gen_now != cmd->metal.compute_gen)) {
+      /* A stale encoder stays stale until cs_end, and this is the record path -- the dogfood
+       * workload calls it millions of times per session, so an unrate-limited line here is a
+       * flood. */
+      const uint64_t n = p_atomic_fetch_add(&kk_limina_enc_refused_handout, 1);
+      if (n < 8 || (n & 4095u) == 0)
+         mesa_loge("kk: the compute encoder %p is stale — handed out at generation %" PRIu64
+                   ", the address now holds generation %" PRIu64 "; dropping the op rather than "
+                   "recording it into someone else's encoder (caller %p, %llu so far)",
+                   cmd->metal.compute, cmd->metal.compute_gen, gen_now,
+                   __builtin_return_address(0), (unsigned long long)n + 1);
+      if (n < 8)
+         mtl_encoder_report_incarnation(cmd->metal.compute, "stale handout");
+      if (kk_enc_guard_aborts())
+         abort();
+      return NULL;
    }
 
    return cmd->metal.compute;
@@ -336,6 +510,10 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
    /* TODO_KOSMICKRISP This is probably overkill */
    mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
    mtl_end_encoding(encoder);
+   /* limina: before the retain goes, so the encoder-liveness table cannot lose the race against
+    * a new encoder landing on this very address. Render encoders are not in the table, so this
+    * is a no-op for them. */
+   mtl_encoder_note_released(encoder);
    mtl_release(encoder);
 
    /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
@@ -363,6 +541,21 @@ flush_post_render_writes(struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->post_render_writes);
 }
 
+/* limina: one work-ring line per closed encoder; see kk_limina_work.h. Draw and unroll counts
+ * belong to the render encoder alone: compute encoders close around it and would otherwise claim
+ * its pass's draws. */
+static void
+kk_limina_note_encoder_closed(struct kk_cmd_buffer *cmd, const char *what, bool render)
+{
+   uint64_t seq =
+      render ? kk_limina_work_record("%s draws=%u unroll=%u", what[0] ? what : "(unnamed)",
+                                     cmd->limina_draws, cmd->limina_unrolls)
+             : kk_limina_work_record("%s", what);
+   if (cmd->work_seq_hi == 0u)
+      cmd->work_seq_lo = seq;
+   cmd->work_seq_hi = seq + 1u;
+}
+
 void
 cs_end(struct kk_cmd_buffer *cmd)
 {
@@ -372,6 +565,10 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.render) {
       end_encoder(cmd, cmd->metal.render);
       cmd->metal.render = NULL;
+      kk_limina_note_encoder_closed(cmd, cmd->metal.render_what, true);
+      /* A render encoder opened by a path that does not set a label would otherwise inherit
+       * this one's and lie about what it held. */
+      cmd->metal.render_what[0] = '\0';
 
       /* The stage map is only valid for the current render encoder */
       util_dynarray_clear(&cmd->ts_stage_map);
@@ -379,8 +576,32 @@ cs_end(struct kk_cmd_buffer *cmd)
    }
 
    if (cmd->metal.compute) {
-      end_encoder(cmd, cmd->metal.compute);
+      /* limina: check the address is still ours BEFORE ending it. Closing a re-tenanted address
+       * is worse than recording into one: mtl_end_encoding ends somebody else's live encoder and
+       * mtl_release drops a retain they still hold, so their object dies under them and their
+       * next dispatch lands on a freed or freshly re-inited context -- which is the very state
+       * the AGX fault shows. Skip both and let the new owner keep its encoder. */
+      const uint64_t stop_gen = mtl_encoder_generation(cmd->metal.compute);
+      if (unlikely(cmd->metal.compute_gen != 0 && stop_gen != 0 &&
+                   stop_gen != cmd->metal.compute_gen)) {
+         const uint64_t n = p_atomic_fetch_add(&kk_limina_enc_refused_close, 1);
+         if (n < 8 || (n & 4095u) == 0)
+            mesa_loge("kk: refusing to close compute encoder %p — it was ours at generation "
+                      "%" PRIu64 " and the address now holds generation %" PRIu64 "; ending "
+                      "it would take down its new owner (%llu so far)",
+                      cmd->metal.compute, cmd->metal.compute_gen, stop_gen,
+                      (unsigned long long)n + 1);
+         if (n < 8)
+            mtl_encoder_report_incarnation(cmd->metal.compute, "refused close");
+         if (kk_enc_guard_aborts())
+            abort();
+      } else {
+         end_encoder(cmd, cmd->metal.compute);
+      }
       cmd->metal.compute = NULL;
+      cmd->metal.compute_gen = 0;
+      kk_limina_note_encoder_closed(cmd, "compute", false);
+      kk_limina_guard_report_maybe();
    }
 }
 
@@ -507,11 +728,22 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
     * it changes set_dynamic_buffer_start[s], this binding is implicitly
     * invalidated.
     */
-   uint8_t dyn_buffer_start =
+   /* Sets past KK_MAX_SETS, dynamic buffers past KK_MAX_DYNAMIC_BUFFERS and
+    * offsets past dynamicOffsetCount are invalid usage. Under venus a guest
+    * sends them unchecked, so they are dropped here rather than indexed. */
+   if (info->firstSet >= KK_MAX_SETS) {
+      mesa_loge("kk: binding descriptor set %u, past the %u sets KK holds",
+                info->firstSet, KK_MAX_SETS);
+      return;
+   }
+   const uint32_t set_count =
+      MIN2(info->descriptorSetCount, KK_MAX_SETS - info->firstSet);
+
+   uint32_t dyn_buffer_start =
       pipeline_layout->dynamic_descriptor_offset[info->firstSet];
 
    uint32_t next_dyn_offset = 0;
-   for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
+   for (uint32_t i = 0; i < set_count; ++i) {
       unsigned s = i + info->firstSet;
       VK_FROM_HANDLE(kk_descriptor_set, set, info->pDescriptorSets[i]);
 
@@ -534,13 +766,22 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
             vk_to_kk_descriptor_set_layout(pipeline_layout->set_layouts[s]);
 
          if (set != NULL && set_layout->vk.dynamic_descriptor_count > 0) {
-            for (uint32_t j = 0; j < set_layout->vk.dynamic_descriptor_count;
-                 j++) {
+            const uint32_t count = set_layout->vk.dynamic_descriptor_count;
+            if (set->layout->vk.dynamic_descriptor_count != count ||
+                (uint64_t)dyn_buffer_start + count > KK_MAX_DYNAMIC_BUFFERS ||
+                (uint64_t)next_dyn_offset + count > info->dynamicOffsetCount) {
+               mesa_loge("kk: set %u's %u dynamic buffers at %u do not fit "
+                         "the %u KK holds or the %u offsets given",
+                         s, count, dyn_buffer_start, KK_MAX_DYNAMIC_BUFFERS,
+                         info->dynamicOffsetCount);
+               return;
+            }
+            for (uint32_t j = 0; j < count; j++) {
                struct kk_buffer_address addr = set->dynamic_buffers[j];
                addr.base_addr += info->pDynamicOffsets[next_dyn_offset + j];
                desc->root.dynamic_buffers[dyn_buffer_start + j] = addr;
             }
-            next_dyn_offset += set->layout->vk.dynamic_descriptor_count;
+            next_dyn_offset += count;
          }
 
          dyn_buffer_start += set_layout->vk.dynamic_descriptor_count;
@@ -548,8 +789,6 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
          assert(set == NULL);
       }
    }
-   assert(dyn_buffer_start <= KK_MAX_DYNAMIC_BUFFERS);
-   assert(next_dyn_offset <= info->dynamicOffsetCount);
 
    desc->root_dirty = true;
 }
@@ -591,6 +830,9 @@ kk_cmd_push_descriptors(struct kk_cmd_buffer *cmd,
 
    /* Pushing descriptors replaces whatever sets are bound */
    desc->push[set]->layout = set_layout;
+   desc->push[set]->limina_used_size =
+      MAX2(desc->push[set]->limina_used_size,
+           set_layout->non_variable_descriptor_buffer_size);
    desc->sets[set] = NULL;
    desc->push_dirty |= BITFIELD_BIT(set);
 
@@ -603,6 +845,17 @@ kk_push_descriptor_set(struct kk_cmd_buffer *cmd,
                        const VkPushDescriptorSetInfoKHR *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+
+   /* info->set indexes pipeline_layout->set_layouts[] and desc->push[], both of
+    * KK_MAX_SETS; a set past the layout or that array overruns one or the
+    * other. Under venus a guest sends the push unchecked. */
+   if (info->set >= KK_MAX_SETS || info->set >= pipeline_layout->set_count ||
+       pipeline_layout->set_layouts[info->set] == NULL) {
+      mesa_loge("kk: refusing a push to descriptor set %u, past the %u the "
+                "pipeline layout holds (max %u)",
+                info->set, pipeline_layout->set_count, KK_MAX_SETS);
+      return;
+   }
 
    struct kk_descriptor_set_layout *set_layout =
       vk_to_kk_descriptor_set_layout(pipeline_layout->set_layouts[info->set]);
@@ -785,17 +1038,65 @@ kk_cmd_buffer_flush_push_descriptors(struct kk_cmd_buffer *cmd,
 {
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct kk_push_descriptor_set *push_set = desc->push[set_idx];
-      struct kk_ptr push_gpu = kk_pool_upload(
-         cmd, push_set->data, sizeof(push_set->data), KK_MIN_UBO_ALIGNMENT);
+
+      /* limina: upload only the bytes the set actually uses instead of the full
+       * KK_PUSH_DESCRIPTOR_SET_SIZE (2 KiB). Zink pushes descriptors per draw,
+       * so this directly scales the upload-pool burn rate (and BO/residency
+       * churn). Matches regular descriptor sets, which already size by the
+       * layout. Was LIMINA_KK_SLIMPUSH, default-ON since round 19 and
+       * unconditional since 2026-08-14.
+       *
+       * Size by the per-set high-water mark, NOT the latest push's layout:
+       * retained bindings from earlier (larger-layout) pushes must stay in the
+       * upload. Latest-layout sizing truncated them — visible as
+       * flickering/transparent frames in glmark2 texture/shading/effect2d
+       * (round 19 regression, caught by eyeball). */
+      const uint32_t latest_layout_size =
+         push_set->layout->non_variable_descriptor_buffer_size;
+      static int limina_stats = -1;
+      if (limina_stats < 0)
+         limina_stats = getenv("LIMINA_KK_STATS") != NULL;
+      if (limina_stats && push_set->limina_used_size > latest_layout_size) {
+         static int truncs = 0;
+         if (truncs++ % 1000 == 0)
+            fprintf(stderr,
+                    "[LIMINA-KK-SLIMPUSH] retained-binding carry: used=%u > "
+                    "latest-layout=%u (x%d) — latest-layout sizing would "
+                    "truncate\n",
+                    push_set->limina_used_size, latest_layout_size, truncs);
+      }
+      uint32_t size = align(push_set->limina_used_size, KK_MIN_UBO_ALIGNMENT);
+      size = CLAMP(size, KK_MIN_UBO_ALIGNMENT, sizeof(push_set->data));
+      struct kk_ptr push_gpu =
+         kk_pool_upload(cmd, push_set->data, size, KK_MIN_UBO_ALIGNMENT);
       if (unlikely(!push_gpu.gpu))
          return;
 
       desc->root.sets[set_idx] = push_gpu.gpu;
-      desc->set_sizes[set_idx] = sizeof(push_set->data);
+      desc->set_sizes[set_idx] = size;
    }
 
    desc->root_dirty = true;
    desc->push_dirty = 0;
+}
+
+void
+kk_dispatch_grid(mtl_compute_encoder *encoder, struct kk_grid grid,
+                 struct mtl_size local_size)
+{
+   switch (grid.mode) {
+   case KK_GRID_DIRECT:
+      mtl_dispatch_threads(encoder, grid.size, local_size);
+      break;
+   case KK_GRID_INDIRECT:
+      mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
+                                                     local_size);
+      break;
+   case KK_GRID_INDIRECT_THREADS:
+      mtl_dispatch_threadgroups_with_indirect_buffer(
+         encoder, grid.addr + 3u * sizeof(uint32_t), local_size);
+      break;
+   }
 }
 
 void
@@ -823,11 +1124,7 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
       .z = prog->info.workgroup_size[2],
    };
 
-   if (grid.mode == KK_GRID_DIRECT)
-      mtl_dispatch_threads(encoder, grid.size, local_size);
-   else
-      mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
-                                                     local_size);
+   kk_dispatch_grid(encoder, grid, local_size);
    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
 
@@ -858,10 +1155,23 @@ kk_CmdPushDescriptorSetWithTemplate2KHR(
 
    struct kk_descriptor_state *desc =
       kk_get_descriptors_state(cmd, template->bind_point);
-   struct kk_descriptor_set_layout *set_layout = vk_to_kk_descriptor_set_layout(
-      pipeline_layout->set_layouts[pPushDescriptorSetWithTemplateInfo->set]);
-   struct kk_push_descriptor_set *push_set = kk_cmd_push_descriptors(
-      cmd, desc, set_layout, pPushDescriptorSetWithTemplateInfo->set);
+
+   /* The set index indexes pipeline_layout->set_layouts[] and desc->push[],
+    * both of KK_MAX_SETS; bound it as the plain push does. */
+   const uint32_t set = pPushDescriptorSetWithTemplateInfo->set;
+   if (set >= KK_MAX_SETS || set >= pipeline_layout->set_count ||
+       pipeline_layout->set_layouts[set] == NULL) {
+      mesa_loge(
+         "kk: refusing a template push to descriptor set %u, past the %u "
+         "the pipeline layout holds (max %u)",
+         set, pipeline_layout->set_count, KK_MAX_SETS);
+      return;
+   }
+
+   struct kk_descriptor_set_layout *set_layout =
+      vk_to_kk_descriptor_set_layout(pipeline_layout->set_layouts[set]);
+   struct kk_push_descriptor_set *push_set =
+      kk_cmd_push_descriptors(cmd, desc, set_layout, set);
    if (unlikely(push_set == NULL))
       return;
 

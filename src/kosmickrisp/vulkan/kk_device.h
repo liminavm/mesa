@@ -10,6 +10,8 @@
 
 #include "kk_private.h"
 
+#include "util/u_atomic.h"
+
 #include "kk_query_table.h"
 #include "kk_queue.h"
 
@@ -76,8 +78,85 @@ struct kk_precompiled_cache {
    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
 };
 
+/* limina: shared MTL4 command-allocator pool.
+ *
+ * Upstream gives each VkCommandPool its own free list of allocators and never resets them, and
+ * two measured facts make that ratchet (spikes/vrend-region-leak/, spikes/kk-alloc-pool/):
+ *   - reset() marks heaps for reuse and NEVER shrinks allocatedSize, so an allocator's size is
+ *     non-decreasing for its whole lifetime; only releasing it returns its heaps (100%, measured);
+ *   - each workload launch drives a different subset of allocators to a new high-water, so
+ *     never-reset allocators climb with every launch and return nothing when it closes
+ *     (663 -> 1492 MiB over eight aquarium launches on the vrend tier, 117 allocators throughout).
+ * On the vrend tier the KK VkDevice belongs to host zink's screen and lives until the worker
+ * exits, so nothing else ever gives that memory back.
+ *
+ * The pool bounds and returns it: allocators are borrowed device-wide for the span of one
+ * recording, so the count follows concurrency; one that crosses a byte budget leaves service and
+ * is released once every command buffer begun on it has completed; and an idle one past a decay
+ * window is released above a floor. The count has a ceiling: an acquire that finds the pool full
+ * waits briefly for a borrow to end or a drained allocator to be released, then fails, because a
+ * guest's in-flight depth is not bounded by anything the host controls. Nothing is ever reset:
+ * reset returns no memory, and reusing a reset allocator faults inside
+ * -[IOGPUMetal4CommandBuffer fillCommandBufferArgs:] at commit under upstream's
+ * reused-MTL4CommandBuffer model (spikes/kk-alloc-pool/RESULTS.md).
+ */
+struct kk_pooled_alloc {
+   mtl_command_allocator *handle;
+   /* Command buffers begun on this allocator that the GPU has not completed. Charged at
+    * mtl_begin_command_buffer, NOT at commit: the borrow is returned at vkEndCommandBuffer while
+    * the command buffer still sits uncommitted, and releasing the allocator in that window would
+    * free heaps the GPU has not been handed yet. */
+   uint32_t pending;
+   bool in_use;   /* borrowed by a recording command buffer; Metal allows one at a time */
+   bool draining; /* over budget: never borrowed again, released once pending hits 0 */
+   uint32_t uses; /* recordings so far, for the stats */
+   /* os_time_get_nano() when the last borrow ended: the decay clock. 0 = borrowed. */
+   uint64_t idle_since;
+};
+
+struct kk_alloc_pool {
+   mtx_t mtx;
+   /* Signalled by release and discharge, the two events that can make room at the ceiling, and
+    * only while someone waits: the common path takes no extra syscall. */
+   cnd_t room;
+   uint32_t waiters;
+   struct util_dynarray allocs; /* struct kk_pooled_alloc * */
+   uint64_t budget_bytes;
+   uint64_t decay_ns;    /* idle this long before an under-budget allocator is surplus */
+   uint32_t floor;       /* never decay below this many (drained over-budget ones always go) */
+   /* Never mint past this many live allocators (0 = no ceiling). At the ceiling an acquire waits
+    * up to wait_ns for a release or a drain, then fails. */
+   uint32_t ceiling;
+   uint64_t wait_ns;
+   bool destroy_enabled; /* LIMINA_KK_ALLOC_DESTROY=0 kill switch */
+   /* Stats, so neither growth nor reclaim is silent. */
+   uint32_t live;
+   uint32_t peak_live;
+   uint32_t destroyed;
+   uint32_t watermark_warned; /* growth past this warns, and doubles it */
+   uint64_t ceiling_waits;    /* acquires that found the pool at its ceiling */
+   uint64_t ceiling_fails;    /* ... and gave up */
+   uint64_t acquires;
+   uint64_t stats_every; /* LIMINA_KK_ALLOC_STATS=<n>: a stats line every n acquires; 0 = off */
+   uint64_t retired;     /* crossed the budget */
+   uint64_t retired_uses; /* sum of their recordings, for the mean lifetime */
+};
+
+/* util_dynarray's macros take a single type token, so give the pointer a name. */
+typedef struct kk_pooled_alloc *kk_pooled_alloc_ptr;
+
+void kk_alloc_pool_init(struct kk_device *dev);
+void kk_alloc_pool_finish(struct kk_device *dev);
+struct kk_pooled_alloc *kk_alloc_pool_acquire(struct kk_device *dev);
+void kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa);
+void kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa);
+void kk_alloc_pool_discharge(struct kk_device *dev, struct kk_pooled_alloc *pa);
+
 struct kk_device {
    struct vk_device vk;
+
+   /* limina: see struct kk_alloc_pool. */
+   struct kk_alloc_pool alloc_pool;
 
    mtl_device *mtl_handle;
    mtl_compiler *mtl_compiler_handle;
@@ -103,6 +182,30 @@ struct kk_device {
    /* Geomtry heap */
    struct kk_bo *heap;
    util_once_flag heap_init_once;
+
+   /* Triangle-list indices for a triangle fan of up to KK_FAN_MAX_VERTICES vertices,
+    * shared by every direct non-indexed fan draw. Created on first use. */
+   struct kk_bo *fan_indices;
+   util_once_flag fan_indices_once;
+
+   /* Writable scratch for geometry shader counters nothing reads */
+   struct kk_bo *gs_sink;
+   util_once_flag gs_sink_once;
+
+   /* Transform feedback counter-buffer shadow: command replay is sequential
+    * on the queue thread and zink only consumes counter values through
+    * vkCmdBeginTransformFeedbackEXT resume / vkCmdDrawIndirectByteCountEXT,
+    * both of which we serve from this CPU-side map (the buffer itself is
+    * not written -- TODO for full conformance). Small ring, newest wins.
+    */
+   struct {
+      struct {
+         mtl_buffer *buffer;
+         uint64_t offset;
+         uint64_t value;
+      } entries[32];
+      uint32_t next;
+   } xfb_counters;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
@@ -117,6 +220,22 @@ VkResult kk_device_init_meta(struct kk_device *dev);
 void kk_device_finish_meta(struct kk_device *dev);
 VkResult kk_device_init_lib(struct kk_device *dev);
 void kk_device_finish_lib(struct kk_device *dev);
+/* limina: how many allocations the queue-attached residency set is carrying. A bindless read
+ * dereferences a texture's MTLResourceID, and a resource that is not resident faults exactly as a
+ * stale pointer would -- so the size of this set is a suspect in its own right once every
+ * lifetime explanation is spent. Counted by kind because a view, a heap and a placed texture are
+ * three different costs. */
+extern uint32_t kk_limina_resident_heaps, kk_limina_resident_buffers,
+   kk_limina_resident_textures;
+
+/* limina: how many device sampler-table slots have been zeroed and returned to the free list. */
+extern uint32_t kk_limina_sampler_retires;
+
+/* limina: whether to print KK's own diagnostics, the lines that report on a
+ * healthy driver rather than a fault: LIMINA_KK_DIAG=1 or 0, else the bridge's
+ * default (mtl_diag_default). */
+bool kk_limina_diag(void);
+
 void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
 void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
                                               mtl_heap *heap);
@@ -124,6 +243,10 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
                                            mtl_buffer *buffer);
 void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
                                                 mtl_buffer *buffer);
+void kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture);
+void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                                 mtl_texture *texture);
 void kk_device_make_resources_resident(struct kk_device *dev);
 
 /* Required to create a sampler */

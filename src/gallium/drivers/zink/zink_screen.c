@@ -22,6 +22,7 @@
  */
 
 #include "zink_screen.h"
+#include "util/u_atomic.h"
 
 #include "zink_kopper.h"
 #include "zink_compiler.h"
@@ -91,6 +92,19 @@ bool zink_tracing = false;
 #include "MoltenVK/mvk_deprecated_api.h"
 #include "MoltenVK/mvk_private_api.h"
 #endif /* HAVE_MOLTENVK */
+
+#if defined(MVK_VERSION)
+/* MVK_VERSION only says MoltenVK's headers were found at build time; another driver
+ * (KosmicKrisp) can be the one running. LIMINA_ZINK_MVK_WORKAROUNDS=1 applies the
+ * MoltenVK workarounds whatever the driver, as before.
+ */
+static bool
+zink_needs_moltenvk_workarounds(const struct zink_screen *screen)
+{
+   return zink_driverid(screen) == VK_DRIVER_ID_MOLTENVK ||
+          debug_get_bool_option("LIMINA_ZINK_MVK_WORKAROUNDS", false);
+}
+#endif
 
 #ifdef HAVE_LIBDRM
 #include "drm-uapi/dma-buf.h"
@@ -762,7 +776,13 @@ zink_init_screen_caps(struct zink_screen *screen)
          BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
       if (screen->have_triangle_fans)
          modes |= BITFIELD_BIT(MESA_PRIM_TRIANGLE_FAN);
-      if (screen->info.have_EXT_primitive_topology_list_restart) {
+      /* limina: KosmicKrisp restarts a list only by unrolling its indices on
+       * the GPU, a compute dispatch per draw. GLES 3 and WebGL 2 keep restart on
+       * for every indexed draw, so leaving lists out lets the GL frontend drop
+       * restart for draws with no restart index, and only the rest pay for
+       * emulation. */
+      if (screen->info.have_EXT_primitive_topology_list_restart &&
+          zink_driverid(screen) != VK_DRIVER_ID_MESA_KOSMICKRISP) {
          modes |= BITFIELD_BIT(MESA_PRIM_POINTS) |
             BITFIELD_BIT(MESA_PRIM_LINES) |
             BITFIELD_BIT(MESA_PRIM_LINES_ADJACENCY) |
@@ -775,7 +795,8 @@ zink_init_screen_caps(struct zink_screen *screen)
    }
    {
       uint32_t modes = BITFIELD_MASK(MESA_PRIM_COUNT);
-      if (!screen->have_triangle_fans || !screen->info.feats.features.geometryShader)
+      if (!screen->have_triangle_fans || !screen->info.feats.features.geometryShader ||
+          screen->driver_workarounds.no_gs_emulation)
          modes &= ~BITFIELD_BIT(MESA_PRIM_QUADS);
       modes &= ~BITFIELD_BIT(MESA_PRIM_QUAD_STRIP);
       modes &= ~BITFIELD_BIT(MESA_PRIM_POLYGON);
@@ -784,10 +805,10 @@ zink_init_screen_caps(struct zink_screen *screen)
          modes &= ~BITFIELD_BIT(MESA_PRIM_TRIANGLE_FAN);
       caps->supported_prim_modes = modes;
    }
-#if defined(MVK_VERSION)
-   caps->fbfetch = 0;
-#else
    caps->fbfetch = screen->info.have_KHR_dynamic_rendering_local_read;
+#if defined(MVK_VERSION)
+   if (zink_needs_moltenvk_workarounds(screen))
+      caps->fbfetch = 0;
 #endif
    caps->fbfetch_coherent = caps->fbfetch && screen->info.have_EXT_rasterization_order_attachment_access;
 
@@ -2015,7 +2036,7 @@ zink_flush_frontbuffer(struct pipe_screen *pscreen,
 
    /* handle any outstanding acquire submits (not just from above) */
    if (ctx->swapchain || ctx->needs_present) {
-      ctx->bs->has_work = true;
+      p_atomic_set(&ctx->bs->has_work, true);
       pctx->flush(pctx, NULL, PIPE_FLUSH_END_OF_FRAME);
    }
    res->use_damage = false;
@@ -2226,6 +2247,9 @@ static bool
 zink_internal_setup_moltenvk(struct zink_screen *screen)
 {
 #if defined(MVK_VERSION)
+   if (!zink_needs_moltenvk_workarounds(screen))
+      return true;
+
    // MoltenVK only supports VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE in newer Metal versions
    // disable unless we can get MoltenVK to confirm it is supported
    screen->have_dynamic_state_vertex_input_binding_stride = false;
@@ -3115,6 +3139,13 @@ zink_is_video_format_supported(struct pipe_screen *pscreen,
 static void
 init_driver_workarounds(struct zink_screen *screen)
 {
+   /* KosmicKrisp runs geometry shaders as compute programs before the draw;
+    * the primitive emulations zink builds on them cost a compute pass per
+    * draw, so keep those primitives on their non-GS lowering. */
+   screen->driver_workarounds.no_gs_emulation =
+      zink_driverid(screen) == VK_DRIVER_ID_MESA_KOSMICKRISP &&
+      !getenv("LIMINA_ZINK_GS_EMULATION");
+
    /* enable implicit sync for all non-mesa drivers */
    screen->driver_workarounds.implicit_sync = !zink_driver_is_venus(screen);
    switch (zink_driverid(screen)) {
@@ -3155,6 +3186,7 @@ init_driver_workarounds(struct zink_screen *screen)
    if ((!screen->info.have_EXT_line_rasterization ||
         !screen->info.line_rast_feats.stippledBresenhamLines) &&
        screen->info.feats.features.geometryShader &&
+       !screen->driver_workarounds.no_gs_emulation &&
        screen->info.feats.features.sampleRateShading) {
       /* we're using stippledBresenhamLines as a proxy for all of these, to
        * avoid accidentally changing behavior on VK-drivers where we don't
@@ -3308,7 +3340,6 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_BROADCOM_PROPRIETARY:
    case VK_DRIVER_ID_ARM_PROPRIETARY:
    case VK_DRIVER_ID_MESA_HONEYKRISP:
-   case VK_DRIVER_ID_MESA_KOSMICKRISP:
       screen->driver_workarounds.track_renderpasses = true; //screen->info.primgen_feats.primitivesGeneratedQueryWithRasterizerDiscard
       break;
    default:
@@ -3656,10 +3687,19 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (config) {
       driParseConfigFiles(config->options, config->options_info,
                           &(driConfigFileParseParams) { .driverName = "zink" });
-      screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
+      /* limina spike: on the surfaceless->sw-vk->zink loader path, config->options_info is not
+       * populated with zink's driconf option descriptions, so the cache is empty and an
+       * unconditional driQueryOptionb() trips assert(info[i].name != NULL). Guard each query with
+       * driCheckOption (safe on an empty cache) and fall back to the option default. The real fix
+       * is wiring zink's options_info into the drisw/kopper loader path. See spikes/virgl-zink-kk. */
+#define ZINK_OPTB(field, name, dflt) \
+      screen->driconf.field = driCheckOption(config->options, (name), DRI_BOOL) \
+                              ? driQueryOptionb(config->options, (name)) : (dflt)
+      ZINK_OPTB(dual_color_blend_by_location, "dual_color_blend_by_location", false);
       //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
-      screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
-      screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
+      ZINK_OPTB(emulate_point_smooth, "zink_emulate_point_smooth", false);
+      ZINK_OPTB(zink_shader_object_enable, "zink_shader_object_enable", false);
+#undef ZINK_OPTB
    }
 
    simple_mtx_lock(&instance_lock);

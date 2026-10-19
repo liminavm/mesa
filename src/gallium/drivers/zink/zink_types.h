@@ -1631,6 +1631,9 @@ struct zink_screen {
       bool track_renderpasses;
       bool no_linestipple;
       bool no_linesmooth;
+      /* Geometry shaders are emulated in compute: keep quads, edge flags,
+       * line stipple and the other primitive emulations off them. */
+      bool no_gs_emulation;
       bool can_do_invalid_linear_modifier;
       bool inconsistent_interpolation;
       bool can_2d_view_sparse;
@@ -2033,6 +2036,8 @@ struct zink_context {
    struct {
       uint64_t render_passes;
    } hud;
+   /* LIMINA: what ends this context's render passes (LIMINA_ZINK_RP_STATS=1), NULL when off. */
+   struct zink_limina_rp_stats *limina_rp;
 
    struct pipe_resource *dummy_xfb_buffer;
 
@@ -2132,11 +2137,16 @@ struct zink_context {
    bool shobj_draw : 1; //using shader objects for draw
    bool is_device_lost;
    bool primitive_restart;
-   bool blitting : 1;
+   /* NOT bitfields: these two are read on the driver thread while the threaded
+    * context's thread writes neighbouring flags, and distinct bitfields sharing a
+    * storage unit are ONE memory location as far as the memory model (and
+    * ThreadSanitizer) are concerned -- so a bitfield here is a data race that no
+    * amount of atomics on the individual flags can fix. Give them their own bytes. */
+   bool blitting;
+   bool unordered_blitting;
    bool video_batch : 1;
    bool blit_scissor : 1;
    bool blit_nearest : 1;
-   bool unordered_blitting : 1;
    bool rp_tc_info_updated : 1;
    bool last_work_was_compute : 1;
    bool needs_transfer_sync : 1;
