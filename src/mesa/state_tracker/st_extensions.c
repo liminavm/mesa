@@ -497,9 +497,10 @@ void st_init_limits(struct pipe_screen *screen,
    /* GL_ARB_get_program_binary */
    if (screen->get_disk_shader_cache && screen->get_disk_shader_cache(screen))
       c->NumProgramBinaryFormats = 1;
-   /* GL_ARB_gl_spirv */
+   /* GL_ARB_gl_spirv, and SPIR-V in GLES 3.1+ for virgl's host renderer, which hands its
+    * guests' shaders over as SPIR-V instead of GLSL text it would otherwise generate. */
    if (screen->caps.gl_spirv &&
-       (api == API_OPENGL_CORE || api == API_OPENGL_COMPAT))
+       (api == API_OPENGL_CORE || api == API_OPENGL_COMPAT || api == API_OPENGLES2))
       c->NumShaderBinaryFormats = 1;
 
    c->MaxAtomicBufferBindings =

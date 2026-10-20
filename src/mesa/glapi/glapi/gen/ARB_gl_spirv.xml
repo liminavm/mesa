@@ -8,7 +8,7 @@
     <enum name="SHADER_BINARY_FORMAT_SPIR_V_ARB" value="0x9551"/>
     <enum name="SPIR_V_BINARY_ARB" value="0x9552"/>
 
-    <function name="SpecializeShaderARB">
+    <function name="SpecializeShaderARB" es2="3.1">
         <param name="shader" type="GLuint"/>
         <param name="pEntryPoint" type="const GLchar *" count="(strlen(pEntryPoint) + 1)"/>
         <param name="numSpecializationConstants" type="GLuint"/>
