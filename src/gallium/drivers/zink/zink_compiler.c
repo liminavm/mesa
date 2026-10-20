@@ -5914,7 +5914,11 @@ zink_shader_finalize(struct pipe_screen *pscreen, struct nir_shader *nir, bool o
    if (!screen->info.feats.features.shaderImageGatherExtended)
       tex_opts.lower_tg4_offsets = true;
    NIR_PASS(_, nir, nir_lower_tex, &tex_opts);
-   optimize_nir(nir, NULL, false);
+   /* zink_shader_init() runs the same loop on every shader that reaches the
+    * driver, so it is needed here only by the inlinable-uniform search below.
+    */
+   if (screen->driconf.inline_uniforms)
+      optimize_nir(nir, NULL, false);
    if (nir->info.stage == MESA_SHADER_VERTEX)
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    if (screen->driconf.inline_uniforms)
