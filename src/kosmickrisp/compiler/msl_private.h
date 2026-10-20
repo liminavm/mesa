@@ -30,14 +30,21 @@ struct nir_to_msl_ctx {
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
 };
 
+/* _mesa_string_buffer_printf for the MSL emitters: the conversions they use
+ * (%s, %d, %i, %u, %c, %x, %%) are appended directly, anything else goes
+ * through vsnprintf.
+ */
+void msl_printf(struct _mesa_string_buffer *str, const char *fmt, ...)
+   PRINTFLIKE(2, 3);
+
 #define P_IND(ctx, ...)                                                        \
    do {                                                                        \
       for (unsigned i = 0; i < (ctx)->indentlevel; i++)                        \
          _mesa_string_buffer_append((ctx)->text, "    ");                      \
-      _mesa_string_buffer_printf((ctx)->text, __VA_ARGS__);                    \
+      msl_printf((ctx)->text, __VA_ARGS__);                                    \
    } while (0);
 
-#define P(ctx, ...) _mesa_string_buffer_printf((ctx)->text, __VA_ARGS__);
+#define P(ctx, ...) msl_printf((ctx)->text, __VA_ARGS__);
 
 #define P_INDENT(ctx)                                                          \
    do {                                                                        \

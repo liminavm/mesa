@@ -9,6 +9,87 @@
 #include "nir.h"
 #include "nir_builder.h"
 
+#include <stdarg.h>
+#include <string.h>
+
+static uint32_t
+format_unsigned(char *buf, unsigned v, unsigned base)
+{
+   char digits[32];
+   uint32_t n = 0;
+   do {
+      digits[n++] = "0123456789abcdef"[v % base];
+      v /= base;
+   } while (v);
+   for (uint32_t i = 0; i < n; i++)
+      buf[i] = digits[n - 1 - i];
+   return n;
+}
+
+/* The MSL is built from thousands of small fragments, and vsnprintf costs
+ * most of the translation on its own (on macOS it also looks the locale up
+ * on every call), so the conversions the emitters use are done here.
+ */
+void
+msl_printf(struct _mesa_string_buffer *str, const char *fmt, ...)
+{
+   va_list args;
+   va_start(args, fmt);
+
+   for (const char *p = fmt; (p = strchr(p, '%')); p += 2) {
+      if (p[1] == '\0' || !strchr("sdiucx%", p[1])) {
+         _mesa_string_buffer_vprintf(str, fmt, args);
+         va_end(args);
+         return;
+      }
+   }
+
+   const char *run = fmt;
+   for (const char *p = fmt; (p = strchr(p, '%')); run = p) {
+      _mesa_string_buffer_append_len(str, run, p - run);
+      char num[16];
+      const char *out = num;
+      uint32_t len;
+      switch (p[1]) {
+      case 's':
+         out = va_arg(args, const char *);
+         if (!out)
+            out = "(null)";
+         len = strlen(out);
+         break;
+      case 'c':
+         num[0] = (char)va_arg(args, int);
+         len = 1;
+         break;
+      case 'd':
+      case 'i': {
+         int v = va_arg(args, int);
+         if (v < 0) {
+            num[0] = '-';
+            len = 1 + format_unsigned(num + 1, 0u - (unsigned)v, 10);
+         } else {
+            len = format_unsigned(num, v, 10);
+         }
+         break;
+      }
+      case 'u':
+         len = format_unsigned(num, va_arg(args, unsigned), 10);
+         break;
+      case 'x':
+         len = format_unsigned(num, va_arg(args, unsigned), 16);
+         break;
+      default:
+         num[0] = '%';
+         len = 1;
+         break;
+      }
+      _mesa_string_buffer_append_len(str, out, len);
+      p += 2;
+   }
+   _mesa_string_buffer_append_len(str, run, strlen(run));
+   va_end(args);
+}
+
 static const char *
 get_stage_string(mesa_shader_stage stage)
 {
