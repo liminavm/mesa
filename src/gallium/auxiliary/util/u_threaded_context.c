@@ -5931,6 +5931,43 @@ void tc_driver_internal_flush_notify(struct threaded_context *tc)
    tc->num_signal_fences_next_flush = 0;
 }
 
+/* limina: see threaded_context::new_shader_pending. */
+static void
+tc_draw_vbo_kick(struct pipe_context *_pipe, const struct pipe_draw_info *info,
+                 unsigned drawid_offset,
+                 const struct pipe_draw_indirect_info *indirect,
+                 const struct pipe_draw_start_count_bias *draws,
+                 unsigned num_draws)
+{
+   struct threaded_context *tc = threaded_context(_pipe);
+   tc_draw_vbo(_pipe, info, drawid_offset, indirect, draws, num_draws);
+   if (!tc->new_shader_pending)
+      return;
+   tc->new_shader_pending = false;
+   if (!tc->batch_slots[tc->next].num_total_slots)
+      return;
+   /* As when a batch fills before its next call: the render pass carries on. */
+   tc_batch_flush(tc, true);
+   tc->seen_fb_state = false;
+}
+
+static void *
+tc_create_fs_state_kick(struct pipe_context *_pipe,
+                        const struct pipe_shader_state *state)
+{
+   threaded_context(_pipe)->new_shader_pending = true;
+   return tc_create_fs_state(_pipe, state);
+}
+
+static void *
+tc_create_vs_state_kick(struct pipe_context *_pipe,
+                        const struct pipe_shader_state *state)
+{
+   threaded_context(_pipe)->new_shader_pending = true;
+   return tc_create_vs_state(_pipe, state);
+}
+
+
 /**
  * Wrap an existing pipe_context into a threaded_context.
  *
@@ -6052,6 +6089,8 @@ threaded_context_create(struct pipe_context *pipe,
 
    CTX_INIT(flush);
    CTX_INIT(draw_vbo);
+   if (tc->base.draw_vbo && debug_get_bool_option("LIMINA_TC_KICK", true))
+      tc->base.draw_vbo = tc_draw_vbo_kick;
    CTX_INIT(draw_vertex_state);
    CTX_INIT(launch_grid);
    CTX_INIT(resource_copy_region);
@@ -6087,9 +6126,13 @@ threaded_context_create(struct pipe_context *pipe,
    CTX_INIT(delete_depth_stencil_alpha_state);
    CTX_INIT(link_shader);
    CTX_INIT(create_fs_state);
+   if (tc->base.draw_vbo == tc_draw_vbo_kick)
+      tc->base.create_fs_state = tc_create_fs_state_kick;
    CTX_INIT(bind_fs_state);
    CTX_INIT(delete_fs_state);
    CTX_INIT(create_vs_state);
+   if (tc->base.draw_vbo == tc_draw_vbo_kick)
+      tc->base.create_vs_state = tc_create_vs_state_kick;
    CTX_INIT(bind_vs_state);
    CTX_INIT(delete_vs_state);
    CTX_INIT(create_gs_state);

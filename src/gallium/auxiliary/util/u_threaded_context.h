@@ -667,6 +667,10 @@ struct threaded_context {
    bool seen_ts;
    /* whether the current renderpass has seen a set_framebuffer_state call */
    bool seen_fb_state;
+   /* limina: a vertex or fragment shader was created since the last draw, so the next draw
+    * likely needs a pipeline compiled: hand its batch to the driver thread at once rather
+    * than when it fills (LIMINA_TC_KICK=0 turns it off). */
+   bool new_shader_pending;
    /* whether a renderpass is currently active */
    bool in_renderpass;
    /* whether a query has ended more recently than a draw */
