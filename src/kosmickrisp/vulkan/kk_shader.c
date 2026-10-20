@@ -34,6 +34,65 @@
 #include "vk_nir_convert_ycbcr.h"
 #include "vk_pipeline.h"
 
+#include "util/u_debug.h"
+
+#include <pthread.h>
+
+/* limina: one piece of a pipeline's compile run on a thread of its own, so a
+ * vertex and a fragment stage compile side by side (LIMINA_KK_PARALLEL=0 turns
+ * it off). Vulkan already lets two pipelines compile at once on two threads,
+ * so a stage touches nothing another pipeline could not. */
+struct kk_par {
+   void (*fn)(void *arg);
+   void *arg;
+   pthread_t thread;
+   bool started;
+};
+
+static bool
+kk_parallel(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = debug_get_bool_option("LIMINA_KK_PARALLEL", true);
+   return on;
+}
+
+static void *
+kk_par_main(void *arg)
+{
+   struct kk_par *p = arg;
+   p->fn(p->arg);
+   return NULL;
+}
+
+/* Starts `fn` on a thread, or runs it here when no thread can be had. NIR
+ * passes recurse, so the thread gets a main thread's stack rather than the
+ * 512 KiB macOS gives others. */
+static void
+kk_par_start(struct kk_par *p, void (*fn)(void *), void *arg)
+{
+   p->fn = fn;
+   p->arg = arg;
+   pthread_attr_t attr;
+   p->started = pthread_attr_init(&attr) == 0;
+   if (p->started) {
+      pthread_attr_setstacksize(&attr, 8u << 20);
+      p->started = pthread_create(&p->thread, &attr, kk_par_main, p) == 0;
+      pthread_attr_destroy(&attr);
+   }
+   if (!p->started)
+      fn(arg);
+}
+
+static void
+kk_par_join(struct kk_par *p)
+{
+   if (!p->started)
+      return;
+   pthread_join(p->thread, NULL);
+}
+
 static const nir_shader_compiler_options *
 kk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
                    UNUSED const struct vk_pipeline_robustness_state *rs)
@@ -1299,7 +1358,7 @@ kk_nir_bound_gs(nir_shader *nir)
 
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
-                  struct kk_shader *prev_stage,
+                  unsigned num_cull_distances,
                   const struct vk_pipeline_robustness_state *robustness,
                   const struct vk_graphics_pipeline_state *state,
                   const uint8_t *fs_reads,
@@ -1334,8 +1393,6 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       stage == MESA_SHADER_GEOMETRY ||
       (stage == MESA_SHADER_VERTEX && next_stage == MESA_SHADER_TESS_CTRL);
 
-   unsigned num_cull_distances =
-      prev_stage ? prev_stage->info.num_cull_distances : 0;
    if (!sw_stage)
       msl_nir_lower_clip_cull_distance(nir, num_cull_distances);
 
@@ -1484,7 +1541,7 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
    struct kk_shader *shader = NULL;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    VkResult result =
-      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, NULL, alloc, &shader);
+      kk_compile_shader(dev, nir, 0, &rs_none, NULL, NULL, alloc, &shader);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1839,6 +1896,22 @@ kk_limina_msl_hash(const struct kk_shader *sh)
    return h;
 }
 
+struct kk_library_job {
+   mtl_compiler *compiler;
+   const char *code;
+   enum mtl_language_version msl_version;
+   mtl_library *library;
+};
+
+static void
+kk_new_library(void *arg)
+{
+   struct kk_library_job *job = arg;
+   job->library = mtl_new_library(job->compiler, job->code, job->msl_version,
+                                  MTL_MATH_MODE_FAST,
+                                  MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+}
+
 static VkResult
 kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
 {
@@ -1870,20 +1943,37 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    }
 
    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
-   mtl_library *vertex_library = mtl_new_library(
-      device->mtl_compiler_handle, vs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
-   if (vertex_library == NULL)
+   const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
+   /* The two libraries compile side by side; Metal's compiler takes calls from
+    * any thread. */
+   struct kk_library_job vertex_job = {
+      .compiler = device->mtl_compiler_handle,
+      .code = vs_data->code,
+      .msl_version = pdev->info.msl_version,
+   };
+   struct kk_library_job fragment_job = vertex_job;
+   fragment_job.code = fs_data->code;
+   struct kk_par par;
+   bool parallel = kk_parallel();
+   if (parallel)
+      kk_par_start(&par, kk_new_library, &vertex_job);
+   else
+      kk_new_library(&vertex_job);
+   kk_new_library(&fragment_job);
+   if (parallel)
+      kk_par_join(&par);
+   mtl_library *vertex_library = vertex_job.library;
+   mtl_library *fragment_library = fragment_job.library;
+   if (vertex_library == NULL) {
+      if (fragment_library != NULL)
+         mtl_release(fragment_library);
       return VK_ERROR_INVALID_SHADER_NV;
+   }
 
    mtl_function_descriptor *vertex_function =
       mtl_new_library_function_descriptor(vertex_library,
                                           vs_data->entrypoint_name);
 
-   const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
-   mtl_library *fragment_library = mtl_new_library(
-      device->mtl_compiler_handle, fs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
    if (fragment_library == NULL) {
       result = VK_ERROR_INVALID_SHADER_NV;
       goto destroy_vertex;
@@ -1956,6 +2046,84 @@ destroy_vertex:
    return result;
 }
 
+struct kk_prelink_job {
+   struct kk_device *dev;
+   const struct vk_shader_compile_info *info;
+   const struct vk_graphics_pipeline_state *state;
+   enum kk_feature_key features;
+   bool tess, gs, tes_primitive_id, gs_reads_primitive_id;
+};
+
+/* Lowers one stage before the stages are linked, notably its IO. */
+static void
+kk_prelink_lower(void *arg)
+{
+   const struct kk_prelink_job *job = arg;
+   struct kk_device *dev = job->dev;
+   struct kk_physical_device *pdev = kk_device_physical(dev);
+   const struct vk_shader_compile_info *info = job->info;
+   const struct vk_graphics_pipeline_state *state = job->state;
+   enum kk_feature_key features = job->features;
+   bool tess = job->tess, gs = job->gs;
+   bool tes_primitive_id = job->tes_primitive_id;
+   bool gs_reads_primitive_id = job->gs_reads_primitive_id;
+   nir_shader *nir = info->nir;
+
+   /* For tessellation and geometry pipelines, the stages before the last
+    * pre-rasterization one are emulated in compute */
+   bool emulated_stage = (tess && (nir->info.stage == MESA_SHADER_VERTEX ||
+                                   nir->info.stage == MESA_SHADER_TESS_CTRL)) ||
+                         (gs && (nir->info.stage == MESA_SHADER_VERTEX ||
+                                 nir->info.stage == MESA_SHADER_TESS_EVAL));
+
+   /* With a geometry shader, the fragment shader's primitive ID is the one
+    * the geometry shader wrote, passed down as a flat varying rather than
+    * Metal's [[primitive_id]]. */
+   if ((gs || tes_primitive_id) && nir->info.stage == MESA_SHADER_FRAGMENT) {
+      const nir_lower_sysvals_to_varyings_options sysvals = {
+         .primitive_id = true,
+      };
+      NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals);
+   }
+
+   msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+   kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+                info->set_layout_count, info->set_layouts, state, features);
+
+   if (tes_primitive_id && nir->info.stage == MESA_SHADER_TESS_EVAL)
+      kk_tes_store_primitive_id(nir);
+   if (gs_reads_primitive_id && nir->info.stage == MESA_SHADER_GEOMETRY)
+      kk_gs_primitive_id_from_tes(nir);
+
+   if (nir->xfb_info) {
+      /* Fold constant offset srcs for IO, then attach xfb to the
+       * store_output intrinsics so kk_nir_lower_xfb can consume it. */
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      nir_io_add_intrinsic_xfb_info(nir);
+   }
+}
+
+struct kk_stage_job {
+   struct kk_device *dev;
+   nir_shader *nir;
+   unsigned num_cull_distances;
+   const struct vk_pipeline_robustness_state *robustness;
+   const struct vk_graphics_pipeline_state *state;
+   const uint8_t *fs_reads;
+   const VkAllocationCallbacks *alloc;
+   struct kk_shader **shader_out;
+   VkResult result;
+};
+
+static void
+kk_compile_stage(void *arg)
+{
+   struct kk_stage_job *job = arg;
+   job->result = kk_compile_shader(job->dev, job->nir, job->num_cull_distances,
+                                   job->robustness, job->state, job->fs_reads,
+                                   job->alloc, job->shader_out);
+}
+
 static VkResult
 kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -2007,49 +2175,31 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
     * optimization. */
    const struct vk_pipeline_robustness_state *vertex_robustness = &rs_none;
+   struct kk_prelink_job jobs[shader_count];
    for (uint32_t i = 0u; i < shader_count; ++i) {
-      const struct vk_shader_compile_info *info = &infos[i];
-      nir_shader *nir = info->nir;
-
-      /* For tessellation and geometry pipelines, the stages before the last
-       * pre-rasterization one are emulated in compute */
-      bool emulated_stage =
-         (tess && (nir->info.stage == MESA_SHADER_VERTEX ||
-                   nir->info.stage == MESA_SHADER_TESS_CTRL)) ||
-         (gs && (nir->info.stage == MESA_SHADER_VERTEX ||
-                 nir->info.stage == MESA_SHADER_TESS_EVAL));
-
-      /* With a geometry shader, the fragment shader's primitive ID is the one
-       * the geometry shader wrote, passed down as a flat varying rather than
-       * Metal's [[primitive_id]]. */
-      if ((gs || tes_primitive_id) && nir->info.stage == MESA_SHADER_FRAGMENT) {
-         const nir_lower_sysvals_to_varyings_options sysvals = {
-            .primitive_id = true,
-         };
-         NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals);
-      }
-
-      msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
-      kk_lower_nir(dev, nir, emulated_stage, info->robustness,
-                   info->set_layout_count, info->set_layouts, state, features);
-
-      if (tes_primitive_id && nir->info.stage == MESA_SHADER_TESS_EVAL)
-         kk_tes_store_primitive_id(nir);
-      if (gs_reads_primitive_id && nir->info.stage == MESA_SHADER_GEOMETRY)
-         kk_gs_primitive_id_from_tes(nir);
-
-      if (nir->info.stage == MESA_SHADER_VERTEX)
-         vertex_robustness = info->robustness;
-
-      if (nir->xfb_info) {
-         /* Fold constant offset srcs for IO, then attach xfb to the
-          * store_output intrinsics so kk_nir_lower_xfb can consume it. */
-         NIR_PASS(_, nir, nir_opt_constant_folding);
-         nir_io_add_intrinsic_xfb_info(nir);
-      }
-
-      nir_shaders[i] = nir;
+      jobs[i] = (struct kk_prelink_job){
+         .dev = dev,
+         .info = &infos[i],
+         .state = state,
+         .features = features,
+         .tess = tess,
+         .gs = gs,
+         .tes_primitive_id = tes_primitive_id,
+         .gs_reads_primitive_id = gs_reads_primitive_id,
+      };
+      if (infos[i].nir->info.stage == MESA_SHADER_VERTEX)
+         vertex_robustness = infos[i].robustness;
+      nir_shaders[i] = infos[i].nir;
    }
+   /* A plain vertex and fragment pair lowers side by side. */
+   bool parallel = kk_parallel() && shader_count == 2u && !tess && !gs;
+   struct kk_par par;
+   if (parallel)
+      kk_par_start(&par, kk_prelink_lower, &jobs[0]);
+   for (uint32_t i = parallel ? 1u : 0u; i < shader_count; ++i)
+      kk_prelink_lower(&jobs[i]);
+   if (parallel)
+      kk_par_join(&par);
 
    /* Since we don't support GPL nor shader objects and Metal render pipelines
     * require both vertex and fragment, we may need to provide a pass-through
@@ -2103,11 +2253,46 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       fs_reads = fs_reads_storage;
    }
 
+   /* A stage reads the cull distances the one before it writes; read them all
+    * before any stage's compile consumes its NIR. */
+   struct kk_stage_job stage_jobs[shader_count + 1u];
    for (uint32_t i = 0; i < total_shaders; i++) {
-      struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
-      result =
-         kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
-                           state, fs_reads, pAllocator, &shaders[i]);
+      stage_jobs[i] = (struct kk_stage_job){
+         .dev = dev,
+         .nir = nir_shaders[i],
+         .num_cull_distances =
+            i > 0 ? nir_shaders[i - 1]->info.cull_distance_array_size : 0,
+         .robustness = vertex_robustness,
+         .state = state,
+         .fs_reads = fs_reads,
+         .alloc = pAllocator,
+         .shader_out = &shaders[i],
+      };
+   }
+   bool parallel_stages = parallel && total_shaders == 2u;
+   if (parallel_stages) {
+      kk_par_start(&par, kk_compile_stage, &stage_jobs[0]);
+      kk_compile_stage(&stage_jobs[1]);
+      kk_par_join(&par);
+      /* Whichever failed, both ran: free what succeeded and report the first
+       * failure. */
+      if (stage_jobs[0].result != VK_SUCCESS ||
+          stage_jobs[1].result != VK_SUCCESS) {
+         for (uint32_t j = 0; j < 2u; j++) {
+            if (stage_jobs[j].result == VK_SUCCESS)
+               kk_shader_destroy(&dev->vk, shaders[j], pAllocator);
+         }
+         memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+         return stage_jobs[0].result != VK_SUCCESS ? stage_jobs[0].result
+                                                   : stage_jobs[1].result;
+      }
+   }
+
+   for (uint32_t i = 0; i < total_shaders; i++) {
+      if (!parallel_stages) {
+         kk_compile_stage(&stage_jobs[i]);
+         result = stage_jobs[i].result;
+      }
 
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
