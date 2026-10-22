@@ -13,6 +13,7 @@
 #include "util/u_atomic.h"
 
 #include "kk_cmd_buffer.h"
+#include "kk_cmd_pool.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
 #include "kk_image_view.h"
@@ -37,6 +38,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 /* limina: the shared command-allocator pool. Rationale and the measurements behind it are on
@@ -747,6 +749,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->mtl_compiler_handle == NULL)
       goto fail_init;
 
+   simple_mtx_init(&dev->limina_hangs.mtx, mtx_plain);
+
    /* We need to initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
@@ -854,10 +858,53 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&dev->residency_set.mutex);
 
    kk_release_compiler(dev);
+   simple_mtx_destroy(&dev->limina_hangs.mtx);
 
    vk_device_finish(&dev->vk);
 
    vk_free(&dev->vk.alloc, dev);
+}
+
+void
+kk_limina_charge_hang(struct kk_device *dev, uint64_t pool_serial)
+{
+   if (pool_serial == 0u)
+      return;
+
+   simple_mtx_lock(&dev->limina_hangs.mtx);
+   uint32_t n = ARRAY_SIZE(dev->limina_hangs.slot);
+   uint32_t i;
+   for (i = 0u; i < n; i++) {
+      if (dev->limina_hangs.slot[i].pool == pool_serial)
+         break;
+   }
+   if (i == n) {
+      i = dev->limina_hangs.next_slot++ % n;
+      dev->limina_hangs.slot[i].pool = pool_serial;
+      dev->limina_hangs.slot[i].count = 0u;
+   }
+   dev->limina_hangs.slot[i].count++;
+   simple_mtx_unlock(&dev->limina_hangs.mtx);
+}
+
+static uint32_t VKAPI_CALL
+kk_GetCommandPoolHangCountLIMINA(VkDevice _device, VkCommandPool commandPool)
+{
+   VK_FROM_HANDLE(kk_device, dev, _device);
+   VK_FROM_HANDLE(kk_cmd_pool, pool, commandPool);
+   if (dev == NULL || pool == NULL)
+      return 0u;
+
+   uint32_t count = 0u;
+   simple_mtx_lock(&dev->limina_hangs.mtx);
+   for (uint32_t i = 0u; i < ARRAY_SIZE(dev->limina_hangs.slot); i++) {
+      if (dev->limina_hangs.slot[i].pool == pool->limina_serial) {
+         count = dev->limina_hangs.slot[i].count;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->limina_hangs.mtx);
+   return count;
 }
 
 /* We need to implement this ourselves so we give the fake ones for vk_common_*
@@ -878,6 +925,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 kk_GetDeviceProcAddr(VkDevice _device, const char *pName)
 {
    VK_FROM_HANDLE(kk_device, device, _device);
+   if (device != NULL && pName != NULL &&
+       strcmp(pName, "vkGetCommandPoolHangCountLIMINA") == 0)
+      return (PFN_vkVoidFunction)kk_GetCommandPoolHangCountLIMINA;
    return kk_device_get_proc_addr(device, pName);
 }
 

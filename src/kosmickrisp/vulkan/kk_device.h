@@ -147,6 +147,12 @@ typedef struct kk_pooled_alloc *kk_pooled_alloc_ptr;
 
 void kk_alloc_pool_init(struct kk_device *dev);
 void kk_alloc_pool_finish(struct kk_device *dev);
+void kk_limina_charge_hang(struct kk_device *dev, uint64_t pool_serial);
+
+/* limina: the private device entry point zink resolves through vkGetDeviceProcAddr. */
+typedef uint32_t(VKAPI_PTR *PFN_vkGetCommandPoolHangCountLIMINA)(VkDevice device,
+                                                                  VkCommandPool pool);
+
 struct kk_pooled_alloc *kk_alloc_pool_acquire(struct kk_device *dev);
 void kk_alloc_pool_release(struct kk_device *dev, struct kk_pooled_alloc *pa);
 void kk_alloc_pool_charge(struct kk_device *dev, struct kk_pooled_alloc *pa);
@@ -176,6 +182,20 @@ struct kk_device {
 
    bool has_queue;
    struct kk_queue queue;
+
+   /* limina: how many times the GPU watchdog stopped work each command pool submitted, so the
+    * client that owns the pool can be told it was the one that hung the GPU
+    * (vkGetCommandPoolHangCountLIMINA). Hangs are rare: the latest pools are enough, and a pool
+    * that falls out of the table only loses its history. */
+   struct {
+      simple_mtx_t mtx;
+      uint64_t next_serial;
+      uint32_t next_slot;
+      struct {
+         uint64_t pool;
+         uint32_t count;
+      } slot[64];
+   } limina_hangs;
 
    struct vk_meta_device meta;
 

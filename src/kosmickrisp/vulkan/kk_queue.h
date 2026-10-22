@@ -31,6 +31,18 @@ struct kk_queue {
    uint32_t commits_in_flight;
    mtx_t mutex;
    cnd_t cond;
+
+   /* limina: GPU-watchdog recovery. A hang sets `hung` from Metal's feedback thread; the next
+    * submission moves to a new Metal queue, generation `gen` + 1, ordered after the old one
+    * through `swap_event`, because the kernel ignores a queue that has hung twice. The queues
+    * left behind are released once `swap_event` shows they drained. `signals` and `gen_hangs`
+    * are under `mutex`: the feedback thread delivers a dead generation's signals from them. */
+   uint32_t hung;
+   uint64_t gen;
+   mtl_shared_event *swap_event;
+   struct util_dynarray retired;   /* struct kk_retired_queue */
+   struct util_dynarray signals;   /* struct kk_pending_signal, in submission order */
+   struct util_dynarray gen_hangs; /* struct kk_gen_hangs */
 };
 
 static inline struct kk_device *
