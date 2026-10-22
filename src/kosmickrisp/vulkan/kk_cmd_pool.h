@@ -28,6 +28,10 @@ struct kk_cmd_bo {
 struct kk_cmd_pool {
    struct vk_command_pool vk;
 
+   /* limina: names this pool in the device's hang table (kk_limina_charge_hang). A serial, not
+    * the pointer, because the GPU watchdog's report can arrive after the pool is destroyed. */
+   uint64_t limina_serial;
+
    /** List of kk_cmd_bo */
    struct list_head free_bos;
    uint32_t num_free_bos;
