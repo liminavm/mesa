@@ -1,4 +1,5 @@
 #include "zink_batch.h"
+#include "util/os_time.h"
 #include "util/timespec.h"
 #include "util/u_atomic.h"
 #include "zink_context.h"
@@ -57,6 +58,65 @@ reset_obj_list(struct zink_screen *screen, struct zink_batch_state *bs, struct z
    for (unsigned i = 0; i < list->num_buffers; i++)
       reset_obj(screen, bs, list->objs[i]);
    list->num_buffers = 0;
+}
+
+/* A driver that survives a GPU hang (KosmicKrisp recovers from macOS's GPU watchdog) keeps the
+ * device, so nothing reaches zink as a loss; it counts the hangs per command pool instead. A
+ * finished batch state's pools are read as its context resets it, and that context is reset
+ * once it has caused ZINK_HANG_LIMIT hangs, or at any hang once all contexts together have caused
+ * more than ZINK_HANG_BUDGET since the last ZINK_HANG_FORGIVE_S seconds without one (0: never
+ * forgiven). A robust context then reads GUILTY_CONTEXT_RESET; until then it
+ * keeps rendering, having lost only the work that hung.
+ */
+/* charge hangs to the screen's budget, emptying it first after a quiet spell; returns the total */
+static unsigned
+count_screen_hangs(struct zink_screen *screen, uint32_t delta)
+{
+   uint64_t now = os_time_get_nano();
+   uint64_t last = p_atomic_xchg(&screen->last_hang_ns, now);
+   if (screen->hang_forgive_ns && last && now - last > screen->hang_forgive_ns)
+      p_atomic_set(&screen->hangs, 0);
+   return p_atomic_add_return(&screen->hangs, delta);
+}
+
+static void
+note_hangs(struct zink_screen *screen, struct zink_context *ctx, struct zink_batch_state *bs)
+{
+   if (!screen->pool_hang_count)
+      return;
+   uint32_t n = screen->pool_hang_count(screen->dev, bs->cmdpool) +
+                screen->pool_hang_count(screen->dev, bs->unsynchronized_cmdpool);
+   if (n <= bs->hangs_seen)
+      return;
+   uint32_t delta = n - bs->hangs_seen;
+   bs->hangs_seen = n;
+
+   unsigned mine = p_atomic_add_return(&ctx->hangs, delta);
+   unsigned all = count_screen_hangs(screen, delta);
+   bool over_budget = screen->hang_budget && all > screen->hang_budget;
+   bool reset = !ctx->is_device_lost && (mine >= screen->hang_limit || over_budget);
+   mesa_loge("zink: context %p hung the GPU (%u of %u for it, %u on the screen%s)%s",
+             (void *)ctx, mine, screen->hang_limit, all,
+             over_budget ? ", over budget" : "", reset ? "; resetting it" : "");
+   if (reset) {
+      ctx->is_device_lost = true;
+      if (ctx->reset.reset)
+         ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
+   }
+}
+
+/* A batch state moving to another context: hangs its pools reported after their previous owner
+ * last looked (a context destroyed with the work in flight) count for the screen's budget only. */
+static void
+adopt_hangs(struct zink_screen *screen, struct zink_batch_state *bs)
+{
+   if (!screen->pool_hang_count)
+      return;
+   uint32_t n = screen->pool_hang_count(screen->dev, bs->cmdpool) +
+                screen->pool_hang_count(screen->dev, bs->unsynchronized_cmdpool);
+   if (n > bs->hangs_seen)
+      count_screen_hangs(screen, n - bs->hangs_seen);
+   bs->hangs_seen = n;
 }
 
 /* reset a given batch state */
@@ -176,6 +236,9 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
 static void
 reset_batch_state_ctx(struct zink_context *ctx, struct zink_batch_state *bs)
 {
+   /* the last point a finished state still knows its context */
+   note_hangs(zink_screen(ctx->base.screen), ctx, bs);
+
    /* this is where bindless texture/buffer ids get recycled */
    while (util_dynarray_contains(&bs->bindless_unrefs, struct zink_bindless_descriptor *)) {
       struct zink_bindless_descriptor *bd = util_dynarray_pop(&bs->bindless_unrefs, struct zink_bindless_descriptor *);
@@ -430,6 +493,7 @@ find_screen_state(struct zink_screen *screen, struct zink_context *ctx)
          break;
    }
    if (bs) {
+      adopt_hangs(screen, bs);
       bs->ctx = ctx;
       if (prev)
          prev->next = bs->next;

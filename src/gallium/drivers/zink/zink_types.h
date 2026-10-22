@@ -631,6 +631,7 @@ struct zink_batch_state {
    VkCommandBuffer unsynchronized_cmdbuf;
    bool is_video;
    VkSemaphore signal_semaphore; //external signal semaphore
+   uint32_t hangs_seen; //the pools' hang count as of the last reset
    struct util_dynarray signal_semaphores; //internal signal semaphores
    struct util_dynarray user_signal_semaphores; //api signal semaphores
    struct util_dynarray user_signal_semaphore_values; //api signal semaphores
@@ -1452,6 +1453,16 @@ struct zink_screen {
    PFN_vkGetInstanceProcAddr vk_GetInstanceProcAddr;
    PFN_vkGetDeviceProcAddr vk_GetDeviceProcAddr;
 
+   /* How many GPU hangs each command pool caused, from drivers that can tell (KosmicKrisp's
+    * vkGetCommandPoolHangCountLIMINA); NULL elsewhere. See note_hangs() in zink_batch.c. */
+   uint32_t (VKAPI_PTR *pool_hang_count)(VkDevice device, VkCommandPool pool);
+   unsigned hang_limit;  /* hangs a context may cause before it is reset: ZINK_HANG_LIMIT */
+   unsigned hang_budget; /* hangs all contexts may cause before any further one resets its
+                          * context: ZINK_HANG_BUDGET, 0 for none */
+   uint64_t hang_forgive_ns; /* a quiet spell this long empties the budget: ZINK_HANG_FORGIVE_S */
+   unsigned hangs;       /* atomic: hangs every context caused since the budget last emptied */
+   uint64_t last_hang_ns; /* atomic */
+
    bool threaded;
    bool threaded_submit;
    bool is_cpu;
@@ -2149,6 +2160,7 @@ struct zink_context {
 
    bool shobj_draw : 1; //using shader objects for draw
    bool is_device_lost;
+   unsigned hangs; /* atomic: GPU hangs this context caused */
    bool primitive_restart;
    /* NOT bitfields: these two are read on the driver thread while the threaded
     * context's thread writes neighbouring flags, and distinct bitfields sharing a
