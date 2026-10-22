@@ -214,7 +214,8 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
     * could stall the very completions the wait needs. */
    struct kk_pooled_alloc *pa = kk_alloc_pool_acquire(dev);
    if (pa == NULL)
-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      return vk_device_is_lost_no_report(&dev->vk) ? VK_ERROR_DEVICE_LOST
+                                                   : VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
