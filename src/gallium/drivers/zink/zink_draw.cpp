@@ -574,6 +574,10 @@ zink_draw(struct pipe_context *pctx,
 
    struct zink_context *ctx = zink_context(pctx);
    struct zink_screen *screen = zink_screen(pctx->screen);
+   /* Nothing recorded after a loss can run, and recording it walks pools a lost device could not
+    * create. */
+   if (unlikely(screen->device_lost))
+      return;
    struct zink_rasterizer_state *rast_state = ctx->rast_state;
    struct zink_batch_state *bs = ctx->bs;
    struct zink_so_target *so_target =
@@ -1299,6 +1303,9 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    struct zink_context *ctx = zink_context(pctx);
    struct zink_batch_state *bs = ctx->bs;
    struct zink_screen *screen = zink_screen(pctx->screen);
+
+   if (unlikely(screen->device_lost))
+      return;
 
    if (unlikely(ctx->buffer_rebind_counter < screen->buffer_rebind_counter)) {
       ctx->buffer_rebind_counter = screen->buffer_rebind_counter;
