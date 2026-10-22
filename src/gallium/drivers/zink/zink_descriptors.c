@@ -966,8 +966,12 @@ check_pool_alloc(struct zink_context *ctx, struct zink_descriptor_pool_multi *mp
             }
          }
       }
-      if (!mpool->pool)
-         UNREACHABLE("out of descriptor memory!");
+      /* Not unreachable: a lost device fails every pool creation, and on a release build the
+       * unreachable fell through into a NULL pool. Callers already handle NULL. */
+      if (!mpool->pool) {
+         mesa_loge("ZINK: out of descriptor memory!");
+         return NULL;
+      }
    }
    struct zink_descriptor_pool *pool = mpool->pool;
    /* allocate up to $current * 10, e.g., 10 -> 100;
@@ -1014,6 +1018,9 @@ check_push_pool_alloc(struct zink_context *ctx, struct zink_descriptor_pool_mult
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    struct zink_descriptor_pool *pool = mpool->pool;
+   /* create_push_pool keeps a pool whose vkCreateDescriptorPool failed */
+   if (!pool || !pool->pool)
+      return NULL;
    /* allocate up to $current * 10, e.g., 10 -> 100 or 100 -> 1000 */
    if (pool->set_idx == pool->sets_alloc || unlikely(ctx->dd.has_fbfetch != bs->dd.has_fbfetch)) {
       unsigned sets_to_alloc = MIN2(MIN2(MAX2(pool->sets_alloc * 10, 10), MAX_LAZY_DESCRIPTORS) - pool->sets_alloc, 100);
@@ -1464,8 +1471,10 @@ zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
             if (ctx->dd.push_state_changed[pidx]) {
                struct zink_descriptor_pool *pool = check_push_pool_alloc(ctx, &bs->dd.push_pool[is_compute], bs, is_compute);
                VkDescriptorSet push_set = get_descriptor_set(pool);
-               if (!push_set)
-                  mesa_loge("ZINK: failed to get push descriptor set! prepare to crash!");
+               if (!push_set) {
+                  mesa_loge("ZINK: failed to get push descriptor set!");
+                  return;
+               }
                VKCTX(UpdateDescriptorSetWithTemplate)(screen->dev, push_set, pg->dd.templates[0], ctx);
                bs->dd.sets[pidx][0] = push_set;
             }
@@ -1624,9 +1633,11 @@ zink_batch_descriptor_reset(struct zink_screen *screen, struct zink_batch_state 
             consolidate_pool_alloc(screen, mpool);
 
             /* if the pool is still in use, reset the current set index */
-            if (mpool->pool_key->use_count)
-               mpool->pool->set_idx = 0;
-            else {
+            /* a pool whose allocation failed has no current pool */
+            if (mpool->pool_key->use_count) {
+               if (mpool->pool)
+                  mpool->pool->set_idx = 0;
+            } else {
                /* otherwise destroy it to reclaim memory */
                multi_pool_destroy(screen, mpool);
                mpools[j] = NULL;
