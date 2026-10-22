@@ -1118,7 +1118,10 @@ zink_draw(struct pipe_context *pctx,
           uint32_t partial_velem_mask)
 {
    MESA_TRACE_FUNC();
-   if (!dindirect && (!draws[0].count || !dinfo->instance_count)) {
+   /* Nothing recorded after a loss can run, and recording it walks pools a lost device could not
+    * create. */
+   if (unlikely(zink_screen(pctx->screen)->device_lost) ||
+       (!dindirect && (!draws[0].count || !dinfo->instance_count))) {
       if (VBS == ZINK_VBS_UNOWNED)
          zink_mark_atom_dirty(zink_context(pctx), ZINK_ATOM_VERTEX_BUFFERS);
       return;
@@ -1539,6 +1542,9 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    struct zink_context *ctx = zink_context(pctx);
    struct zink_batch_state *bs = ctx->bs;
    struct zink_screen *screen = zink_screen(pctx->screen);
+
+   if (unlikely(screen->device_lost))
+      return;
 
    if (unlikely(ctx->buffer_rebind_counter < screen->buffer_rebind_counter)) {
       ctx->buffer_rebind_counter = screen->buffer_rebind_counter;
