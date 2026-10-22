@@ -108,6 +108,10 @@ zink_context_destroy(struct pipe_context *pctx)
    struct zink_context *ctx = zink_context(pctx);
    struct zink_screen *screen = zink_screen(pctx->screen);
 
+   /* the frontend that installed the reset callback is being torn down: a hang found while the
+    * batch states are cleared below counts toward the screen's budget, not against this context */
+   ctx->reset.reset = NULL;
+
    struct pipe_framebuffer_state fb = {0};
    pctx->set_framebuffer_state(pctx, &fb);
 
