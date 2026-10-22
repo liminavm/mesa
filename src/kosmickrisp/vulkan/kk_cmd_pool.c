@@ -13,6 +13,8 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#include "util/u_atomic.h"
+
 #include "vk_common_entrypoints.h"
 
 #include <stdlib.h>
@@ -155,6 +157,7 @@ kk_CreateCommandPool(VkDevice _device,
    }
 
    pool->metal.free_cmd_bufs = UTIL_DYNARRAY_INIT;
+   pool->limina_serial = p_atomic_inc_return(&device->limina_hangs.next_serial);
 
    list_inithead(&pool->free_bos);
 
