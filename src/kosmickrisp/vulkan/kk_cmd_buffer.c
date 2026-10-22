@@ -269,7 +269,11 @@ fail_cmd:
    kk_alloc_pool_release(dev, cmd->metal.pa);
    cmd->metal.pa = NULL;
    cmd->metal.allocator = NULL;
-   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   /* limina: after a loss the allocator pool refuses on purpose, and calling that out of memory
+    * is what makes zink retry: its VRAM_ALLOC_LOOP sleeps ~1.5 s per call on OUT_OF_DEVICE_MEMORY,
+    * once per batch, which stalled the virtio-gpu worker for 20 s at a time behind a dead device. */
+   return vk_device_is_lost_no_report(&dev->vk) ? VK_ERROR_DEVICE_LOST
+                                                : VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
