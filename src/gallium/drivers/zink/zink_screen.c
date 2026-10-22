@@ -3749,6 +3749,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    vk_device_uncompacted_dispatch_table_load(&screen->vk.device,
                                              screen->vk_GetDeviceProcAddr,
                                              screen->dev);
+   screen->pool_hang_count = (void *)screen->vk_GetDeviceProcAddr(screen->dev,
+                                                                   "vkGetCommandPoolHangCountLIMINA");
+   screen->hang_limit = MAX2(debug_get_num_option("ZINK_HANG_LIMIT", 1), 1);
+   screen->hang_budget = debug_get_num_option("ZINK_HANG_BUDGET", 0);
+   screen->hang_forgive_ns = debug_get_num_option("ZINK_HANG_FORGIVE_S", 3600) * 1000000000ull;
 
    init_queue(screen);
 
