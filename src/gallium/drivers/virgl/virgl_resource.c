@@ -1084,10 +1084,13 @@ virgl_resource_get_param(struct pipe_screen *screen,
                          unsigned handle_usage,
                          uint64_t *value)
 {
+   struct pipe_resource *first = resource;
    struct virgl_resource *res;
 
    /* The plane argument indexes the chain, as it does in every driver that builds one:
-    * step to that element and answer from it. gst-va asks per plane this way. */
+    * step to that element and answer from it. gst-va asks per plane this way. A resource
+    * imported with several planes in one GBM layout has no chain, and the plane left over
+    * indexes its layout instead. */
    while (plane && resource->next) {
       --plane;
       resource = resource->next;
@@ -1096,10 +1099,20 @@ virgl_resource_get_param(struct pipe_screen *screen,
 
    switch(param) {
    case PIPE_RESOURCE_PARAM_STRIDE:
-      *value = res->metadata.stride[level];
+      virgl_resource_sync_gbm_layout(res);
+
+      if (res->metadata.gbm.layout.planes[0].stride)
+         *value = res->metadata.gbm.layout.planes[plane].stride;
+      else
+         *value = res->metadata.stride[level];
       return true;
    case PIPE_RESOURCE_PARAM_OFFSET:
-      *value = res->metadata.plane_offset + res->metadata.level_offset[level];
+      virgl_resource_sync_gbm_layout(res);
+
+      if (res->metadata.gbm.layout.planes[0].stride)
+         *value = res->metadata.gbm.layout.planes[plane].offset;
+      else
+         *value = res->metadata.plane_offset + res->metadata.level_offset[level];
       return true;
    case PIPE_RESOURCE_PARAM_MODIFIER:
       virgl_resource_sync_gbm_layout(res);
@@ -1110,27 +1123,11 @@ virgl_resource_get_param(struct pipe_screen *screen,
          *value = res->metadata.modifier;
       return true;
    case PIPE_RESOURCE_PARAM_NPLANES:
-      *value = util_resource_num(resource);
+      *value = util_resource_num(first);
       return true;
     case PIPE_RESOURCE_PARAM_DISJOINT_PLANES:
         *value = true;
         return true;
-   case PIPE_RESOURCE_PARAM_STRIDE:
-      virgl_resource_sync_gbm_layout(res);
-
-      if (res->metadata.gbm.layout.planes[0].stride)
-         *value = res->metadata.gbm.layout.planes[plane].stride;
-      else
-         return false;
-      return true;
-   case PIPE_RESOURCE_PARAM_OFFSET:
-      virgl_resource_sync_gbm_layout(res);
-
-      if (res->metadata.gbm.layout.planes[0].stride)
-         *value = res->metadata.gbm.layout.planes[plane].offset;
-      else
-         return false;
-      return true;
    default:
       return false;
    }
