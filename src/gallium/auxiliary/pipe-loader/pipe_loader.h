@@ -264,6 +264,12 @@ bool
 pipe_loader_drm_probe_fd(struct pipe_loader_device **dev, int fd, bool zink);
 
 /**
+ * Like pipe_loader_drm_probe_fd, with the driver named rather than asked of the loader.
+ */
+bool
+pipe_loader_drm_probe_fd_driver(struct pipe_loader_device **dev, int fd, const char *driver);
+
+/**
  * Get the dri options used for the DRM driver of the given name, if any.
  *
  * The returned array is heap-allocated.

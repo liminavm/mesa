@@ -584,8 +584,15 @@ vn_physical_device_sanitize_properties(struct vn_physical_device *physical_dev)
    props->driverID = VK_DRIVER_ID_MESA_VENUS;
 
    snprintf(props->driverName, sizeof(props->driverName), "venus");
+#ifdef LIMINA_VENDOR
+   /* Marks limina's vendor build, which installs beside the system's venus: its Vulkan layer
+    * hides the system's device by this. */
+   snprintf(props->driverInfo, sizeof(props->driverInfo),
+            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " (limina)");
+#else
    snprintf(props->driverInfo, sizeof(props->driverInfo),
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+#endif
 
    props->conformanceVersion.major = 1;
    props->conformanceVersion.minor = 4;
