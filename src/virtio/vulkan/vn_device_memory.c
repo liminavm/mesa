@@ -352,8 +352,10 @@ vn_device_memory_emit_report(struct vn_device *dev,
    struct vk_device *dev_vk = &dev->base.vk;
 
    const struct vk_device_memory *mem_vk = &mem->base.vk;
+   /* A failed import or allocation has no bo to name. */
    const uint64_t mem_obj_id =
-      (mem_vk->import_handle_type | mem_vk->export_handle_types)
+      (mem_vk->import_handle_type | mem_vk->export_handle_types) &&
+            mem->base_bo
          ? mem->base_bo->res_id
          : mem->base.id;
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
