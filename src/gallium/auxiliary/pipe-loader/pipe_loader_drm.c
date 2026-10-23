@@ -116,8 +116,9 @@ get_nctx_caps(int fd, struct virgl_renderer_capset_drm *caps)
 }
 
 static bool
-pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zink)
+pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, const char *driver)
 {
+   bool zink = driver && !strcmp(driver, "zink");
    struct pipe_loader_drm_device *ddev = CALLOC_STRUCT(pipe_loader_drm_device);
    int vendor_id, chip_id;
 
@@ -134,8 +135,8 @@ pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zin
    ddev->base.ops = &pipe_loader_drm_ops;
    ddev->fd = fd;
 
-   if (zink)
-      ddev->base.driver_name = strdup("zink");
+   if (driver)
+      ddev->base.driver_name = strdup(driver);
    else
       ddev->base.driver_name = loader_get_driver_for_fd(fd);
    if (!ddev->base.driver_name)
@@ -203,7 +204,22 @@ pipe_loader_drm_probe_fd(struct pipe_loader_device **dev, int fd, bool zink)
    if (fd < 0 || (new_fd = os_dupfd_cloexec(fd)) < 0)
      return false;
 
-   ret = pipe_loader_drm_probe_fd_nodup(dev, new_fd, zink);
+   ret = pipe_loader_drm_probe_fd_nodup(dev, new_fd, zink ? "zink" : NULL);
+   if (!ret)
+      close(new_fd);
+
+   return ret;
+}
+
+bool
+pipe_loader_drm_probe_fd_driver(struct pipe_loader_device **dev, int fd, const char *driver)
+{
+   int new_fd;
+
+   if (fd < 0 || (new_fd = os_dupfd_cloexec(fd)) < 0)
+     return false;
+
+   bool ret = pipe_loader_drm_probe_fd_nodup(dev, new_fd, driver);
    if (!ret)
       close(new_fd);
 
@@ -232,7 +248,7 @@ pipe_loader_drm_probe_internal(struct pipe_loader_device **devs, int ndev, bool 
       if (fd < 0)
          continue;
 
-      if (!pipe_loader_drm_probe_fd_nodup(&dev, fd, zink)) {
+      if (!pipe_loader_drm_probe_fd_nodup(&dev, fd, zink ? "zink" : NULL)) {
          close(fd);
          continue;
       }

@@ -66,18 +66,19 @@ char *
 loader_get_driver_for_fd(int fd);
 
 #ifdef LIMINA_VENDOR
-/* Whether `fd` is a limina transport this build speaks to. A vendor build drives nothing else. */
+/* Whether `fd` is a limina transport this build speaks to. */
 bool
 loader_fd_is_limina(int fd);
 
-/* Whether any render node is. */
+/* Whether `fd` is a virtio-gpu, which a vendor build drives whatever its transport. */
 bool
-loader_limina_present(void);
+loader_fd_is_virtio_gpu(int fd);
 
-/* Whether the client names drivers other than this build's: a Vulkan driver list without ours
- * (zink here runs on our Vulkan driver alone), or software rendering. Such a client is the
- * system's drivers' to serve. GALLIUM_DRIVER is not asked: a system Mesa's configuration sets it
- * for itself (GALLIUM_DRIVER=virgl on the enhanced tier), for every client. */
+/* Whether any render node is a virtio-gpu. */
+bool
+loader_virtio_gpu_present(void);
+
+/* Whether the client asks for software rendering, which is the system's drivers' to serve. */
 bool
 loader_limina_client_names_other_drivers(void);
 #endif

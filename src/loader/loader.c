@@ -78,19 +78,41 @@ loader_fd_is_limina(int fd)
 }
 
 bool
+loader_fd_is_virtio_gpu(int fd)
+{
+   drmVersionPtr v = drmGetVersion(fd);
+   bool virtio = v && v->name && !strcmp(v->name, "virtio_gpu");
+   drmFreeVersion(v);
+   return virtio;
+}
+
+bool
 loader_limina_client_names_other_drivers(void)
 {
-   const char *vk = getenv("VK_DRIVER_FILES");
-   if (!vk)
-      vk = getenv("VK_ICD_FILENAMES");
-   if (vk && !strstr(vk, "limina"))
-      return true;
    const char *sw = getenv("LIBGL_ALWAYS_SOFTWARE");
    return sw && strcmp(sw, "0") != 0 && strcmp(sw, "false") != 0;
 }
 
+/* Whether the client's Vulkan loader can reach KosmicKrisp, which zink here runs on: a client that
+ * names its Vulkan drivers names KosmicKrisp's ICD (limina-<wire>.json) or leaves it out. */
+static bool
+loader_limina_client_reaches_kosmickrisp(void)
+{
+   const char *vk = getenv("VK_DRIVER_FILES");
+   if (!vk)
+      vk = getenv("VK_ICD_FILENAMES");
+   if (!vk)
+      return true;
+   for (const char *p = vk; (p = strstr(p, "limina-")); p += strlen("limina-")) {
+      if ((p == vk || p[-1] == '/') && p[strlen("limina-")] >= '0' &&
+          p[strlen("limina-")] <= '9')
+         return true;
+   }
+   return false;
+}
+
 bool
-loader_limina_present(void)
+loader_virtio_gpu_present(void)
 {
    for (int n = 128; n < 192; n++) {
       char path[32];
@@ -98,7 +120,7 @@ loader_limina_present(void)
       int fd = open(path, O_RDWR | O_CLOEXEC);
       if (fd < 0)
          continue;
-      bool ours = lmn_probe_fd(fd);
+      bool ours = loader_fd_is_virtio_gpu(fd);
       close(fd);
       if (ours)
          return true;
@@ -821,11 +843,18 @@ loader_get_driver_for_fd(int fd)
    char *driver;
 
 #ifdef LIMINA_VENDOR
-   /* The only driver a vendor build has, and only for the device it is for: anything else
-    * belongs to the system's own drivers. Ahead of the override, which a system Mesa's
-    * configuration sets for itself (MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu on the enhanced
-    * tier) and which names a driver this build does not have. */
-   return loader_fd_is_limina(fd) ? strdup("zink") : NULL;
+   /* A vendor build drives every virtio-gpu and nothing else: zink on KosmicKrisp for a limina
+    * transport whose driver the client's Vulkan loader reaches, virgl for the rest. An override
+    * is honoured only when it names one of the two (zink on venus is a test vehicle). */
+   if (!loader_fd_is_virtio_gpu(fd))
+      return NULL;
+   if (__normal_user()) {
+      const char *override = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
+      if (override && (!strcmp(override, "zink") || !strcmp(override, "virtio_gpu")))
+         return strdup(override);
+   }
+   return strdup(loader_fd_is_limina(fd) && loader_limina_client_reaches_kosmickrisp()
+                    ? "zink" : "virtio_gpu");
 #endif
 
    /* Allow an environment variable to force choosing a different driver

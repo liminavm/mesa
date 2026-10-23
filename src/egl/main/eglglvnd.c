@@ -106,8 +106,8 @@ __egl_Main(uint32_t version, const __EGLapiExports *exports,
       return EGL_FALSE;
 
 #ifdef LIMINA_VENDOR
-   /* Without a transport this build speaks to, glvnd never routes a call here. */
-   if (!loader_limina_present())
+   /* Without a virtio-gpu, glvnd never routes a call here. */
+   if (!loader_virtio_gpu_present())
       return EGL_FALSE;
 #endif
 
