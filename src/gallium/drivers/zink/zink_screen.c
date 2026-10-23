@@ -1776,10 +1776,15 @@ zink_picks_device(int dev_major, uint64_t adapter_luid)
 
 #ifdef LIMINA_VENDOR
 /* KosmicKrisp on the limina bridge. venus drives the same render node and may report the host
- * driver's ID, so its device name tells it apart too. */
+ * driver's ID, so its device name tells it apart too. A client that names zink itself
+ * (MESA_LOADER_DRIVER_OVERRIDE=zink) takes whichever device its Vulkan loader gives it: zink on
+ * venus is a test vehicle. */
 static bool
 zink_limina_vendor_device(const struct zink_screen *screen, VkPhysicalDevice pdev)
 {
+   const char *override = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
+   if (override && !strcmp(override, "zink"))
+      return true;
    VkPhysicalDeviceDriverProperties driver_props = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
    };

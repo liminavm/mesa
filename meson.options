@@ -928,10 +928,10 @@ option(
   'limina-vendor',
   type : 'boolean',
   value : false,
-  description : 'Build as limina\'s vendor driver: GL through zink on KosmicKrisp over the ' +
-                'limina bridge only, installed beside the system Mesa. Every entry point ' +
-                '(EGL vendor, GBM backend, the DRI loader) declines a device that is not a ' +
-                'limina transport speaking this build\'s protocol, so the system drivers take it.'
+  description : 'Build as limina\'s vendor driver, installed beside the system Mesa and driving ' +
+                'every virtio-gpu: GL through zink on KosmicKrisp over a limina transport, ' +
+                'virgl elsewhere; venus for Vulkan; virgl for video. Every entry point (EGL ' +
+                'vendor, GBM backend, the DRI loader) declines any other device.'
 )
 
 option(

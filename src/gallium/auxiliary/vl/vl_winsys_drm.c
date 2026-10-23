@@ -58,7 +58,15 @@ vl_drm_screen_create(int fd, bool honor_dri_prime)
    if (!vscreen)
       return NULL;
 
+#ifdef LIMINA_VENDOR
+   /* Video is virgl's on every virtio-gpu, a limina transport's too: zink on KosmicKrisp decodes
+    * nothing. */
+   if (loader_fd_is_virtio_gpu(fd) ?
+          pipe_loader_drm_probe_fd_driver(&vscreen->dev, fd, "virtio_gpu") :
+          pipe_loader_drm_probe_fd(&vscreen->dev, fd, false))
+#else
    if (pipe_loader_drm_probe_fd(&vscreen->dev, fd, false))
+#endif
       vscreen->pscreen = pipe_loader_create_screen(vscreen->dev, false);
 
    if (libva_owned_fd >= 0 && libva_owned_fd != fd)

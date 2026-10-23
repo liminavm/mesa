@@ -1184,8 +1184,9 @@ dri_device_create(int fd, uint32_t gbm_backend_version)
 
 #ifdef LIMINA_VENDOR
    /* Installed as the backend of the device's DRM driver (virtio_gpu_gbm.so), so libgbm asks us
-    * first about every virtio-gpu: a device that is not ours goes to its built-in backend. */
-   if (!loader_fd_is_limina(fd) || loader_limina_client_names_other_drivers())
+    * first about every virtio-gpu; a client asking for software rendering goes to its built-in
+    * backend. */
+   if (!loader_fd_is_virtio_gpu(fd) || loader_limina_client_names_other_drivers())
       return NULL;
 #endif
 
