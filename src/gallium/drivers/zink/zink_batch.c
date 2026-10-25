@@ -96,6 +96,10 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    }
    util_dynarray_clear(&bs->zombie_samplers);
 
+   util_dynarray_foreach(&bs->bufferview_releases, struct zink_buffer_view *, bv)
+      zink_buffer_view_unref(*bv);
+   util_dynarray_clear(&bs->bufferview_releases);
+
    zink_batch_descriptor_reset(screen, bs);
 
    while (util_dynarray_contains(&bs->freed_sparse_backing_bos, struct zink_bo*)) {
@@ -261,6 +265,7 @@ zink_batch_state_destroy(struct zink_screen *screen, struct zink_batch_state *bs
    util_dynarray_fini(&bs->swapchain_obj);
    util_dynarray_fini(&bs->swapchain_obj_unsync);
    util_dynarray_fini(&bs->zombie_samplers);
+   util_dynarray_fini(&bs->bufferview_releases);
    util_dynarray_fini(&bs->bindless_releases[0]);
    util_dynarray_fini(&bs->bindless_releases[1]);
    util_dynarray_fini(&bs->acquires);
@@ -381,6 +386,7 @@ create_batch_state(struct zink_context *ctx)
    bs->wait_semaphore_values = UTIL_DYNARRAY_INIT;
    bs->fd_wait_semaphore_stages = UTIL_DYNARRAY_INIT;
    bs->zombie_samplers = UTIL_DYNARRAY_INIT;
+   bs->bufferview_releases = UTIL_DYNARRAY_INIT;
    bs->freed_sparse_backing_bos = UTIL_DYNARRAY_INIT;
    bs->acquires = UTIL_DYNARRAY_INIT;
    bs->acquire_flags = UTIL_DYNARRAY_INIT;
