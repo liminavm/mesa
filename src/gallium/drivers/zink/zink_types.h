@@ -679,6 +679,8 @@ struct zink_batch_state {
    struct util_dynarray bindless_unrefs; //zink_bindless_descriptor
 
    struct util_dynarray zombie_samplers;
+   /* buffer views a holder let go of while this batch may still read them */
+   struct util_dynarray bufferview_releases;
 
    struct set active_queries; /* zink_query objects which were active at some point in this batch */
    struct util_dynarray dead_querypools;
@@ -1818,7 +1820,9 @@ struct zink_bufferview_key {
 };
 
 struct zink_buffer_view {
-   struct zink_bufferview_key key;
+   struct zink_bufferview_key key; /* first: the surface cache compares entries by it */
+   /* one for the surface cache while it holds the view, one for each holder */
+   struct pipe_reference reference;
    struct pipe_resource *pres;
    VkBufferView buffer_view;
 };
@@ -1916,6 +1920,8 @@ struct zink_bindless_resident {
    unsigned access;
    /* the resource's rebind_count the handle was last written for in this context */
    unsigned rebind_count;
+   /* the view a resident texel-buffer handle is bound with in this context */
+   struct zink_buffer_view *bufferview;
 };
 
 struct zink_rendering_info {
