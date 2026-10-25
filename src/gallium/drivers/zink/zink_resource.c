@@ -210,10 +210,11 @@ void
 zink_destroy_resource_surface_cache(struct zink_screen *screen, struct set *ht, bool is_buffer)
 {
    if (is_buffer) {
-      set_foreach_remove(ht, he) {
+      /* not set_foreach_remove: eviction leaves deleted entries, which it would walk as views */
+      set_foreach(ht, he) {
          struct zink_buffer_view *bv = (void*)he->key;
          VKSCR(DestroyBufferView)(screen->dev, bv->buffer_view, NULL);
-         FREE(bv);
+         zink_buffer_view_unref(bv);
       }
       _mesa_set_fini(ht, NULL);
    } else {
@@ -224,6 +225,13 @@ zink_destroy_resource_surface_cache(struct zink_screen *screen, struct set *ht, 
       }
       _mesa_set_fini(ht, NULL);
    }
+}
+
+void
+zink_buffer_view_unref(struct zink_buffer_view *bv)
+{
+   if (pipe_reference(&bv->reference, NULL))
+      FREE(bv);
 }
 
 void
