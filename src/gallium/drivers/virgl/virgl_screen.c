@@ -744,6 +744,15 @@ virgl_is_format_supported( struct pipe_screen *screen,
      goto out_lookup;
    }
 
+   /* Planar YUV has no channels to inspect -- util_format describes it by its
+    * planes -- so the generic checks below would reject it out of hand and the
+    * gallium frontend would fall back to importing each plane as its own
+    * resource. Whether the host can sample the composite format is exactly
+    * what the sampler bitmask says, so go ask it. */
+   if (format_desc->layout == UTIL_FORMAT_LAYOUT_PLANAR2 ||
+       format_desc->layout == UTIL_FORMAT_LAYOUT_PLANAR3)
+      goto out_lookup;
+
    i = util_format_get_first_non_void_channel(format);
    if (i == -1)
       return false;
@@ -763,7 +772,28 @@ static bool virgl_is_video_format_supported(struct pipe_screen *screen,
                                             enum pipe_video_profile profile,
                                             enum pipe_video_entrypoint entrypoint)
 {
-    return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
+   /* A decoder does not produce three-plane 4:2:0. The generic helper answers a
+    * different question than the one asked -- its own comment is "we at least need to
+    * sample from it" -- so it accepts NV12, YV12 and IYUV alike, all of which decompose
+    * to R8 and so all of which the screen can sample. Every other driver implementing
+    * this hook answers from real decode caps instead (radeonsi, si_vid_is_format_supported);
+    * virgl deferred wholesale.
+    *
+    * The result is not a harmless surplus. ffmpeg chooses a surface format by exact match
+    * against sw_pix_fmt (vaapi_decode_find_best_format, and get_pix_fmt_score short-circuits
+    * to INT_MAX when dst == src), so for an 8-bit 4:2:0 stream I420 and YV12 both outscore
+    * NV12 and the last one advertised wins. Firefox then refuses the surface it is handed,
+    * tears down its frame pool and decodes in software: hardware decode is advertised,
+    * selected, and silently never used.
+    *
+    * So the two planar 4:2:0 layouts are withheld from decode targets, leaving NV12 -- what
+    * VA-API decoders actually emit. Encode and video processing are untouched, and so is
+    * every other format. */
+   if (entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM &&
+       (format == PIPE_FORMAT_YV12 || format == PIPE_FORMAT_IYUV))
+      return false;
+
+   return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
 }
 
 

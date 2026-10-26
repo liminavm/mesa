@@ -68,6 +68,67 @@
 #define __IS_LOADER
 #include "pci_id_driver_map.h"
 
+#ifdef LIMINA_VENDOR
+#include "../kosmickrisp/bridge/limina/lmn_probe.h"
+
+bool
+loader_fd_is_limina(int fd)
+{
+   return lmn_probe_fd(fd);
+}
+
+bool
+loader_fd_is_virtio_gpu(int fd)
+{
+   drmVersionPtr v = drmGetVersion(fd);
+   bool virtio = v && v->name && !strcmp(v->name, "virtio_gpu");
+   drmFreeVersion(v);
+   return virtio;
+}
+
+bool
+loader_limina_client_names_other_drivers(void)
+{
+   const char *sw = getenv("LIBGL_ALWAYS_SOFTWARE");
+   return sw && strcmp(sw, "0") != 0 && strcmp(sw, "false") != 0;
+}
+
+/* Whether the client's Vulkan loader can reach KosmicKrisp, which zink here runs on: a client that
+ * names its Vulkan drivers names KosmicKrisp's ICD (limina-<wire>.json) or leaves it out. */
+static bool
+loader_limina_client_reaches_kosmickrisp(void)
+{
+   const char *vk = getenv("VK_DRIVER_FILES");
+   if (!vk)
+      vk = getenv("VK_ICD_FILENAMES");
+   if (!vk)
+      return true;
+   for (const char *p = vk; (p = strstr(p, "limina-")); p += strlen("limina-")) {
+      if ((p == vk || p[-1] == '/') && p[strlen("limina-")] >= '0' &&
+          p[strlen("limina-")] <= '9')
+         return true;
+   }
+   return false;
+}
+
+bool
+loader_virtio_gpu_present(void)
+{
+   for (int n = 128; n < 192; n++) {
+      char path[32];
+      snprintf(path, sizeof(path), "/dev/dri/renderD%d", n);
+      int fd = open(path, O_RDWR | O_CLOEXEC);
+      if (fd < 0)
+         continue;
+      bool ours = loader_fd_is_virtio_gpu(fd);
+      close(fd);
+      if (ours)
+         return true;
+   }
+   return false;
+}
+#endif
+
 /* For systems like Hurd */
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -780,6 +841,21 @@ char *
 loader_get_driver_for_fd(int fd)
 {
    char *driver;
+
+#ifdef LIMINA_VENDOR
+   /* A vendor build drives every virtio-gpu and nothing else: zink on KosmicKrisp for a limina
+    * transport whose driver the client's Vulkan loader reaches, virgl for the rest. An override
+    * is honoured only when it names one of the two (zink on venus is a test vehicle). */
+   if (!loader_fd_is_virtio_gpu(fd))
+      return NULL;
+   if (__normal_user()) {
+      const char *override = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
+      if (override && (!strcmp(override, "zink") || !strcmp(override, "virtio_gpu")))
+         return strdup(override);
+   }
+   return strdup(loader_fd_is_limina(fd) && loader_limina_client_reaches_kosmickrisp()
+                    ? "zink" : "virtio_gpu");
+#endif
 
    /* Allow an environment variable to force choosing a different driver
     * binary.  If that driver binary can't survive on this FD, that's the

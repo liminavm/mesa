@@ -59,6 +59,7 @@
 #include <util/u_dynarray.h>
 #include <util/anon_file.h>
 #include <util/os_time.h>
+#include <util/stack_array.h>
 
 #include <loader/loader_wayland_helper.h>
 
@@ -447,7 +448,7 @@ wsi_wl_display_add_vk_format(struct wsi_wl_display *display,
 }
 
 static void
-wsi_wl_format_add_modifier(struct wsi_wl_format *format, uint64_t modifier)
+wsi_wl_format_add_modifier_full(struct wsi_wl_format *format, uint64_t modifier)
 {
    uint64_t *mod;
 
@@ -461,6 +462,17 @@ wsi_wl_format_add_modifier(struct wsi_wl_format *format, uint64_t modifier)
    mod = u_vector_add(&format->modifiers);
    if (mod)
       *mod = modifier;
+}
+
+static void
+wsi_wl_format_add_modifier(struct wsi_wl_format *format, uint64_t modifier)
+{
+   /* See treat_invalid_modifier_as_linear in wsi_common.h. The wsi_device
+    * pointer is reachable via the format's display, but format here doesn't
+    * carry it; the rewrite is done at the call sites that have wsi_device
+    * (wsi_wl_display_add_drm_format_modifier). For backward compat we still
+    * filter INVALID here. */
+   wsi_wl_format_add_modifier_full(format, modifier);
 }
 
 static void
@@ -483,6 +495,33 @@ wsi_wl_display_add_drm_format_modifier(struct wsi_wl_display *display,
 {
    VK_FROM_HANDLE(vk_physical_device, pdevice, display->wsi_wl->physical_device);
    struct wsi_device *wsi_device = pdevice->wsi_device;
+
+   /* On macOS-host virtio-gpu the compositor advertises every modifier as
+    * INVALID. Without the rewrite below, mesa would fall back to the
+    * prime-blit path, which on this transport breaks IOSurface zero-copy.
+    * See wsi_device::treat_invalid_modifier_as_linear. */
+   if (wsi_device->treat_invalid_modifier_as_linear &&
+       modifier == DRM_FORMAT_MOD_INVALID)
+      modifier = DRM_FORMAT_MOD_LINEAR;
+
+   /* Skip high-bit-depth DRM formats so apps fall back to 8-bpp BGRA/RGBA.
+    * See wsi_device::block_16f_swapchain_formats. The 16F variant trips a
+    * stride mismatch (8bpp treated as 4bpp downstream → cube positioned
+    * too far right) and 10:10:10:2 produces wrong colors via the current
+    * IOSurface→ANGLE path. Both render correctly at BGRA8/RGBA8. */
+   if (wsi_device->block_16f_swapchain_formats) {
+      switch (drm_format) {
+      case DRM_FORMAT_ABGR16161616F:
+      case DRM_FORMAT_XBGR16161616F:
+      case DRM_FORMAT_ARGB2101010:
+      case DRM_FORMAT_XRGB2101010:
+      case DRM_FORMAT_ABGR2101010:
+      case DRM_FORMAT_XBGR2101010:
+         return;
+      default:
+         break;
+      }
+   }
 
    /* From Vulkan 1.3 onwards, we can always try adding the 4444 formats.
     * If the format isn't supported or isn't renderable,
@@ -611,15 +650,16 @@ wsi_wl_display_add_drm_format_modifier(struct wsi_wl_display *display,
     * compared to DRM formats, just like the 8-bits-per-channel ones.
     * On little endian systems the memory representation of each channel
     * matches the DRM formats'. */
+   /* limina: do NOT expose R16G16B16A16_UNORM as a wayland swapchain/surface format.
+      It is a legal Vulkan swapchain format but NOT a color-renderable surface format in
+      wgpu/WebGPU even with TEXTURE_FORMAT_16BIT_NORM, so a conventional "first non-sRGB"
+      wgpu client (e.g. ghost-ui) that lands on it fails pipeline creation ("Rgba16Unorm
+      cannot be used as a render attachment"). It is never a real scanout format here (host
+      virtio-gpu scanout is 8-bit); it reached clients only via the compositor's
+      compositable dmabuf set. Skip the UNORM 16-bit cases; the SFLOAT (HDR) variants below
+      stay (those ARE wgpu-renderable). Matches lavapipe. */
    case DRM_FORMAT_ABGR16161616:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_R16G16B16A16_UNORM,
-                                            WSI_WL_FMT_ALPHA, modifier);
-      break;
    case DRM_FORMAT_XBGR16161616:
-      wsi_wl_display_add_vk_format_modifier(display, formats,
-                                            VK_FORMAT_R16G16B16A16_UNORM,
-                                            WSI_WL_FMT_OPAQUE, modifier);
       break;
    case DRM_FORMAT_ABGR16161616F:
       wsi_wl_display_add_vk_format_modifier(display, formats,
@@ -2312,10 +2352,43 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    vk_free2(&instance->alloc, pAllocator, wsi_wl_surface);
 }
 
+/* Whether the driver can allocate vk_format with any of the modifiers in f. */
+static bool
+format_has_driver_modifier(struct wsi_device *wsi_device, VkFormat vk_format,
+                           struct wsi_wl_format *f)
+{
+   VkDrmFormatModifierPropertiesListEXT list = {
+      .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+   };
+   VkFormatProperties2 format_props = {
+      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+      .pNext = &list,
+   };
+   wsi_device->GetPhysicalDeviceFormatProperties2(wsi_device->pdevice, vk_format,
+                                                  &format_props);
+   if (list.drmFormatModifierCount == 0)
+      return false;
+
+   STACK_ARRAY(VkDrmFormatModifierPropertiesEXT, props, list.drmFormatModifierCount);
+   list.pDrmFormatModifierProperties = props;
+   wsi_device->GetPhysicalDeviceFormatProperties2(wsi_device->pdevice, vk_format,
+                                                  &format_props);
+
+   bool found = false;
+   uint64_t *modifier;
+   u_vector_foreach(modifier, &f->modifiers) {
+      for (uint32_t i = 0; i < list.drmFormatModifierCount && !found; i++)
+         found = props[i].drmFormatModifier == *modifier;
+   }
+   STACK_ARRAY_FINISH(props);
+   return found;
+}
+
 static struct wsi_wl_format *
 pick_format_from_surface_dmabuf_feedback(struct wsi_wl_surface *wsi_wl_surface,
                                          VkFormat vk_format)
 {
+   struct wsi_device *wsi_device = wsi_wl_surface->display->wsi_wl->wsi;
    struct wsi_wl_format *f = NULL;
 
    /* If the main_device was not advertised, we don't have valid feedback */
@@ -2325,6 +2398,12 @@ pick_format_from_surface_dmabuf_feedback(struct wsi_wl_surface *wsi_wl_surface,
    util_dynarray_foreach(&wsi_wl_surface->dmabuf_feedback.tranches,
                          struct dmabuf_feedback_tranche, tranche) {
       f = find_format(&tranche->formats, vk_format);
+      /* A tranche offering only modifiers we cannot allocate, such as a scanout tranche of
+       * DRM_FORMAT_MOD_INVALID alone, would leave the image without a modifier: skip to the next
+       * one rather than fall back to an implicit layout the compositor may refuse. */
+      if (f && wsi_device->supports_modifiers &&
+          !format_has_driver_modifier(wsi_device, vk_format, f))
+         f = NULL;
       if (f)
          break;
    }

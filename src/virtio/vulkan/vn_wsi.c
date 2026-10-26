@@ -10,8 +10,12 @@
 
 #include "vn_wsi.h"
 
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+
 #include "vk_enum_to_str.h"
 #include "wsi_common_entrypoints.h"
+#include "wsi_common_private.h"
 
 #include "vn_device.h"
 #include "vn_image.h"
@@ -119,6 +123,34 @@ vn_wsi_chains_unlock(struct vn_device *dev,
    }
 }
 
+/* The common check matches PCI bus info only, so a virtio-gpu on any other
+ * bus (virtio-mmio on arm64 VMMs) never matched the X server's DRI3 device,
+ * and every X11 swapchain took the prime blit path into a buffer. Match the
+ * device numbers VK_EXT_physical_device_drm reports instead.
+ */
+static bool
+vn_wsi_can_present_on_device(VkPhysicalDevice physicalDevice, int fd)
+{
+   struct vn_physical_device *physical_dev =
+      vn_physical_device_from_handle(physicalDevice);
+   const VkPhysicalDeviceDrmPropertiesEXT *drm =
+      &physical_dev->instance->renderer->info.drm.props;
+
+   if (wsi_device_matches_drm_fd(physicalDevice, fd))
+      return true;
+
+   struct stat st;
+   if (fstat(fd, &st) || !S_ISCHR(st.st_mode))
+      return false;
+
+   const unsigned maj = major(st.st_rdev);
+   const unsigned min = minor(st.st_rdev);
+   return (drm->hasPrimary && maj == drm->primaryMajor &&
+           min == drm->primaryMinor) ||
+          (drm->hasRender && maj == drm->renderMajor &&
+           min == drm->renderMinor);
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 {
@@ -187,8 +219,19 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
       return result;
 
    physical_dev->wsi_device.supports_scanout = false;
+   physical_dev->wsi_device.can_present_on_device =
+      vn_wsi_can_present_on_device;
    physical_dev->wsi_device.supports_modifiers =
       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
+   /* macOS-host virtio-gpu compositors advertise modifiers as INVALID. Force
+    * the rewrite to LINEAR so mesa picks the native single-memory path; this
+    * is what lets the host-side IOSurface reach the wl_buffer Mutter samples. */
+   physical_dev->wsi_device.treat_invalid_modifier_as_linear = true;
+   /* Diagnostic: drop high-bit-depth DRM formats (RGBA16F, RGB10A2) so
+    * clients fall back to BGRA8/RGBA8. The high-bit path currently produces
+    * stride-mismatch position offsets and wrong colors via IOSurface→ANGLE.
+    * Remove this once the high-bit color/stride path is fixed. */
+   physical_dev->wsi_device.block_16f_swapchain_formats = true;
    physical_dev->base.vk.wsi_device = &physical_dev->wsi_device;
 
    return VK_SUCCESS;
