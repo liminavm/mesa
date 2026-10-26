@@ -254,6 +254,33 @@ alu_funclike_precise(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
       alu_src_to_msl(ctx, instr, 1);                                           \
    } while (0)
 
+/* NIR takes a shift count modulo the shifted value's bit size, and its
+ * algebraic passes rely on it: `(b >> (4 * (i & 1)))` on a byte becomes
+ * `b >> (i << 2)`. MSL shifts by the whole count, after promoting a char or a
+ * short to int, so a count past the operand's width shifts its bits away
+ * instead of wrapping (and is undefined at 32 and 64 bits). Mask the count,
+ * unless it is a constant already in range. */
+static void
+alu_shift_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
+                 const char *op)
+{
+   const unsigned bits = instr->def.bit_size;
+   bool in_range = nir_src_is_const(instr->src[1].src);
+   for (unsigned i = 0; in_range && i < instr->def.num_components; i++)
+      in_range = nir_src_comp_as_uint(instr->src[1].src,
+                                      instr->src[1].swizzle[i]) < bits;
+
+   alu_src_to_msl(ctx, instr, 0);
+   P(ctx, " %s ", op);
+   if (in_range) {
+      alu_src_to_msl(ctx, instr, 1);
+   } else {
+      P(ctx, "(");
+      alu_src_to_msl(ctx, instr, 1);
+      P(ctx, " & %uu)", bits - 1u);
+   }
+}
+
 static void
 alu_fcmp_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
                 const char *op)
@@ -311,11 +338,11 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
       ALU_BINOP("%");
       break;
    case nir_op_ishl:
-      ALU_BINOP("<<");
+      alu_shift_to_msl(ctx, instr, "<<");
       break;
    case nir_op_ishr:
    case nir_op_ushr:
-      ALU_BINOP(">>");
+      alu_shift_to_msl(ctx, instr, ">>");
       break;
    case nir_op_ige:
    case nir_op_uge:
@@ -2209,6 +2236,70 @@ kk_scalarize_filter(const nir_instr *instr, const void *data)
    return true;
 }
 
+/* The largest loop, in NIR's instruction cost times its trip count, whose
+ * [[unroll]] hint is honoured. A loop bounded by a specialization constant
+ * arrives with its trip count known, and unrolling it lets the arrays it
+ * indexes become values instead of scratch or if-else trees: ggml's
+ * matrix-vector kernels run 2-3x faster for it. Unrolling every hinted loop
+ * makes its tiled matrix multiply 4x slower instead, and this budget makes
+ * that one 3.7x faster.
+ */
+#define KK_UNROLL_HINT_BUDGET 512
+
+static void
+kk_budget_unroll_hints(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         kk_budget_unroll_hints(&nif->then_list);
+         kk_budget_unroll_hints(&nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         kk_budget_unroll_hints(&loop->body);
+         if (loop->control == nir_loop_control_unroll) {
+            const unsigned trip = loop->info->max_trip_count;
+            if (!trip || trip * loop->info->instr_cost > KK_UNROLL_HINT_BUDGET)
+               loop->control = nir_loop_control_none;
+         }
+         break;
+      }
+      default:
+         break;
+      }
+   }
+}
+
+/* Unroll the hinted loops that fit the budget. Inner loops go first; each
+ * round re-measures, so an outer loop is judged with its inner ones unrolled.
+ * max_unroll_iterations stays 0, so no loop without a hint is unrolled.
+ */
+static void
+kk_unroll_hinted_loops(nir_shader *nir)
+{
+   bool progress;
+   do {
+      progress = false;
+      nir_foreach_function_impl(impl, nir) {
+         nir_loop_analyze_impl(impl, 0, false);
+         kk_budget_unroll_hints(&impl->body);
+      }
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+   } while (progress);
+   NIR_PASS(_, nir, nir_split_array_vars, nir_var_function_temp);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+}
+
 void
 msl_preprocess_nir(struct nir_shader *nir)
 {
@@ -2273,6 +2364,9 @@ msl_preprocess_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_split_array_vars,
             nir_var_function_temp | nir_var_shader_in | nir_var_shader_out);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, kk_scalarize_filter, NULL);
+
+   /* Before the arrays below are lowered to scratch or if-else trees. */
+   kk_unroll_hinted_loops(nir);
 
    NIR_PASS(_, nir, nir_opt_large_constants, glsl_get_natural_size_align_bytes,
             32);

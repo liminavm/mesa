@@ -1,5 +1,7 @@
 #include "zink_batch.h"
+#include "util/os_time.h"
 #include "util/timespec.h"
+#include "util/u_atomic.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
 #include "zink_kopper.h"
@@ -58,6 +60,65 @@ reset_obj_list(struct zink_screen *screen, struct zink_batch_state *bs, struct z
    list->num_buffers = 0;
 }
 
+/* A driver that survives a GPU hang (KosmicKrisp recovers from macOS's GPU watchdog) keeps the
+ * device, so nothing reaches zink as a loss; it counts the hangs per command pool instead. A
+ * finished batch state's pools are read as its context resets it, and that context is reset
+ * once it has caused ZINK_HANG_LIMIT hangs, or at any hang once all contexts together have caused
+ * more than ZINK_HANG_BUDGET since the last ZINK_HANG_FORGIVE_S seconds without one (0: never
+ * forgiven). A robust context then reads GUILTY_CONTEXT_RESET; until then it
+ * keeps rendering, having lost only the work that hung.
+ */
+/* charge hangs to the screen's budget, emptying it first after a quiet spell; returns the total */
+static unsigned
+count_screen_hangs(struct zink_screen *screen, uint32_t delta)
+{
+   uint64_t now = os_time_get_nano();
+   uint64_t last = p_atomic_xchg(&screen->last_hang_ns, now);
+   if (screen->hang_forgive_ns && last && now - last > screen->hang_forgive_ns)
+      p_atomic_set(&screen->hangs, 0);
+   return p_atomic_add_return(&screen->hangs, delta);
+}
+
+static void
+note_hangs(struct zink_screen *screen, struct zink_context *ctx, struct zink_batch_state *bs)
+{
+   if (!screen->pool_hang_count)
+      return;
+   uint32_t n = screen->pool_hang_count(screen->dev, bs->cmdpool) +
+                screen->pool_hang_count(screen->dev, bs->unsynchronized_cmdpool);
+   if (n <= bs->hangs_seen)
+      return;
+   uint32_t delta = n - bs->hangs_seen;
+   bs->hangs_seen = n;
+
+   unsigned mine = p_atomic_add_return(&ctx->hangs, delta);
+   unsigned all = count_screen_hangs(screen, delta);
+   bool over_budget = screen->hang_budget && all > screen->hang_budget;
+   bool reset = !ctx->is_device_lost && (mine >= screen->hang_limit || over_budget);
+   mesa_loge("zink: context %p hung the GPU (%u of %u for it, %u on the screen%s)%s",
+             (void *)ctx, mine, screen->hang_limit, all,
+             over_budget ? ", over budget" : "", reset ? "; resetting it" : "");
+   if (reset) {
+      ctx->is_device_lost = true;
+      if (ctx->reset.reset)
+         ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
+   }
+}
+
+/* A batch state moving to another context: hangs its pools reported after their previous owner
+ * last looked (a context destroyed with the work in flight) count for the screen's budget only. */
+static void
+adopt_hangs(struct zink_screen *screen, struct zink_batch_state *bs)
+{
+   if (!screen->pool_hang_count)
+      return;
+   uint32_t n = screen->pool_hang_count(screen->dev, bs->cmdpool) +
+                screen->pool_hang_count(screen->dev, bs->unsynchronized_cmdpool);
+   if (n > bs->hangs_seen)
+      count_screen_hangs(screen, n - bs->hangs_seen);
+   bs->hangs_seen = n;
+}
+
 /* reset a given batch state */
 static void
 reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *bs)
@@ -97,6 +158,10 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
       VKSCR(DestroySampler)(screen->dev, *samp, NULL);
    }
    util_dynarray_clear(&bs->zombie_samplers);
+
+   util_dynarray_foreach(&bs->bufferview_releases, struct zink_buffer_view *, bv)
+      zink_buffer_view_unref(*bv);
+   util_dynarray_clear(&bs->bufferview_releases);
 
    zink_batch_descriptor_reset(screen, bs);
 
@@ -152,22 +217,22 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    /* fence waiters read these under the usage mutex: update them together */
    mtx_lock(&bs->usage.mtx);
    /* only increment batch generation if previously in-use to avoid false detection of batch completion */
-   if (bs->fence.submitted)
-      bs->usage.submit_count++;
+   if (p_atomic_read(&bs->fence.submitted))
+      p_atomic_inc(&bs->usage.submit_count);
    /* only reset submitted here so that tc fence desync can pick up the 'completed' flag
     * before the state is reused
     */
-   bs->fence.submitted = false;
+   p_atomic_set(&bs->fence.submitted, false);
    const uint64_t reset_batch_id = bs->fence.batch_id;
-   bs->fence.batch_id = 0;
+   p_atomic_set(&bs->fence.batch_id, 0);
    mtx_unlock(&bs->usage.mtx);
    if (reset_batch_id)
       zink_screen_update_last_finished(screen, reset_batch_id);
-   bs->usage.usage = 0;
+   p_atomic_set(&bs->usage.usage, 0);
    bs->next = NULL;
-   bs->last_added_obj = NULL;
+   p_atomic_set(&bs->last_added_obj, NULL);
 
-   bs->has_work = false;
+   p_atomic_set(&bs->has_work, false);
    bs->has_reordered_work = false;
    bs->has_unsync = false;
 }
@@ -175,6 +240,9 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
 static void
 reset_batch_state_ctx(struct zink_context *ctx, struct zink_batch_state *bs)
 {
+   /* the last point a finished state still knows its context */
+   note_hangs(zink_screen(ctx->base.screen), ctx, bs);
+
    /* this is where bindless texture/buffer ids get recycled */
    while (util_dynarray_contains(&bs->bindless_unrefs, struct zink_bindless_descriptor *)) {
       struct zink_bindless_descriptor *bd = util_dynarray_pop(&bs->bindless_unrefs, struct zink_bindless_descriptor *);
@@ -200,7 +268,7 @@ zink_reset_batch_state(struct zink_context *ctx, struct zink_batch_state *bs)
 void
 zink_clear_batch_state(struct zink_context *ctx, struct zink_batch_state *bs)
 {
-   bs->fence.completed = true;
+   p_atomic_set(&bs->fence.completed, true);
    zink_reset_batch_state(ctx, bs);
 }
 
@@ -210,7 +278,7 @@ pop_batch_state(struct zink_context *ctx)
 {
    const struct zink_batch_state *bs = ctx->batch_states;
    ctx->batch_states = bs->next;
-   ctx->batch_states_count--;
+   p_atomic_dec(&ctx->batch_states_count);
    if (ctx->last_batch_state == bs)
       ctx->last_batch_state = NULL;
 }
@@ -223,7 +291,7 @@ zink_batch_reset_all(struct zink_context *ctx)
 {
    while (ctx->batch_states) {
       struct zink_batch_state *bs = ctx->batch_states;
-      bs->fence.completed = true;
+      p_atomic_set(&bs->fence.completed, true);
       pop_batch_state(ctx);
       zink_reset_batch_state(ctx, bs);
       zink_batch_state_append(&ctx->free_batch_states, &ctx->last_free_batch_state, bs);
@@ -263,6 +331,7 @@ zink_batch_state_destroy(struct zink_screen *screen, struct zink_batch_state *bs
    util_dynarray_fini(&bs->swapchain_obj);
    util_dynarray_fini(&bs->swapchain_obj_unsync);
    util_dynarray_fini(&bs->zombie_samplers);
+   util_dynarray_fini(&bs->bufferview_releases);
    util_dynarray_fini(&bs->bindless_unrefs);
    util_dynarray_fini(&bs->acquires);
    util_dynarray_fini(&bs->signal_semaphores);
@@ -382,6 +451,7 @@ create_batch_state(struct zink_context *ctx)
    bs->wait_semaphore_values = UTIL_DYNARRAY_INIT;
    bs->fd_wait_semaphore_stages = UTIL_DYNARRAY_INIT;
    bs->zombie_samplers = UTIL_DYNARRAY_INIT;
+   bs->bufferview_releases = UTIL_DYNARRAY_INIT;
    bs->freed_sparse_backing_bos = UTIL_DYNARRAY_INIT;
    bs->acquires = UTIL_DYNARRAY_INIT;
    bs->acquire_flags = UTIL_DYNARRAY_INIT;
@@ -429,6 +499,7 @@ find_screen_state(struct zink_screen *screen, struct zink_context *ctx)
          break;
    }
    if (bs) {
+      adopt_hangs(screen, bs);
       bs->ctx = ctx;
       if (prev)
          prev->next = bs->next;
@@ -453,9 +524,9 @@ find_completed_batch_state(struct zink_context *ctx)
    while (i) {
       struct zink_batch_state *j = i->next;
       /* only a submitted state can be reused */
-      if (i->fence.submitted &&
+      if (p_atomic_read(&i->fence.submitted) &&
           /* a submitted state must have completed before it can be reused */
-          (zink_screen_check_last_finished(screen, i->fence.batch_id) || i->fence.completed)) {
+          (zink_screen_check_last_finished(screen, p_atomic_read(&i->fence.batch_id)) || p_atomic_read(&i->fence.completed))) {
          pop_batch_state(ctx);
          reset_batch_state_ctx(ctx, i);
          if (ctx->flags & ZINK_CONTEXT_COPY_ONLY) {
@@ -590,7 +661,7 @@ zink_start_batch(struct zink_context *ctx)
          mesa_loge("ZINK: vkBeginCommandBuffer failed (%s)", vk_Result_to_str(result));
    );
 
-   bs->fence.completed = false;
+   p_atomic_set(&bs->fence.completed, false);
 
 #if HAVE_RENDERDOC_INTEGRATION
    if (VKCTX(CmdInsertDebugUtilsLabelEXT) && screen->renderdoc_api) {
@@ -642,12 +713,14 @@ post_submit(struct zink_batch_state *bs, struct zink_screen *screen)
          /* if nothing can save us, abort */
          abort();
       screen->device_lost = true;
-   } else if (bs->ctx->batch_states_count > 5000) {
+   } else if (p_atomic_read(&bs->ctx->batch_states_count) > 5000) {
       /* throttle in case something crazy is happening */
-      zink_screen_timeline_wait(screen, bs->fence.batch_id - 2500, OS_TIMEOUT_INFINITE);
-   } else if (screen->curr_batch - screen->last_finished > 5) {
-      /* try to avoid ooming by regularly checking for batch completion */
-      zink_screen_timeline_wait(screen, screen->last_finished + 1, 0);
+      zink_screen_timeline_wait(screen, p_atomic_read(&bs->fence.batch_id) - 2500, OS_TIMEOUT_INFINITE);
+   } else {
+      const uint32_t last_finished = p_atomic_read(&screen->last_finished);
+      if (screen->curr_batch - last_finished > 5)
+         /* try to avoid ooming by regularly checking for batch completion */
+         zink_screen_timeline_wait(screen, last_finished + 1, 0);
    }
 }
 
@@ -679,7 +752,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    p_atomic_set(&bs->usage.usage, bs->fence.batch_id);
    p_atomic_set(&bs->usage.unflushed, false);
 
-   uint64_t batch_id = bs->fence.batch_id;
+   uint64_t batch_id = p_atomic_read(&bs->fence.batch_id);
    /* first submit is just for acquire waits since they have a separate array */
    for (unsigned i = 0; i < ARRAY_SIZE(si); i++)
       si[i].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -725,7 +798,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    if (si[ZINK_SUBMIT_CMDBUF].waitSemaphoreCount)
       si[ZINK_SUBMIT_CMDBUF].pNext = &sem_submit;
    {
-      VkCommandBuffer sync_cmdbuf = bs->has_work ? bs->cmdbuf :
+      VkCommandBuffer sync_cmdbuf = p_atomic_read(&bs->has_work) ? bs->cmdbuf :
                                                    bs->has_reordered_work ? bs->reordered_cmdbuf :
                                                                             bs->has_unsync ? bs->unsynchronized_cmdbuf :
                                                                                              VK_NULL_HANDLE;
@@ -747,7 +820,7 @@ submit_queue(void *data, void *gdata, int thread_index)
       cmdbufs[c++] = bs->unsynchronized_cmdbuf;
    if (bs->has_reordered_work)
       cmdbufs[c++] = bs->reordered_cmdbuf;
-   if (bs->has_work)
+   if (p_atomic_read(&bs->has_work))
       cmdbufs[c++] = bs->cmdbuf;
    si[ZINK_SUBMIT_CMDBUF].pCommandBuffers = cmdbufs;
    si[ZINK_SUBMIT_CMDBUF].commandBufferCount = c;
@@ -796,7 +869,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    }
 
    VkResult result;
-   if (bs->has_work) {
+   if (p_atomic_read(&bs->has_work)) {
       VRAM_ALLOC_LOOP(result,
          VKSCR(EndCommandBuffer)(bs->cmdbuf),
          if (result != VK_SUCCESS) {
@@ -900,7 +973,7 @@ end:
     */
    mtx_lock(&bs->usage.mtx);
    if (count_submit)
-      bs->usage.submit_count++;
+      p_atomic_inc(&bs->usage.submit_count);
    p_atomic_set(&bs->fence.submitted, true);
    u_cnd_monotonic_broadcast(&bs->usage.flush);
    mtx_unlock(&bs->usage.mtx);
@@ -940,7 +1013,7 @@ zink_end_batch(struct zink_context *ctx)
        ctx->last_batch_state)
       util_queue_fence_wait(&ctx->last_batch_state->flush_completed);
    zink_batch_state_append(&ctx->batch_states, &ctx->last_batch_state, bs);
-   ctx->batch_states_count++;
+   p_atomic_inc(&ctx->batch_states_count);
    ctx->work_count = 0;
 
    /* this is swapchain presentation semaphore handling */
@@ -1033,7 +1106,7 @@ zink_end_batch(struct zink_context *ctx)
             }
          }
       }
-      bs->has_work = true;
+      p_atomic_set(&bs->has_work, true);
    }
 
    util_dynarray_foreach(&bs->fences, struct zink_tc_fence*, mfence)
@@ -1154,7 +1227,7 @@ batch_reference_resource_move_internal(struct zink_batch_state *bs, struct zink_
    list->objs[idx] = res->obj;
    unsigned hash = bo->unique_id & (BUFFER_HASHLIST_SIZE-1);
    bs->buffer_indices_hashlist[hash] = idx & 0x7fff;
-   bs->last_added_obj = res->obj;
+   p_atomic_set(&bs->last_added_obj, res->obj);
    if (!(res->base.b.flags & PIPE_RESOURCE_FLAG_SPARSE)) {
       bs->resource_size += res->obj->size;
    } else {
@@ -1194,7 +1267,7 @@ zink_batch_reference_resource_move(struct zink_context *ctx, struct zink_resourc
     * This is very effective with suballocators and linear uploaders that
     * are outside of the winsys.
     */
-   if (res->obj == bs->last_added_obj) {
+   if (res->obj == p_atomic_read(&bs->last_added_obj)) {
       return true;
    }
 
@@ -1245,7 +1318,7 @@ zink_batch_reference_program(struct zink_context *ctx,
       return;
    pipe_reference(NULL, &pg->reference);
    zink_batch_usage_set(&pg->batch_uses, bs);
-   bs->has_work = true;
+   p_atomic_set(&bs->has_work, true);
 }
 
 /* a fast (hopefully) way to check whether a given batch has completed */
@@ -1257,7 +1330,7 @@ zink_screen_usage_check_completion(struct zink_screen *screen, const struct zink
    if (zink_batch_usage_is_unflushed(u))
       return false;
 
-   return zink_screen_timeline_wait(screen, u->usage, 0);
+   return zink_screen_timeline_wait(screen, p_atomic_read(&u->usage), 0);
 }
 
 /* an even faster check that doesn't ioctl */
@@ -1269,7 +1342,7 @@ zink_screen_usage_check_completion_fast(struct zink_screen *screen, const struct
    if (zink_batch_usage_is_unflushed(u))
       return false;
 
-   return zink_screen_check_last_finished(screen, u->usage);
+   return zink_screen_check_last_finished(screen, p_atomic_read(&u->usage));
 }
 
 bool
@@ -1279,7 +1352,7 @@ zink_batch_usage_check_completion(struct zink_context *ctx, const struct zink_ba
       return true;
    if (zink_batch_usage_is_unflushed(u))
       return false;
-   return zink_check_batch_completion(ctx, u->usage);
+   return zink_check_batch_completion(ctx, p_atomic_read(&u->usage));
 }
 
 bool
@@ -1289,7 +1362,7 @@ zink_batch_usage_unflushed_wait(struct zink_context *ctx, struct zink_batch_usag
    if (!zink_batch_usage_exists(u))
       return true;
    /* this batch state was already completed and reset */
-   if (zink_batch_submit_count_diff(u->submit_count, submit_count) > 1)
+   if (zink_batch_submit_count_diff(p_atomic_read(&u->submit_count), submit_count) > 1)
       return true;
    if (zink_batch_usage_is_unflushed(u)) {
       if (likely(u == &ctx->bs->usage)) {
@@ -1321,10 +1394,10 @@ batch_usage_wait(struct zink_context *ctx, struct zink_batch_usage *u, unsigned 
    if (!zink_batch_usage_exists(u))
       return;
    /* this batch state was already completed and reset */
-   if (zink_batch_submit_count_diff(u->submit_count, submit_count) > 1)
+   if (zink_batch_submit_count_diff(p_atomic_read(&u->submit_count), submit_count) > 1)
       return;
    if (zink_batch_usage_unflushed_wait(ctx, u, submit_count, trywait))
-      zink_wait_on_batch(ctx, u->usage);
+      zink_wait_on_batch(ctx, p_atomic_read(&u->usage));
 }
 
 void

@@ -6,7 +6,9 @@
  */
 
 #include "kk_image.h"
+#include "kk_limina_work.h"
 
+#include "kk_bo.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
 #include "kk_entrypoints.h"
@@ -19,7 +21,10 @@
 #include "vk_enum_defines.h"
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
+#include "vk_util.h"
 #include "wsi_common_private.h"
+
+#include "drm-uapi/drm_fourcc.h"
 
 static VkFormatFeatureFlags2
 kk_get_image_plane_format_features(struct kk_physical_device *pdev,
@@ -228,6 +233,20 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    memset(&pImageFormatProperties->imageFormatProperties, 0,
           sizeof(pImageFormatProperties->imageFormatProperties));
 
+   /* VK_EXT_image_drm_format_modifier: LINEAR is the only modifier we offer,
+    * and only for the formats kk_get_drm_format_modifier_features admits. */
+   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
+         vk_find_struct_const(
+            pImageFormatInfo->pNext,
+            PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+
+      if (mod_info == NULL ||
+          mod_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+          !kk_get_drm_format_modifier_features(pdev, pImageFormatInfo->format))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+
    /* Metal does not support depth/stencil textures that are not 2D (we make 1D
     * textures 2D) */
    if (vk_format_is_depth_or_stencil(pImageFormatInfo->format) &&
@@ -399,15 +418,38 @@ kk_GetPhysicalDeviceImageFormatProperties2(
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT:
          ext_mem_props = &kk_mtlheap_mem_props;
          break;
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT:
+         /* The imported texture supplies the layout, so the tiling the caller
+          * asks for is not ours to choose — but a LINEAR request would make
+          * kk_image_plane_create_texture take the buffer-backed path and ignore
+          * the import entirely, so refuse it rather than silently diverge. */
+         if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+            return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                             "MTLTexture import image must not be linear");
+         }
+         ext_mem_props = &kk_mtltexture_mem_props;
+         break;
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT: {
-         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR) {
+         /* DRM-format-modifier tiling qualifies: our only modifier is
+          * DRM_FORMAT_MOD_LINEAR, laid out exactly like TILING_LINEAR. */
+         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR &&
+             pImageFormatInfo->tiling !=
+                VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
             return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
                              "host memory import image must be linear");
          }
          ext_mem_props = &kk_host_mem_props;
          break;
       }
+#if !DETECT_OS_APPLE
+      /* Without modifiers a dma-buf image means this driver's own layout, which another
+       * KosmicKrisp context binds the same way. */
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+         ext_mem_props = &kk_fd_mem_props;
+         break;
+#endif
       default:
          /* From the Vulkan 1.3.256 spec:
           *
@@ -522,10 +564,52 @@ kk_GetPhysicalDeviceSparseImageFormatProperties2(
    return;
 }
 
+/* Whether the create info stays inside what KK advertises. Metal asserts on a
+ * texture descriptor past its limits, and KK's layout keeps per-level arrays of
+ * KK_MAX_MIP_LEVELS entries, one more than the levels they describe. Invalid
+ * usage reaches both, and under venus a guest sends it unchecked. */
+static bool
+kk_image_create_info_is_valid(const struct kk_physical_device *pdev,
+                              const VkImageCreateInfo *pCreateInfo)
+{
+   if (pCreateInfo->imageType != VK_IMAGE_TYPE_1D &&
+       pCreateInfo->imageType != VK_IMAGE_TYPE_2D &&
+       pCreateInfo->imageType != VK_IMAGE_TYPE_3D)
+      return false;
+
+   const VkExtent3D *extent = &pCreateInfo->extent;
+   const uint32_t max_dim =
+      kk_image_max_dimension(pdev, pCreateInfo->imageType);
+   if (extent->width == 0 || extent->height == 0 || extent->depth == 0 ||
+       extent->width > max_dim || extent->height > max_dim ||
+       extent->depth > max_dim)
+      return false;
+
+   if (pCreateInfo->arrayLayers == 0 || pCreateInfo->arrayLayers > 2048)
+      return false;
+
+   const uint32_t full_chain =
+      util_logbase2(MAX3(extent->width, extent->height, extent->depth)) + 1;
+   if (pCreateInfo->mipLevels == 0 || pCreateInfo->mipLevels > full_chain ||
+       pCreateInfo->mipLevels >= KK_MAX_MIP_LEVELS)
+      return false;
+
+   return true;
+}
+
 static VkResult
 kk_image_init(struct kk_device *dev, struct kk_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
+   if (!kk_image_create_info_is_valid(kk_device_physical(dev), pCreateInfo)) {
+      mesa_loge("kk: refusing a %ux%ux%u image with %u levels and %u layers, "
+                "outside what KK advertises",
+                pCreateInfo->extent.width, pCreateInfo->extent.height,
+                pCreateInfo->extent.depth, pCreateInfo->mipLevels,
+                pCreateInfo->arrayLayers);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
 
    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -551,6 +635,58 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
    image->disjoint = image->plane_count > 1 &&
                      (pCreateInfo->flags & VK_IMAGE_CREATE_DISJOINT_BIT);
 
+   /* VK_EXT_image_drm_format_modifier: DRM_FORMAT_MOD_LINEAR is the only
+    * modifier we advertise, so it is the only one a valid LIST can offer us
+    * and the only one a valid EXPLICIT can name. A multi-plane image is
+    * disjoint, every plane in memory of its own (limina: one surface per
+    * plane), since no single allocation lays its planes out for us. */
+   uint32_t explicit_row_stride_B[3] = {0};
+   if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      if (image->plane_count > 1 && !image->disjoint)
+         return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                          "a multi-plane image with a modifier must be disjoint");
+
+      const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit_info =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+      if (mod_explicit_info) {
+         if (mod_explicit_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+             mod_explicit_info->drmFormatModifierPlaneCount != image->plane_count)
+            return vk_errorf(dev,
+                             VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "unsupported DRM format modifier 0x%" PRIx64
+                             " (plane count %u)",
+                             mod_explicit_info->drmFormatModifier,
+                             mod_explicit_info->drmFormatModifierPlaneCount);
+         for (uint8_t p = 0; p < image->plane_count; p++) {
+            const VkSubresourceLayout *pl = &mod_explicit_info->pPlaneLayouts[p];
+            if (pl->offset != 0 || pl->rowPitch > UINT32_MAX)
+               return vk_errorf(dev,
+                                VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                                "unsupported explicit plane %u layout (offset %" PRIu64
+                                ", rowPitch %" PRIu64 ")",
+                                p, pl->offset, pl->rowPitch);
+            explicit_row_stride_B[p] = pl->rowPitch;
+         }
+      } else {
+         const VkImageDrmFormatModifierListCreateInfoEXT *mod_list_info =
+            vk_find_struct_const(pCreateInfo->pNext,
+                                 IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+         bool has_linear = false;
+         for (uint32_t i = 0;
+              mod_list_info && i < mod_list_info->drmFormatModifierCount; i++)
+            has_linear |=
+               mod_list_info->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR;
+         if (!has_linear)
+            return vk_errorf(dev,
+                             VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "modifier list offers none we support (LINEAR)");
+      }
+
+      assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_INVALID);
+      image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
+   }
+
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(pCreateInfo->format);
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
@@ -561,8 +697,37 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
       const uint8_t height_scale =
          ycbcr_info ? ycbcr_info->planes[plane].denominator_scales[1] : 1;
       kk_image_layout_init(dev, &image->vk, vk_format_to_pipe_format(format),
-                           width_scale, height_scale,
+                           width_scale, height_scale, explicit_row_stride_B[plane],
                            &image->planes[plane].layout);
+   }
+
+   /* An EXPLICIT rowPitch we could not adopt (narrower than Metal's minimum
+    * for this format/width, or violating its linear-texture row alignment) is
+    * an invalid plane layout — app-side undefined behavior, which we define as
+    * "the image uses the computed pitch instead", loudly. Rationale: in the VM
+    * stack the exporter's buffer at the same width really does have this pitch,
+    * so substituting stays coherent end to end. That is ENFORCED, not
+    * coincidental: virglrenderer (limina 5c76245) forces the exported
+    * IOSurface's bytesPerRow to Metal's minimumLinearTextureAlignment for the
+    * format, precisely so the pitch we compute here is the truth. Before that
+    * fix IOSurface's own 256-byte row alignment won and every linear import
+    * addressed rows short — diagonal shear in every GL window, with this log
+    * line silent at most of the affected widths. If that virgl commit is ever
+    * reverted or the exporter changes, this substitution goes back to
+    * corrupting; and the transition-era guest driver
+    * (mesa 0010(b)) fabricates tight-packed pitches that are wrong exactly
+    * when width*bpp misses the alignment. The queries always report the pitch
+    * actually in use, never the rejected value — the claim stays truthful.
+    * This log line disappearing is the tripwire that the guest went truthful. */
+   for (uint8_t p = 0; p < image->plane_count; p++) {
+      if (explicit_row_stride_B[p] != 0 &&
+          image->planes[p].layout.linear_stride_B != explicit_row_stride_B[p]) {
+         fprintf(stderr,
+                 "[KK-MODIFIER] EXPLICIT plane %u rowPitch %u unusable (minimum %u, "
+                 "alignment %" PRIu64 "); using the computed pitch\n",
+                 p, explicit_row_stride_B[p], image->planes[p].layout.linear_stride_B,
+                 image->planes[p].layout.align_B);
+      }
    }
 
    return VK_SUCCESS;
@@ -582,10 +747,42 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
                       VkImageCreateFlags create_flags,
                       const VkAllocationCallbacks *pAllocator)
 {
-   if (plane->mtl_handle != NULL)
+   /* limina: bisection knob, LIMINA_KK_TEX_LEAK=1. The counterpart of LIMINA_KK_VIEW_LEAK for
+    * the image's own textures: a descriptor caches a MTLResourceID, and a released texture can
+    * have its ID reissued to an unrelated one, which is what a scattered read fault in a draw
+    * whose attachments are alive would look like. Leaking makes that unrepresentable. Costs
+    * memory without bound -- a bisection arm, never a shipping mode. */
+   {
+      static int leak = -1;
+      if (leak < 0) {
+         const char *e = getenv("LIMINA_KK_TEX_LEAK");
+         leak = e && e[0] && e[0] != '0';
+         if (leak)
+            fprintf(stderr, "[LIMINA] KK image textures LEAKING (LIMINA_KK_TEX_LEAK)\n");
+      }
+      if (leak)
+         return;
+   }
+
+   if (plane->mtl_handle != NULL) {
+      kk_limina_addr_log("img- tex=%p gpu=0x%llx..0x%llx %ux%u s%u fmt%u",
+                         (void *)plane->mtl_handle, (unsigned long long)plane->addr,
+                         (unsigned long long)(plane->addr + plane->layout.size_B),
+                         plane->layout.width_px, plane->layout.height_px,
+                         (unsigned)plane->layout.sample_count_sa,
+                         (unsigned)plane->layout.format.mtl);
+      KK_TEX_CENSUS_RELEASE(); /* limina census */
+      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle);
       mtl_release(plane->mtl_handle);
-   if (plane->mtl_handle_array != NULL)
+   }
+   if (plane->mtl_handle_array != NULL) {
+      KK_TEX_CENSUS_RELEASE(); /* limina census */
+      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle_array);
       mtl_release(plane->mtl_handle_array);
+   }
+   /* limina: free the private heap-backed bo, if this plane got one (heap-less backing). */
+   if (plane->private_bo != NULL)
+      kk_destroy_bo(dev, plane->private_bo);
 }
 
 static void
@@ -735,11 +932,12 @@ kk_GetDeviceImageMemoryRequirements(VkDevice device,
                                     VkMemoryRequirements2 *pMemoryRequirements)
 {
    VK_FROM_HANDLE(kk_device, dev, device);
-   ASSERTED VkResult result;
    struct kk_image image = {0};
 
-   result = kk_image_init(dev, &image, pInfo->pCreateInfo);
-   assert(result == VK_SUCCESS);
+   if (kk_image_init(dev, &image, pInfo->pCreateInfo) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){0};
+      return;
+   }
 
    const VkImageAspectFlags aspects =
       image.disjoint ? pInfo->planeAspect : image.vk.aspects;
@@ -818,11 +1016,12 @@ kk_GetDeviceImageSubresourceLayoutKHR(
    VkSubresourceLayout2KHR *pLayout)
 {
    VK_FROM_HANDLE(kk_device, dev, device);
-   ASSERTED VkResult result;
    struct kk_image image = {0};
 
-   result = kk_image_init(dev, &image, pInfo->pCreateInfo);
-   assert(result == VK_SUCCESS);
+   if (kk_image_init(dev, &image, pInfo->pCreateInfo) != VK_SUCCESS) {
+      pLayout->subresourceLayout = (VkSubresourceLayout){0};
+      return;
+   }
 
    kk_get_image_subresource_layout(dev, &image, pInfo->pSubresource, pLayout);
 
@@ -838,8 +1037,27 @@ kk_image_plane_create_texture(struct kk_image_plane *plane,
       return mtl_new_texture_with_descriptor_linear(plane->mem->bo->map, layout,
                                                     mem_offset_B);
 
+   /* limina: a tiled plane bound to heap-less (venus host-imported) memory was given its own
+    * dedicated heap-backed bo in kk_image_plane_bind; texture it from that heap at offset 0. */
+   if (plane->private_bo != NULL)
+      return mtl_new_texture_with_descriptor(plane->private_bo->mtl_handle, layout,
+                                             0u);
+
    return mtl_new_texture_with_descriptor(plane->mem->bo->mtl_handle, layout,
                                           mem_offset_B);
+}
+
+/* LIMINA_KK_IMPORT_TRACE: per-texture import logging. Off by default — it is one line per
+ * adopted texture, which is thousands a second at frame rate. */
+static bool
+kk_limina_import_trace(void)
+{
+   static int on = -1;
+   if (unlikely(on < 0)) {
+      const char *e = getenv("LIMINA_KK_IMPORT_TRACE");
+      on = e && e[0] && e[0] != '0';
+   }
+   return on;
 }
 
 static VkResult
@@ -852,7 +1070,133 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
                                &plane_align_B);
    *offset_B = align64(*offset_B, plane_align_B);
 
-   assert(plane->layout.linear || mem->bo->mtl_handle);
+   /* VK_EXT_external_memory_metal, MTLTEXTURE handle: the imported texture IS
+    * the image's storage, so adopt it instead of creating one. The handle type
+    * is DEDICATED_ONLY, so this binds a single-plane image at offset 0 — a
+    * disjoint/multi-plane image would need one handle per plane, which we do
+    * not accept. Validate against the texture we were actually given: Vulkan
+    * says a mismatched handle is undefined, and Metal will not complain later,
+    * it will just render somewhere unexpected. */
+   if (mem->bo->texture) {
+      struct mtl_texture_props props;
+      mtl_texture_get_props(mem->bo->texture, &props);
+
+      /* Validate HARD, and especially on format and usage. Adopting a texture
+       * verbatim has a known, proven silent-failure mode: on a usage or format
+       * mismatch Metal does not complain, the render simply no-ops and the
+       * texture's memory is never written (observed on the MoltenVK equivalent of
+       * this path — a magenta-prefilled scanout surface stayed pure magenta). A
+       * wrong image here is therefore invisible at every later layer, so it has to
+       * die at bind time. */
+      const bool geometry_ok =
+         (image->plane_count == 1 || image->disjoint) && *offset_B == 0 &&
+         props.width == plane->layout.width_px &&
+         props.height == plane->layout.height_px &&
+         props.mip_levels == plane->layout.levels &&
+         props.array_length == plane->layout.layers &&
+         props.sample_count == plane->layout.sample_count_sa &&
+         props.texture_type == (uint32_t)plane->layout.type;
+      const bool format_ok = props.pixel_format == plane->layout.format.mtl;
+
+      /* limina: an sRGB image over a linear-format imported texture is the ONE mismatch worth
+       * accepting rather than rejecting. It is exactly what the scanout path produces -- venus
+       * imports a BGRA8Unorm IOSurface (fmt 80) and the guest binds a BGRA8Unorm_sRGB image
+       * (fmt 81) to it -- and it is not the silent-wrong-render class the hard reject exists
+       * for: the two formats have identical memory layout and Metal's own texture view does
+       * the sRGB reinterpretation. Rejecting it instead left the plane with a NULL texture,
+       * whose attachment then made an attachment-less render pass and AGX aborted the whole
+       * process from inside the Metal compiler (see mtl_new_render_command_encoder_with_-
+       * descriptor and spikes/agx-compiler-abort in the limina tree).
+       *
+       * Gate it tightly: the formats must be exactly each other's linear/sRGB counterpart, and
+       * the imported texture must carry MTLTextureUsagePixelFormatView -- without that bit
+       * newTextureViewWithPixelFormat: cannot reinterpret and returns nil. Every other
+       * mismatch keeps dying loudly at bind time. */
+      const enum pipe_format linear_pipe =
+         util_format_linear(plane->layout.format.pipe);
+      const struct kk_va_format *linear_fmt =
+         linear_pipe != plane->layout.format.pipe ? kk_get_va_format(linear_pipe) : NULL;
+      const bool srgb_view_ok =
+         !format_ok && linear_fmt != NULL &&
+         props.pixel_format == (uint32_t)linear_fmt->mtl_pixel_format &&
+         (props.usage & MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW) != 0u;
+      /* The texture must offer at least what the image will ask of it; extra
+       * usage bits on the imported texture are harmless. */
+      const bool usage_ok =
+         (props.usage & (uint32_t)plane->layout.usage) == (uint32_t)plane->layout.usage;
+      if (!geometry_ok || (!format_ok && !srgb_view_ok) || !usage_ok) {
+         fprintf(stderr,
+                 "[LIMINA-KK-IMPORT] REJECTED MTLTexture (geom=%d fmt=%d usage=%d): "
+                 "tex %ux%u type=%u samples=%u lv=%u ly=%u fmt=%u usage=0x%x | image "
+                 "%ux%u type=%u samples=%u lv=%u ly=%u fmt=%u usage=0x%x\n",
+                 geometry_ok, format_ok, usage_ok, (unsigned)props.width,
+                 (unsigned)props.height, props.texture_type, props.sample_count,
+                 props.mip_levels, props.array_length, props.pixel_format, props.usage,
+                 plane->layout.width_px, plane->layout.height_px,
+                 (unsigned)plane->layout.type, plane->layout.sample_count_sa,
+                 plane->layout.levels, plane->layout.layers, plane->layout.format.mtl,
+                 (unsigned)plane->layout.usage);
+         return vk_errorf(
+            dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+            "imported MTLTexture does not match the image it is bound to "
+            "(geometry_ok=%d format_ok=%d usage_ok=%d): texture %ux%u type=%u "
+            "samples=%u levels=%u layers=%u fmt=%u usage=0x%x vs image %ux%u "
+            "type=%u samples=%u levels=%u layers=%u fmt=%u usage=0x%x "
+            "(planes=%u offset=%" PRIu64 ")",
+            geometry_ok, format_ok, usage_ok, (unsigned)props.width,
+            (unsigned)props.height, props.texture_type, props.sample_count,
+            props.mip_levels, props.array_length, props.pixel_format, props.usage,
+            plane->layout.width_px, plane->layout.height_px,
+            (unsigned)plane->layout.type, plane->layout.sample_count_sa,
+            plane->layout.levels, plane->layout.layers, plane->layout.format.mtl,
+            (unsigned)plane->layout.usage, image->plane_count, *offset_B);
+      }
+
+      plane->mem = mem;
+      plane->mem_offset_B = 0u;
+      /* limina: when the import needed the sRGB reinterpretation, the plane owns the VIEW, not
+       * the imported texture -- so the rest of KK sees a handle in the image's own format, as
+       * it would for a texture it allocated itself. The view retains its parent. */
+      if (srgb_view_ok) {
+         plane->mtl_handle = mtl_new_texture_view_with_format(
+            mem->bo->texture, plane->layout.format.mtl);
+         if (plane->mtl_handle == NULL)
+            return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                             "could not reinterpret imported MTLTexture (fmt %u) as the "
+                             "image format (fmt %u)",
+                             props.pixel_format, plane->layout.format.mtl);
+      } else {
+         plane->mtl_handle = mtl_retain(mem->bo->texture);
+      }
+      KK_TEX_CENSUS_ACQUIRE(); /* limina census: adopted import (or its sRGB view) */
+      plane->addr = 0u;
+      /* limina: one line per adopted texture is thousands a second at frame rate — 1.4 GB of
+       * dogfood supervisor log in 45 minutes. Keep it for import debugging, behind a switch. */
+      if (unlikely(kk_limina_import_trace()))
+         fprintf(stderr,
+              "[LIMINA-KK-IMPORT] adopted MTLTexture %p (srgb_view=%d) for image plane: %ux%u "
+              "type=%u fmt=%u usage=0x%x (image usage=0x%x linear=%u optimized=%u)\n",
+              mem->bo->texture, srgb_view_ok, plane->layout.width_px, plane->layout.height_px,
+              props.texture_type, props.pixel_format, props.usage,
+              (unsigned)plane->layout.usage, plane->layout.linear,
+              plane->layout.optimized_layout);
+      *offset_B += plane_size_B;
+      return VK_SUCCESS;
+   }
+
+   /* limina: venus host-imports some VkDeviceMemory as a plain Metal buffer with NO heap
+    * (mem->bo->mtl_handle == NULL) — observed with wgpu, which maps the only host-visible memory
+    * type, so venus imports the guest pages. A non-linear (tiled) image cannot be textured from a
+    * buffer, so give this plane its own heap-backed bo and texture from that. Safe: an OPTIMAL
+    * image is opaque to the guest CPU (touched only via GPU copies/renders), so its host storage
+    * living in a private heap rather than the imported buffer is transparent. */
+   if (!plane->layout.linear && mem->bo->mtl_handle == NULL) {
+      VkResult result = kk_alloc_bo(dev, &dev->vk.base, plane_size_B, plane_align_B,
+                                    &plane->private_bo);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   assert(plane->layout.linear || mem->bo->mtl_handle || plane->private_bo);
 
    /* Linear textures in Metal need to be allocated through a buffer... */
    plane->mem = mem;
@@ -861,7 +1205,43 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
    if (image->vk.base.object_name)
       mtl_resource_set_label(plane->mtl_handle, image->vk.base.object_name);
 
+   KK_TEX_CENSUS_ACQUIRE(); /* limina census: freshly created plane texture */
+
+   /* limina DIAGNOSTIC: name the texture so Metal's debug layer identifies it. Its
+    * reports otherwise say "(Label: (null))", which cannot be acted on -- naming them is
+    * what turned "some attachment is not resident" into "the 4-sample one is". Only worth
+    * the snprintf and the NSString when something is reading labels. */
+   static int label = -1;
+   if (label < 0) {
+      const char *dbg = getenv("MTL_DEBUG_LAYER");
+      label = (dbg && strcmp(dbg, "0") != 0) || getenv("LIMINA_KK_LABELS") != NULL;
+   }
+   if (label) {
+      char lbl[128];
+      snprintf(lbl, sizeof(lbl),
+               "kkimg %ux%u s=%u fmt=%u ty=%u lv=%u ly=%u use=0x%x %s%s",
+               plane->layout.width_px, plane->layout.height_px,
+               (unsigned)plane->layout.sample_count_sa, (unsigned)plane->layout.format.mtl,
+               (unsigned)plane->layout.type, (unsigned)plane->layout.levels,
+               (unsigned)plane->layout.layers, (unsigned)plane->layout.usage,
+               plane->layout.linear ? "linear" : "tiled",
+               plane->private_bo ? " privbo" : "");
+      mtl_limina_set_label(plane->mtl_handle, lbl);
+   }
+
+   /* limina: put the texture itself in the residency set, not just the heap it was
+    * placed on. Metal's validation reports these textures as "not added to any
+    * residency set on the command buffer or command queue" even though their heap is
+    * in it, and an MSAA attachment used that way takes a GPU address fault. */
+   kk_device_add_texture_to_residency_set(dev, plane->mtl_handle);
    plane->addr = mem->bo->gpu + *offset_B;
+
+   kk_limina_addr_log("img+ tex=%p gpu=0x%llx..0x%llx %ux%u s%u fmt%u", (void *)plane->mtl_handle,
+                      (unsigned long long)plane->addr,
+                      (unsigned long long)(plane->addr + plane->layout.size_B),
+                      plane->layout.width_px, plane->layout.height_px,
+                      (unsigned)plane->layout.sample_count_sa,
+                      (unsigned)plane->layout.format.mtl);
 
    /* Create auxiliary 2D array texture for 3D images so we can use 2D views of
     * it */
@@ -873,11 +1253,22 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
       array_layout.type = MTL_TEXTURE_TYPE_2D_ARRAY;
       array_layout.layers = array_layout.layers * array_layout.depth_px;
       array_layout.depth_px = 1u;
+      /* A 3D image's mip chain runs as far as its depth does, but a 2D array's
+       * only as far as its width and height, and Metal aborts on a descriptor
+       * asking for more: a legal 8x4x16 image with five levels takes the
+       * process down. Levels past the 2D chain get no 2D view. */
+      const uint32_t levels_2d =
+         util_logbase2(MAX2(array_layout.width_px, array_layout.height_px)) + 1;
+      array_layout.levels = MIN2(array_layout.levels, levels_2d);
+      /* limina: honor the private heap-backed bo (heap-less host-imported backing) here too. */
       plane->mtl_handle_array = mtl_new_texture_with_descriptor(
-         mem->bo->mtl_handle, &array_layout, *offset_B);
+         plane->private_bo ? plane->private_bo->mtl_handle : mem->bo->mtl_handle,
+         &array_layout, plane->private_bo ? 0u : *offset_B);
       if (image->vk.base.object_name)
          mtl_resource_set_label(plane->mtl_handle_array,
                                 image->vk.base.object_name);
+      KK_TEX_CENSUS_ACQUIRE(); /* limina census: 3D array aux texture */
+      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle_array);
    }
 
    *offset_B += plane_size_B;
@@ -913,10 +1304,13 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
       /* Copy swapchain plane data retaining relevant resources. */
       plane->layout = swapchain_plane->layout;
       plane->mtl_handle = mtl_retain(swapchain_plane->mtl_handle);
+      KK_TEX_CENSUS_ACQUIRE(); /* limina census: swapchain plane adoption */
       plane->mtl_handle_array =
          swapchain_plane->mtl_handle_array
             ? mtl_retain(swapchain_plane->mtl_handle_array)
             : NULL;
+      if (plane->mtl_handle_array)
+         KK_TEX_CENSUS_ACQUIRE(); /* limina census */
       plane->addr = swapchain_plane->addr;
 
       return VK_SUCCESS;

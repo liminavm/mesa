@@ -1,4 +1,5 @@
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_compiler.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
@@ -1117,7 +1118,10 @@ zink_draw(struct pipe_context *pctx,
           uint32_t partial_velem_mask)
 {
    MESA_TRACE_FUNC();
-   if (!dindirect && (!draws[0].count || !dinfo->instance_count)) {
+   /* Nothing recorded after a loss can run, and recording it walks pools a lost device could not
+    * create. */
+   if (unlikely(zink_screen(pctx->screen)->device_lost) ||
+       (!dindirect && (!draws[0].count || !dinfo->instance_count))) {
       if (VBS == ZINK_VBS_UNOWNED)
          zink_mark_atom_dirty(zink_context(pctx), ZINK_ATOM_VERTEX_BUFFERS);
       return;
@@ -1539,6 +1543,9 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    struct zink_batch_state *bs = ctx->bs;
    struct zink_screen *screen = zink_screen(pctx->screen);
 
+   if (unlikely(screen->device_lost))
+      return;
+
    if (unlikely(ctx->buffer_rebind_counter < screen->buffer_rebind_counter)) {
       ctx->buffer_rebind_counter = screen->buffer_rebind_counter;
       zink_rebind_all_buffers(ctx);
@@ -1629,7 +1636,7 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       zink_batch_reference_resource_rw(ctx, zink_resource(info->indirect), false);
    } else
       VKCTX(CmdDispatch)(bs->cmdbuf, info->grid[0], info->grid[1], info->grid[2]);
-   bs->has_work = true;
+   p_atomic_set(&bs->has_work, true);
    ctx->last_work_was_compute = true;
    /* flush after 30000 draws and dispatches */
    if (!ctx->unordered_blitting && (unlikely(ctx->work_count >= 30000) || ctx->oom_flush))

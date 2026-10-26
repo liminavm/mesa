@@ -6,6 +6,9 @@
 
 #include "mtl_texture.h"
 
+/* limina: per-class allocation census (limina_mtl_note_new). */
+#include "mtl_bridge.h"
+
 /* TODO_LUNARG Remove */
 #include "kk_image_layout.h"
 
@@ -13,6 +16,17 @@
 #include "vulkan/vulkan.h"
 
 #include <Metal/MTLTexture.h>
+
+/* limina: RTLOG knob, cached — a getenv here sat on the per-draw path (round 24:
+ * ~7% of the hot ring core in __findenv_locked). */
+static inline bool
+limina_kk_rtlog_cached(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_RTLOG") != NULL;
+   return v;
+}
 
 uint64_t
 mtl_texture_get_gpu_resource_id(mtl_texture *texture)
@@ -29,6 +43,22 @@ mtl_texture_first_mipmap_in_tail(mtl_texture *texture)
    @autoreleasepool {
       id<MTLTexture> tex = (id<MTLTexture>)texture;
       return [tex firstMipmapInTail];
+   }
+}
+
+void
+mtl_texture_get_props(mtl_texture *texture, struct mtl_texture_props *props)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      props->width = [tex width];
+      props->height = [tex height];
+      props->pixel_format = (uint32_t)[tex pixelFormat];
+      props->texture_type = (uint32_t)[tex textureType];
+      props->sample_count = (uint32_t)[tex sampleCount];
+      props->mip_levels = (uint32_t)[tex mipmapLevelCount];
+      props->array_length = (uint32_t)[tex arrayLength];
+      props->usage = (uint32_t)[tex usage];
    }
 }
 
@@ -85,7 +115,18 @@ mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *lay
                                                                         mtl_texture_swizzle(layout->swizzle.green),
                                                                         mtl_texture_swizzle(layout->swizzle.blue),
                                                                         mtl_texture_swizzle(layout->swizzle.alpha));
-      return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices swizzle:swizzle];
+      id<MTLTexture> v = [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices swizzle:swizzle];
+      /* limina: a nil view is always a bug -- Metal refuses some views of a
+       * multisample parent, and the caller goes on to ask nil for a resource ID,
+       * getting a zeroed one that the shader then dereferences. Report it
+       * unconditionally; the buffer-backed case stays behind RTLOG. */
+      if (!v || (limina_kk_rtlog_cached() && tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s parent=%p(linear=%d %lux%lu s=%lu) type=%lu fmt=%lu -> %p\n",
+                 v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
+                 (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.sampleCount,
+                 (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
+      return (mtl_texture *)limina_mtl_note_new(v);
    }
 }
 
@@ -97,7 +138,34 @@ mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_
       MTLTextureType type = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
       NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
       NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
-      return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
+      id<MTLTexture> v = [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
+      if (!v || (limina_kk_rtlog_cached() && tex.buffer))
+         fprintf(stderr, "[LIMINA-KK-VIEW] %s(nosw) parent=%p(linear=%d %lux%lu s=%lu) type=%lu fmt=%lu -> %p\n",
+                 v ? "ok" : "NIL", (void *)tex, tex.buffer ? 1 : 0,
+                 (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.sampleCount,
+                 (unsigned long)type, (unsigned long)layout->format.mtl, (void *)v);
+      return (mtl_texture *)limina_mtl_note_new(v);
+   }
+}
+
+mtl_texture *
+mtl_new_texture_view_with_format(mtl_texture *texture, uint32_t pixel_format)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      id<MTLTexture> v =
+         [tex newTextureViewWithPixelFormat:(MTLPixelFormat)pixel_format
+                               textureType:tex.textureType
+                                    levels:NSMakeRange(0, tex.mipmapLevelCount)
+                                    slices:NSMakeRange(0, tex.arrayLength)];
+      if (!v)
+         fprintf(stderr,
+                 "[LIMINA-KK-VIEW] NIL reformat parent=%p(%lux%lu fmt=%lu usage=0x%lx) -> fmt=%lu\n",
+                 (void *)tex, (unsigned long)tex.width, (unsigned long)tex.height,
+                 (unsigned long)tex.pixelFormat, (unsigned long)tex.usage,
+                 (unsigned long)pixel_format);
+      return (mtl_texture *)limina_mtl_note_new(v);
    }
 }
 
@@ -132,5 +200,18 @@ mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                       withBytes:host_ptr
                     bytesPerRow:data->buffer_stride_B
                   bytesPerImage:data->buffer_2d_image_size_B];
+   }
+}
+
+/* limina DIAGNOSTIC: name a Metal object so the debug layer's reports identify it.
+ * Metal's validation says things like "Attachment texture (Label: (null)) ... is not
+ * added to any residency set", which is useless without this. */
+void
+mtl_limina_set_label(void *obj, const char *label)
+{
+   @autoreleasepool {
+      if (obj == NULL || label == NULL)
+         return;
+      [(id<MTLResource>)obj setLabel:[NSString stringWithUTF8String:label]];
    }
 }

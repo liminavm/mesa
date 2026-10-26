@@ -45,3 +45,52 @@ void
 mtl_resource_set_label(mtl_resource *resource, const char *label)
 {
 }
+
+void *
+mtl_heap_map_at(mtl_heap *heap, void *addr, uint64_t size_B)
+{
+   return NULL;
+}
+
+mtl_heap *
+mtl_new_heap_exportable(mtl_device *device, uint64_t size)
+{
+   return NULL;
+}
+
+mtl_texture *
+mtl_new_texture_shareable(mtl_device *device, const struct kk_image_layout *layout)
+{
+   return NULL;
+}
+
+int
+mtl_texture_export_fd(mtl_texture *texture)
+{
+   return -1;
+}
+
+mtl_texture *
+mtl_new_texture_from_fd(mtl_device *device, int fd, const struct kk_image_layout *const *layouts,
+                        uint32_t layout_count)
+{
+   return NULL;
+}
+
+bool
+mtl_fd_is_surface(mtl_device *device, int fd)
+{
+   return false;
+}
+
+int
+mtl_heap_export_fd(mtl_heap *heap)
+{
+   return -1;
+}
+
+mtl_heap *
+mtl_new_heap_from_fd(mtl_device *device, int fd)
+{
+   return NULL;
+}

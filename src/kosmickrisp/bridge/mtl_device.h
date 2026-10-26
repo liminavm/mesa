@@ -29,6 +29,14 @@ void mtl_device_get_architecture_name(mtl_device *dev, char buffer[256]);
 /* Returns 0 if no Apple family is supported */
 uint32_t mtl_device_get_gpu_apple_family(mtl_device *dev);
 uint64_t mtl_device_get_registry_id(mtl_device *dev);
+/* The DRM render node the device was opened on, if it was: false for Metal itself. */
+bool mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor);
+/* Whether mtl_new_texture_shareable can succeed. Only for bridges on a DRM device. */
+bool mtl_device_supports_shareable_textures(mtl_device *dev);
+/* Whether mtl_new_timestamp_counter_heap can succeed. Only for bridges on a DRM device. */
+bool mtl_device_supports_timestamps(mtl_device *dev);
+/* Whether mtl_new_texture_shareable takes `format`. */
+bool mtl_pixel_format_is_shareable(enum mtl_pixel_format format);
 bool mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count);
 struct mtl_size mtl_device_max_threads_per_threadgroup(mtl_device *dev);
 uint32_t mtl_device_max_threadgroup_memory_length(mtl_device *dev);
@@ -45,6 +53,17 @@ uint64_t mtl_device_timestamp_frequency(mtl_device *dev);
  * mtl_release. */
 mtl_counter_heap *mtl_new_timestamp_counter_heap(mtl_device *dev,
                                                  uint32_t count);
+
+/* limina: dealloc census for the IOSurface import textures (see mtl_device.m). The census
+ * answers "did the texture actually die"; the retain count is a point-in-time lead. */
+void mtl_limina_texture_census(char *buf, unsigned long len);
+long mtl_limina_retain_count(void *obj);
+
+/* limina: texture whose storage IS an IOSurface (import path; see mtl_device.m) */
+bool mtl_handle_is_iosurface(void *handle);
+mtl_texture *mtl_new_texture_with_descriptor_iosurface(
+   mtl_device *device, const struct kk_image_layout *layout, void *iosurface,
+   uint32_t plane);
 
 /* Resource queries */
 void mtl_heap_buffer_size_and_align_with_length(mtl_device *device,

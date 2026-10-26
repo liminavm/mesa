@@ -37,6 +37,10 @@
 #ifdef VK_USE_PLATFORM_METAL_EXT
 #include "QuartzCore/CAMetalLayer.h"
 #endif
+#ifdef __APPLE__
+#include "vulkan/vulkan_metal.h"
+#include "kosmickrisp/bridge/kk_limina_plane.h"
+#endif
 
 #include "vk_format.h"
 #include "util/u_blitter.h"
@@ -206,10 +210,11 @@ void
 zink_destroy_resource_surface_cache(struct zink_screen *screen, struct set *ht, bool is_buffer)
 {
    if (is_buffer) {
-      set_foreach_remove(ht, he) {
+      /* not set_foreach_remove: eviction leaves deleted entries, which it would walk as views */
+      set_foreach(ht, he) {
          struct zink_buffer_view *bv = (void*)he->key;
          VKSCR(DestroyBufferView)(screen->dev, bv->buffer_view, NULL);
-         FREE(bv);
+         zink_buffer_view_unref(bv);
       }
       _mesa_set_fini(ht, NULL);
    } else {
@@ -220,6 +225,13 @@ zink_destroy_resource_surface_cache(struct zink_screen *screen, struct set *ht, 
       }
       _mesa_set_fini(ht, NULL);
    }
+}
+
+void
+zink_buffer_view_unref(struct zink_buffer_view *bv)
+{
+   if (pipe_reference(&bv->reference, NULL))
+      FREE(bv);
 }
 
 void
@@ -1152,6 +1164,10 @@ get_export_flags(struct zink_screen *screen, const struct pipe_resource *templ, 
       if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_FD ||
           alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE)
          needs_export |= true;
+      else if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
+         ; /* limina: import-only; the Metal-handle import struct is chained in
+            * allocate_bo, and (matching the vkr precedent) the image itself is
+            * created plain — no external-memory image info. */
       else
          UNREACHABLE("unknown handle type");
    }
@@ -1221,6 +1237,36 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
       obj->exportable = true;
       obj->exportable_dmabuf = !!(alloc_info->export_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
    }
+
+#ifdef __APPLE__
+   /* limina: IOSurface import — KK's MTLTEXTURE metal handle accepts an
+    * IOSurfaceRef and builds the texture from the dedicated image's layout.
+    * Deliberately OUTSIDE ZINK_USE_DMABUF (not defined on macOS). */
+   VkImportMemoryMetalHandleInfoEXT immhi = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+   };
+   /* limina: which plane of the surface backs this image. The Metal-handle
+    * import struct has no field for it, so it rides alongside — see
+    * kk_limina_plane.h. Plane 0 is the single-plane scanout/shared case. */
+   VkImportIOSurfacePlaneLIMINA iospi = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_IOSURFACE_PLANE_LIMINA,
+   };
+   if (alloc_info->whandle &&
+       alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA) {
+      immhi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+      immhi.handle = alloc_info->whandle->com_obj;
+      immhi.pNext = mai.pNext;
+      mai.pNext = &immhi;
+
+      iospi.plane = alloc_info->whandle->plane == 2
+                       ? VK_IMAGE_ASPECT_PLANE_2_BIT
+                       : alloc_info->whandle->plane == 1
+                            ? VK_IMAGE_ASPECT_PLANE_1_BIT
+                            : VK_IMAGE_ASPECT_PLANE_0_BIT;
+      iospi.pNext = mai.pNext;
+      mai.pNext = &iospi;
+   }
+#endif
 
 #ifdef ZINK_USE_DMABUF
 
@@ -1792,6 +1838,15 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
          ici.pNext = pnext;
    }
 
+   /* limina: an IOSurface-adopted texture must be plain MTLTextureType2D;
+    * INPUT_ATTACHMENT usage makes KK promote the layout to 2DArray (same
+    * rationale as the vkr MTLTEXTURE scanout path). zink only adds the bit
+    * speculatively for fb-fetch, which never applies to a compositor's
+    * imported client buffer. */
+   if (alloc_info->whandle &&
+       alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
+      ici.usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+
    bool success = false;
    VkImageFormatListCreateInfo *fmtlist = (formats[0] && formats[1]) ? &format_list : NULL;
    uint64_t mod = negotiate_image_config(screen, &ici, templ, templ->bind, ici_modifier_count, ici_modifiers, fmtlist, pnext, &success);
@@ -1805,8 +1860,14 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
       if (!ici.pNext)
          return roc_fail_and_free_object;
    }
-   if (!success)
+   if (!success) {
+      if (alloc_info->whandle &&
+          alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
+         mesa_loge("zink: IOSurface import: negotiate_image_config failed "
+                   "(fmt %u tiling %u usage 0x%x)", ici.format, ici.tiling,
+                   ici.usage);
       return roc_fail_and_free_object;
+   }
 
    if (ici.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && srgb &&
       util_format_get_nr_components(srgb) == 4 &&
@@ -1849,6 +1910,11 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
       obj->plane_strides[alloc_info->whandle->plane] = alloc_info->whandle->stride;
    }
 
+   /* limina: re-mask after negotiate_image_config, which can recompute usage. */
+   if (alloc_info->whandle &&
+       alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
+      ici.usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+
    VkResult result = VKSCR(CreateImage)(screen->dev, &ici, NULL, &obj->image);
    if (result != VK_SUCCESS) {
       mesa_loge("ZINK: vkCreateImage failed (%s)", vk_Result_to_str(result));
@@ -1876,6 +1942,11 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
    }
 
    alloc_info->need_dedicated = get_image_memory_requirement(screen, obj, (ici.flags & VK_IMAGE_CREATE_DISJOINT_BIT) ? num_planes : 1, &reqs);
+   /* limina: an IOSurface (Metal-texture) import backs exactly one image — KK
+    * needs the dedicated image at vkAllocateMemory to build the texture. */
+   if (alloc_info->whandle &&
+       alloc_info->whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
+      alloc_info->need_dedicated = true;
    if (templ->usage == PIPE_USAGE_STAGING && ici.tiling == VK_IMAGE_TILING_LINEAR)
       alloc_info->flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
    else
@@ -1916,7 +1987,16 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
    };
 
    /* figure out aux plane count */
-   if (whandle && whandle->plane >= util_format_get_num_planes(whandle->format))
+   /* limina: an IOSurface import is never an aux plane. Its plane index selects a
+    * plane OF THE SURFACE, and the resource is a complete single-plane image over
+    * it (the whandle format is that plane's own component format, so the generic
+    * test below fires for every plane past the first). An aux object skips
+    * DestroyImage, which for this import leaks the VkImage, the KK texture retain
+    * behind it, and the IOSurface itself: every decode target's chroma plane
+    * stayed alive after its resource was gone, ~16.4k surfaces in, IOSurfaceCreate
+    * refused, and every hardware decode from then on poisoned its context. */
+   if (whandle && whandle->plane >= util_format_get_num_planes(whandle->format) &&
+       whandle->type != WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA)
       obj->is_aux = true;
    struct pipe_resource *pnext = templ->next;
    for (obj->plane_count = 1; pnext; obj->plane_count++, pnext = pnext->next) {
@@ -1954,6 +2034,9 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
       create_result = create_image(screen, obj, templ, linear, modifiers, modifiers_count,
                                    &alloc_info);
    }
+   if (whandle && whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA &&
+       create_result != roc_success)
+      mesa_loge("zink: IOSurface import: create_image result=%d", create_result);
 
    switch (create_result) {
    case roc_success:
@@ -2554,6 +2637,32 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
                  struct winsys_handle *whandle,
                  unsigned usage)
 {
+#ifdef __APPLE__
+   /* limina: import an IOSurface (winsys_handle::com_obj) as a plain OPTIMAL
+    * image whose dedicated memory adopts the surface via KK's MTLTEXTURE
+    * metal handle. No modifier machinery, no dmabuf bind — mirror of the vkr
+    * scanout import, reached from vrend through the EGL_IOSURFACE_LIMINA
+    * EGLImage target. NOTE: deliberately OUTSIDE ZINK_USE_DMABUF, which is
+    * not defined on macOS. */
+   if (whandle->type == WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA) {
+      struct pipe_resource templ3 = *templ;
+      if (templ->format == PIPE_FORMAT_NONE)
+         templ3.format = whandle->format;
+      struct pipe_resource *ios_pres =
+         resource_create(pscreen, &templ3, whandle, usage, NULL, 0, NULL, NULL);
+      if (!ios_pres) {
+         mesa_loge("zink: IOSurface import resource_create refused (%s %ux%u)",
+                   util_format_name(templ3.format), templ3.width0,
+                   templ3.height0);
+         return NULL;
+      }
+      struct zink_resource *ios_res = zink_resource(ios_pres);
+      ios_res->valid = true;
+      ios_res->obj->immutable_handle = true;
+      ios_res->internal_format = templ3.format;
+      return ios_pres;
+   }
+#endif
 #ifdef ZINK_USE_DMABUF
    struct zink_screen *screen = zink_screen(pscreen);
 
@@ -4063,6 +4172,13 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
       pscreen->resource_get_handle = zink_resource_get_handle;
       pscreen->resource_from_handle = zink_resource_from_handle;
    }
+#ifdef __APPLE__
+   /* limina: KK has neither external-memory-fd nor win32, but the IOSurface
+    * winsys-handle import (WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA) needs the
+    * entry point installed — without it dri2_from_iosurface_limina calls NULL. */
+   if (!pscreen->resource_from_handle)
+      pscreen->resource_from_handle = zink_resource_from_handle;
+#endif
    if (screen->info.have_EXT_external_memory_host) {
       pscreen->resource_from_user_memory = zink_resource_from_user_memory;
    }

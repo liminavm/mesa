@@ -194,6 +194,35 @@ vk_meta_rect_cmp_layer(const void *_a, const void *_b)
    return a->layer - b->layer;
 }
 
+/* A zero-extent or zero-layer VkClearRect clears nothing (invalid per
+ * VUID-vkCmdClearAttachments-rect-02682/-02683, but the caller may not have
+ * validated it). Emitting it anyway would feed a degenerate rect to
+ * vk_meta_draw_rects/setup_viewport_scissor, whose assert(x0 < x1 && y0 < y1)
+ * aborts (and, without asserts, x1 == 0 wraps x1 - 1 to compute the viewport
+ * from the *union* of all rects, corrupting the valid ones). Skip such rects.
+ *
+ * A negative offset, or an offset + extent overflowing int32, is equally
+ * invalid usage (the rect must lie within the render area, whose offset is
+ * non-negative and whose bounds fit int32) and equally lethal: VkClearRect
+ * offsets are signed i32 while vk_meta_rect coordinates are u32, so the
+ * conversion wraps into an inverted (x1 <= x0) or absurdly-huge rect — the
+ * same asserts, or the same union corruption without them. Skip these too;
+ * bounding x1/y1 by INT32_MAX also keeps setup_viewport_scissor's
+ * xmax_log2/ymax_log2 within their asserted <= 31 range.
+ */
+static inline bool
+vk_meta_clear_rect_is_empty(const VkClearRect *rect)
+{
+   if (rect->rect.extent.width == 0 || rect->rect.extent.height == 0 ||
+       rect->layerCount == 0)
+      return true;
+
+   const int64_t x1 = (int64_t)rect->rect.offset.x + rect->rect.extent.width;
+   const int64_t y1 = (int64_t)rect->rect.offset.y + rect->rect.extent.height;
+   return rect->rect.offset.x < 0 || rect->rect.offset.y < 0 ||
+          x1 > INT32_MAX || y1 > INT32_MAX;
+}
+
 void
 vk_meta_clear_attachments(struct vk_command_buffer *cmd,
                           struct vk_meta_device *meta,
@@ -268,6 +297,9 @@ vk_meta_clear_attachments(struct vk_command_buffer *cmd,
 
    if (render->view_mask == 0) {
       if (clear_rect_count == 1 && clear_rects[0].layerCount > 1) {
+         if (vk_meta_clear_rect_is_empty(&clear_rects[0]))
+            return;
+
          struct vk_meta_rect rect = {
             .x0 = clear_rects[0].rect.offset.x,
             .x1 = clear_rects[0].rect.offset.x +
@@ -289,6 +321,9 @@ vk_meta_clear_attachments(struct vk_command_buffer *cmd,
 
          uint32_t rect_count = 0;
          for (uint32_t r = 0; r < clear_rect_count; r++) {
+            if (vk_meta_clear_rect_is_empty(&clear_rects[r]))
+               continue;
+
             struct vk_meta_rect rect = {
                .x0 = clear_rects[r].rect.offset.x,
                .x1 = clear_rects[r].rect.offset.x +
@@ -316,13 +351,16 @@ vk_meta_clear_attachments(struct vk_command_buffer *cmd,
          STACK_ARRAY_FINISH(rects);
       }
    } else {
-      const uint32_t rect_count = clear_rect_count *
-                                  util_bitcount(render->view_mask);
-      STACK_ARRAY(struct vk_meta_rect, rects, rect_count);
+      const uint32_t max_rect_count = clear_rect_count *
+                                      util_bitcount(render->view_mask);
+      STACK_ARRAY(struct vk_meta_rect, rects, max_rect_count);
 
       uint32_t rect_idx = 0;
       u_foreach_bit(v, render->view_mask) {
          for (uint32_t r = 0; r < clear_rect_count; r++) {
+            if (vk_meta_clear_rect_is_empty(&clear_rects[r]))
+               continue;
+
             assert(clear_rects[r].baseArrayLayer == 0);
             assert(clear_rects[r].layerCount == 1);
             rects[rect_idx++] = (struct vk_meta_rect) {
@@ -337,9 +375,9 @@ vk_meta_clear_attachments(struct vk_command_buffer *cmd,
             };
          }
       }
-      assert(rect_idx == rect_count);
+      assert(rect_idx <= max_rect_count);
 
-      meta->cmd_draw_rects(cmd, meta, rect_count, rects);
+      meta->cmd_draw_rects(cmd, meta, rect_idx, rects);
 
       STACK_ARRAY_FINISH(rects);
    }

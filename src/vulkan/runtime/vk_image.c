@@ -23,7 +23,10 @@
 
 #include "vk_image.h"
 
-#if DETECT_OS_LINUX || DETECT_OS_BSD
+#include <inttypes.h>
+#include <stdio.h>
+
+#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
 #include <drm-uapi/drm_fourcc.h>
 #endif
 
@@ -111,7 +114,7 @@ vk_image_init(struct vk_device *device,
       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
 
-#if DETECT_OS_LINUX || DETECT_OS_BSD
+#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
 #endif
 
@@ -196,7 +199,7 @@ vk_image_destroy(struct vk_device *device,
    vk_object_free(device, alloc, image);
 }
 
-#if DETECT_OS_LINUX || DETECT_OS_BSD
+#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
                                                  VkImage _image,
@@ -207,7 +210,22 @@ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
    assert(pProperties->sType ==
           VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT);
 
-   assert(image->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+   /* Valid usage requires a DRM_FORMAT_MODIFIER-tiled image here, but in the
+    * limina stack this entrypoint is reachable with guest-controlled state via
+    * venus, and a guest slip must degrade, not abort the host VMM (a release
+    * build would already return drm_format_mod — 0 == LINEAR — silently; do
+    * the same loudly). Seen live 2026-08-04: firefox's dmabuf path queried a
+    * non-modifier image and the assert killed the worker.
+    */
+   if (image->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      fprintf(stderr,
+              "[KK-MODIFIER] GetImageDrmFormatModifierPropertiesEXT on a "
+              "non-modifier image (tiling=%d format=%d extent=%ux%u usage=0x%" PRIx64
+              ") — reporting modifier 0x%" PRIx64 "\n",
+              image->tiling, image->format, image->extent.width,
+              image->extent.height, (uint64_t)image->usage,
+              image->drm_format_mod);
+   }
    pProperties->drmFormatModifier = image->drm_format_mod;
 
    return VK_SUCCESS;

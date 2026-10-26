@@ -631,6 +631,7 @@ struct zink_batch_state {
    VkCommandBuffer unsynchronized_cmdbuf;
    bool is_video;
    VkSemaphore signal_semaphore; //external signal semaphore
+   uint32_t hangs_seen; //the pools' hang count as of the last reset
    struct util_dynarray signal_semaphores; //internal signal semaphores
    struct util_dynarray user_signal_semaphores; //api signal semaphores
    struct util_dynarray user_signal_semaphore_values; //api signal semaphores
@@ -676,6 +677,8 @@ struct zink_batch_state {
    struct util_dynarray bindless_unrefs; //zink_bindless_descriptor
 
    struct util_dynarray zombie_samplers;
+   /* buffer views a holder let go of while this batch may still read them */
+   struct util_dynarray bufferview_releases;
 
    struct set active_queries; /* zink_query objects which were active at some point in this batch */
    struct util_dynarray dead_querypools;
@@ -1452,6 +1455,16 @@ struct zink_screen {
    PFN_vkGetInstanceProcAddr vk_GetInstanceProcAddr;
    PFN_vkGetDeviceProcAddr vk_GetDeviceProcAddr;
 
+   /* How many GPU hangs each command pool caused, from drivers that can tell (KosmicKrisp's
+    * vkGetCommandPoolHangCountLIMINA); NULL elsewhere. See note_hangs() in zink_batch.c. */
+   uint32_t (VKAPI_PTR *pool_hang_count)(VkDevice device, VkCommandPool pool);
+   unsigned hang_limit;  /* hangs a context may cause before it is reset: ZINK_HANG_LIMIT */
+   unsigned hang_budget; /* hangs all contexts may cause before any further one resets its
+                          * context: ZINK_HANG_BUDGET, 0 for none */
+   uint64_t hang_forgive_ns; /* a quiet spell this long empties the budget: ZINK_HANG_FORGIVE_S */
+   unsigned hangs;       /* atomic: hangs every context caused since the budget last emptied */
+   uint64_t last_hang_ns; /* atomic */
+
    bool threaded;
    bool threaded_submit;
    bool is_cpu;
@@ -1641,6 +1654,9 @@ struct zink_screen {
       bool track_renderpasses;
       bool no_linestipple;
       bool no_linesmooth;
+      /* Geometry shaders are emulated in compute: keep quads, edge flags,
+       * line stipple and the other primitive emulations off them. */
+      bool no_gs_emulation;
       bool can_do_invalid_linear_modifier;
       bool inconsistent_interpolation;
       bool can_2d_view_sparse;
@@ -1709,7 +1725,9 @@ struct zink_bufferview_key {
 };
 
 struct zink_buffer_view {
-   struct zink_bufferview_key key;
+   struct zink_bufferview_key key; /* first: the surface cache compares entries by it */
+   /* one for the surface cache while it holds the view, one for each holder */
+   struct pipe_reference reference;
    struct pipe_resource *pres;
    VkBufferView buffer_view;
 };
@@ -1797,6 +1815,8 @@ struct zink_bindless_resident {
    struct zink_bindless_descriptor *bd;
    /* PIPE_IMAGE_ACCESS_*, per context since each can use a different one */
    unsigned access;
+   /* the view a resident texel-buffer handle is bound with in this context */
+   struct zink_buffer_view *bufferview;
 };
 
 struct zink_rendering_info {
@@ -2050,6 +2070,8 @@ struct zink_context {
    struct {
       uint64_t render_passes;
    } hud;
+   /* LIMINA: what ends this context's render passes (LIMINA_ZINK_RP_STATS=1), NULL when off. */
+   struct zink_limina_rp_stats *limina_rp;
 
    struct pipe_resource *dummy_xfb_buffer;
 
@@ -2144,12 +2166,18 @@ struct zink_context {
 
    bool shobj_draw : 1; //using shader objects for draw
    bool is_device_lost;
+   unsigned hangs; /* atomic: GPU hangs this context caused */
    bool primitive_restart;
-   bool blitting : 1;
+   /* NOT bitfields: these two are read on the driver thread while the threaded
+    * context's thread writes neighbouring flags, and distinct bitfields sharing a
+    * storage unit are ONE memory location as far as the memory model (and
+    * ThreadSanitizer) are concerned -- so a bitfield here is a data race that no
+    * amount of atomics on the individual flags can fix. Give them their own bytes. */
+   bool blitting;
+   bool unordered_blitting;
    bool video_batch : 1;
    bool blit_scissor : 1;
    bool blit_nearest : 1;
-   bool unordered_blitting : 1;
    bool rp_tc_info_updated : 1;
    bool last_work_was_compute : 1;
    bool needs_transfer_sync : 1;

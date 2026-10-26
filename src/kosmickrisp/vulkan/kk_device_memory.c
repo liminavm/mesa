@@ -9,8 +9,11 @@
 
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_image.h"
+#include "kk_limina_work.h"
 #include "kk_physical_device.h"
 
+#include "kosmickrisp/bridge/kk_limina_plane.h"
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
 #include "vulkan/vulkan_metal.h"
@@ -20,6 +23,7 @@
 
 #include <inttypes.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* Supports mtlheap only */
 const VkExternalMemoryProperties kk_mtlheap_mem_props = {
@@ -30,12 +34,33 @@ const VkExternalMemoryProperties kk_mtlheap_mem_props = {
    .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
 };
 
+/* An MTLTexture handle is a *dedicated* allocation: the texture is the storage,
+ * so it can back exactly one image and cannot be suballocated. It is therefore
+ * not interchangeable with the heap handle type — keep the compatible set to
+ * itself alone. */
+const VkExternalMemoryProperties kk_mtltexture_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+};
+
 const VkExternalMemoryProperties kk_host_mem_props = {
    .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
    .exportFromImportedHandleTypes = 0,
    .compatibleHandleTypes =
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT,
+};
+
+/* Linux: a bridge heap shared through DRM, as a dma-buf. */
+const VkExternalMemoryProperties kk_fd_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes = KK_FD_HANDLE_TYPES,
+   .compatibleHandleTypes = KK_FD_HANDLE_TYPES,
 };
 
 #ifdef VK_USE_PLATFORM_METAL_EXT
@@ -48,10 +73,12 @@ kk_GetMemoryMetalHandlePropertiesEXT(
    VK_FROM_HANDLE(kk_device, dev, device);
    struct kk_physical_device *pdev = kk_device_physical(dev);
 
-   /* We only support heaps since that's the backing for all our memory and
-    * simplifies implementation */
+   /* Heaps back all of our own allocations; textures are additionally accepted
+    * as dedicated imports (a texture cannot be suballocated, so it backs exactly
+    * one image). */
    switch (handleType) {
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT:
       break;
    default:
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -79,8 +106,13 @@ kk_GetMemoryHostPointerPropertiesEXT(
    default:
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
-   pMemoryHostPointerProperties->memoryTypeBits =
-      BITFIELD_MASK(pdev->mem_type_count);
+   /* Host memory is host-visible by definition. */
+   uint32_t types = 0;
+   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+      if (pdev->mem_types[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         types |= BITFIELD_BIT(i);
+   }
+   pMemoryHostPointerProperties->memoryTypeBits = types;
 
    return VK_SUCCESS;
 }
@@ -111,17 +143,179 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    bool import_metal = metal_info && metal_info->handleType;
    bool import_host = host_info && host_info->handleType;
 
+#if !DETECT_OS_APPLE
+   /* Shared memory is a heap of its own, never suballocated. */
+   const VkImportMemoryFdInfoKHR *fd_info =
+      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+   const VkExportMemoryAllocateInfo *export_info =
+      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
+   const VkMemoryDedicatedAllocateInfo *ded =
+      vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+   struct kk_image *ded_image = ded && ded->image ? kk_image_from_handle(ded->image) : NULL;
+   if (fd_info && fd_info->handleType) {
+      if (!(fd_info->handleType & KK_FD_HANDLE_TYPES)) {
+         result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+         goto fail_alloc;
+      }
+      /* A buffer another driver made (vrend, venus) or another context shared as a surface is
+       * a texture over that surface; only an image can be one. A disjoint image's memory is
+       * one plane's, and which one only the bind says: the surface's own shape picks it. */
+      const struct kk_image_layout *layouts[3] = {0};
+      uint32_t layout_count = 0;
+      if (ded_image && (ded_image->plane_count == 1 || ded_image->disjoint)) {
+         for (uint8_t p = 0; p < ded_image->plane_count; p++)
+            layouts[layout_count++] = &ded_image->planes[p].layout;
+      }
+      mtl_texture *surface =
+         layout_count ? mtl_new_texture_from_fd(dev->mtl_handle, fd_info->fd, layouts,
+                                                layout_count)
+                      : NULL;
+      if (surface) {
+         mem->bo = CALLOC_STRUCT(kk_bo);
+         if (!mem->bo) {
+            mtl_release(surface);
+            result = vk_errorf(&dev->vk.base, VK_ERROR_OUT_OF_HOST_MEMORY, "%m");
+            goto fail_alloc;
+         }
+         mem->bo->texture = surface;
+         mem->bo->size_B = mem->vk.size;
+         kk_device_add_texture_to_residency_set(dev, surface);
+         /* A successful import owns the fd. */
+         close(fd_info->fd);
+         *pMem = kk_device_memory_to_handle(mem);
+         return VK_SUCCESS;
+      }
+      result = kk_import_bo_fd(dev, &dev->vk.base, fd_info->fd, &mem->bo);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
+      if (mem->bo->size_B < pAllocateInfo->allocationSize) {
+         kk_destroy_bo(dev, mem->bo);
+         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "dma-buf smaller than the allocation");
+         goto fail_alloc;
+      }
+      /* A successful import owns the fd. */
+      close(fd_info->fd);
+      *pMem = kk_device_memory_to_handle(mem);
+      return VK_SUCCESS;
+   }
+   if (export_info && (export_info->handleTypes & KK_FD_HANDLE_TYPES)) {
+      /* A dedicated linear image other drivers read: its storage is a surface they can import,
+       * not a heap only this driver understands. */
+      mtl_texture *shareable =
+         ded_image && ded_image->plane_count == 1
+            ? mtl_new_texture_shareable(dev->mtl_handle, &ded_image->planes[0].layout)
+            : NULL;
+      if (shareable) {
+         mem->bo = CALLOC_STRUCT(kk_bo);
+         if (!mem->bo) {
+            mtl_release(shareable);
+            result = vk_errorf(&dev->vk.base, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
+            goto fail_alloc;
+         }
+         mem->bo->texture = shareable;
+         mem->bo->size_B = mem->vk.size;
+         kk_device_add_texture_to_residency_set(dev, shareable);
+         *pMem = kk_device_memory_to_handle(mem);
+         return VK_SUCCESS;
+      }
+      /* The compositor's driver cannot read this one's layout, and an import it cannot make
+       * ends its own context, not ours: refuse here, where only this swapchain fails. */
+      if (ded_image && ded_image->vk.wsi_legacy_scanout) {
+         fprintf(stderr, "[limina-kk] a window-system image %ux%u in Metal format %u cannot be "
+                 "shared with the compositor\n",
+                 ded_image->vk.extent.width, ded_image->vk.extent.height,
+                 ded_image->planes[0].layout.format.mtl);
+         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "window-system image in a format the compositor cannot import");
+         goto fail_alloc;
+      }
+      result = kk_alloc_bo_exportable(dev, &dev->vk.base, aligned_size, &mem->bo);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
+      *pMem = kk_device_memory_to_handle(mem);
+      return VK_SUCCESS;
+   }
+#endif
+
    if (import_metal || import_host) {
+      /* limina: metal_info is NULL on a host-pointer-only import — don't deref it. */
+      const bool import_texture =
+         import_metal && metal_info->handleType ==
+                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+      if (import_metal && !import_texture &&
+          metal_info->handleType !=
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT) {
+         result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "unsupported Metal handle type 0x%x",
+                            metal_info->handleType);
+         goto fail_alloc;
+      }
       mem->bo = CALLOC_STRUCT(kk_bo);
       if (!mem->bo) {
          result = vk_errorf(&dev->vk.base, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
          goto fail_alloc;
       }
 
-      if (import_metal) {
-         assert(metal_info->handleType ==
-                VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
-
+      if (import_texture) {
+         /* A texture is the storage, not a pool to carve from: there is no heap
+          * and no buffer, so gpu/cpu stay 0 and the image bound to this memory
+          * adopts the texture verbatim (kk_image_plane_bind). Anything that
+          * tries to treat this memory as a buffer — vkMapMemory, a VkBuffer
+          * bind — must fail rather than deref a NULL map. */
+         /* limina: the MTLTEXTURE handle also accepts an IOSurfaceRef (CFTypeID
+          * dispatch). We build the texture HERE, from the dedicated image's own
+          * kk_image_layout, via newTextureWithDescriptor:iosurface:plane: — so
+          * the bind-time verbatim-adoption checks pass by construction. This is
+          * the import half of the vrend "IOSurface world": zink (under vrend)
+          * imports a venus-exported window buffer's IOSurface as a GL texture. */
+         if (mtl_handle_is_iosurface(metal_info->handle)) {
+            const VkMemoryDedicatedAllocateInfo *ded = vk_find_struct_const(
+               pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+            struct kk_image *ded_image =
+               (ded && ded->image) ? kk_image_from_handle(ded->image) : NULL;
+            if (!ded_image || ded_image->plane_count != 1) {
+               result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                                  "IOSurface import requires a dedicated "
+                                  "single-plane image");
+               FREE(mem->bo);
+               goto fail_alloc;
+            }
+            /* Hand-walked rather than vk_find_struct_const: the plane struct is
+             * limina-private and has no entry in the generated sType tables the
+             * macro resolves against. Absent, the import means plane 0. */
+            uint32_t io_plane = 0;
+            for (const VkBaseInStructure *s = pAllocateInfo->pNext; s;
+                 s = s->pNext) {
+               if (s->sType == VK_STRUCTURE_TYPE_IMPORT_IOSURFACE_PLANE_LIMINA) {
+                  io_plane = kk_limina_plane_index(
+                     ((const VkImportIOSurfacePlaneLIMINA *)s)->plane);
+                  break;
+               }
+            }
+            mem->bo->texture = mtl_new_texture_with_descriptor_iosurface(
+               dev->mtl_handle, &ded_image->planes[0].layout,
+               metal_info->handle, io_plane);
+            if (!mem->bo->texture) {
+               result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                                  "IOSurface texture creation failed");
+               FREE(mem->bo);
+               goto fail_alloc;
+            }
+         } else {
+            mem->bo->texture = mtl_retain(metal_info->handle);
+         }
+         mem->bo->size_B = mem->vk.size;
+         kk_device_add_texture_to_residency_set(dev, mem->bo->texture);
+         /* limina: imported memory is a population the address log never covered,
+          * so "the fault is outside every range we logged" could not speak for it.
+          * A texture import has no GPU address to print -- the handle and the size
+          * are what there is. */
+         kk_limina_addr_log("import-tex+ tex=%p size=%llu iosurface=%d",
+                            (void *)mem->bo->texture,
+                            (unsigned long long)mem->bo->size_B,
+                            mtl_handle_is_iosurface(metal_info->handle) ? 1 : 0);
+      } else if (import_metal) {
          /* We only support heaps since that's the backing for all our memory
           * and simplifies implementation */
          mem->bo->mtl_handle = mtl_retain(metal_info->handle);
@@ -129,17 +323,45 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             mtl_new_buffer_with_length(mem->bo->mtl_handle, mem->vk.size, 0u);
          mem->bo->size_B = mtl_heap_get_size(mem->bo->mtl_handle);
          kk_device_add_heap_to_residency_set(dev, mem->bo->mtl_handle);
+         kk_limina_addr_log("import-heap+ heap=%p gpu=0x%llx..0x%llx size=%llu",
+                            (void *)mem->bo->mtl_handle,
+                            (unsigned long long)mtl_buffer_get_gpu_address(mem->bo->map),
+                            (unsigned long long)(mtl_buffer_get_gpu_address(mem->bo->map) +
+                                                 mem->bo->size_B),
+                            (unsigned long long)mem->bo->size_B);
       } else if (import_host) {
          /* We can't create a heap from a host pointer. The imported memory will
           * only be usable for buffers */
          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
+         /* limina: newBufferWithBytesNoCopy returns nil on a rejected pointer/length;
+          * adding nil to the residency set makes the AGX residency commit segfault
+          * at the next submit. Fail the allocation loudly instead. */
+         if (!mem->bo->map) {
+            fprintf(stderr,
+                    "[LIMINA-KK-IMPORT] newBufferWithBytesNoCopy FAILED ptr=%p "
+                    "size=%llu (page-aligned ptr + page-multiple size required)\n",
+                    host_info->pHostPointer, (unsigned long long)mem->vk.size);
+            FREE(mem->bo);
+            result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                               "host pointer import rejected by Metal");
+            goto fail_alloc;
+         }
          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
+         kk_limina_addr_log("import-host+ buf=%p host=%p gpu=0x%llx..0x%llx size=%llu",
+                            (void *)mem->bo->map, host_info->pHostPointer,
+                            (unsigned long long)mtl_buffer_get_gpu_address(mem->bo->map),
+                            (unsigned long long)(mtl_buffer_get_gpu_address(mem->bo->map) +
+                                                 mem->bo->size_B),
+                            (unsigned long long)mem->bo->size_B);
       }
 
-      mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
-      mem->bo->cpu = mtl_get_contents(mem->bo->map);
+      /* A texture import has no buffer to take an address or contents from. */
+      if (mem->bo->map) {
+         mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+         mem->bo->cpu = mtl_get_contents(mem->bo->map);
+      }
    } else {
       result =
          kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
@@ -233,6 +455,11 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
    mem->map = mapped_addr;
    *ppData = mem->map + offset;
 
+   if (getenv("LIMINA_KK_RTLOG"))
+      fprintf(stderr, "[LIMINA-KK-MAP] mem=%p size=%llu cpu=%p heap=%d\n", (void *)mem,
+              (unsigned long long)mem->vk.size, mem->bo->cpu,
+              mem->bo->mtl_handle ? 1 : 0);
+
    return result;
 }
 
@@ -289,11 +516,22 @@ kk_GetMemoryMetalHandleEXT(
    VkDevice device, const VkMemoryGetMetalHandleInfoEXT *pGetMetalHandleInfo,
    void **pHandle)
 {
-   /* We only support heaps since that's the backing for all our memory and
-    * simplifies implementation */
-   assert(pGetMetalHandleInfo->handleType ==
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
    VK_FROM_HANDLE(kk_device_memory, mem, pGetMetalHandleInfo->memory);
+
+   /* A texture-backed allocation can only ever hand back its texture, and a
+    * heap-backed one its heap — asking for the other is an invalid handle, not
+    * an assert: the request comes from the application. */
+   if (pGetMetalHandleInfo->handleType ==
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
+      if (!mem->bo->texture)
+         return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      *pHandle = mem->bo->texture;
+      return VK_SUCCESS;
+   }
+
+   if (pGetMetalHandleInfo->handleType !=
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)
+      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    /* In some cases, such as host pointer imports, we don't have a MTLHeap */
    if (!mem->bo->mtl_handle)
@@ -308,6 +546,42 @@ kk_GetMemoryMetalHandleEXT(
    return VK_SUCCESS;
 }
 #endif /* VK_USE_PLATFORM_METAL_EXT */
+
+#if !DETECT_OS_APPLE
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   VK_FROM_HANDLE(kk_device, dev, device);
+   VK_FROM_HANDLE(kk_device_memory, mem, pGetFdInfo->memory);
+
+   if (!(pGetFdInfo->handleType & KK_FD_HANDLE_TYPES) || (!mem->bo->mtl_handle && !mem->bo->texture))
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   int fd = mem->bo->texture ? mtl_texture_export_fd(mem->bo->texture)
+                             : mtl_heap_export_fd(mem->bo->mtl_handle);
+   if (fd < 0)
+      return vk_error(dev, VK_ERROR_TOO_MANY_OBJECTS);
+   *pFd = fd;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+                            int fd, VkMemoryFdPropertiesKHR *pMemoryFdProperties)
+{
+   VK_FROM_HANDLE(kk_device, dev, device);
+   struct kk_physical_device *pdev = kk_device_physical(dev);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   /* A surface's pixels are the host's, so its memory is device-local only; a heap another
+    * context exported is memory like any other. */
+   pMemoryFdProperties->memoryTypeBits =
+      pdev->shareable_textures && mtl_fd_is_surface(dev->mtl_handle, fd)
+         ? BITFIELD_BIT(pdev->import_mem_type)
+         : BITFIELD_MASK(pdev->mem_type_count);
+   return VK_SUCCESS;
+}
+#endif /* !DETECT_OS_APPLE */
 
 VKAPI_ATTR uint64_t VKAPI_CALL
 kk_GetDeviceMemoryOpaqueCaptureAddress(

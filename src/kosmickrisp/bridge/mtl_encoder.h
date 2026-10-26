@@ -13,6 +13,55 @@
 
 /* Common encoder utils */
 void mtl_end_encoding(void *encoder);
+
+/* limina: tell the encoder-liveness table that our retain on `encoder` is about to go, so a use
+ * after this point is reported by name instead of faulting inside AGX on a recycled address. */
+void mtl_encoder_note_released(void *encoder);
+
+/* limina: which incarnation of this address the table currently describes. Encoder addresses are
+ * recycled constantly -- a measured desktop reuses one within tens of encoders -- so the pointer
+ * alone carries no identity and a liveness state alone cannot see a stale pointer: the new
+ * tenant is perfectly live. Comparing this against the generation recorded when the encoder was
+ * handed out is what catches it. 0 means "not tracked". */
+uint64_t mtl_encoder_generation(void *encoder);
+
+/* limina: what the encoder guard has actually seen. Reported on the unconditional periodic
+ * counts line, because a guard whose only signal is silence cannot be told apart from a dead one
+ * -- `checks` rising with `bad_*` at zero is evidence, `checks == 0` means the needle is dead.
+ * `untracked` is the guard's own blind spot: the address was not in the table, so every check
+ * passed by default. `slots_used` says how close the table is to the eviction that causes it. */
+struct mtl_encoder_guard_stats {
+   uint64_t checks;
+   uint64_t untracked;
+   uint64_t bad_null;
+   uint64_t bad_ended;
+   uint64_t bad_released;
+   uint64_t encoders_seen;
+   uint32_t slots_used;
+   uint32_t slots_total;
+   /* The AGX context behind the encoder (see mtl_encoder.m). `ctx_mode` says whether the
+    * pass-state canary is armed on this driver build, and is never NULL. */
+   const char *ctx_mode;
+   uint64_t ctx_born_broken; /* pass state already gone when AGX handed us the encoder */
+   uint64_t ctx_died;        /* pass state gone at a later op on a live encoder */
+   uint64_t ctx_swapped;     /* the encoder's context or allocator ivar changed under us */
+   uint64_t ctx_alloc_mismatch; /* the encoder's allocator is not the one KK began it on */
+   uint64_t ctx_skipped;     /* ops dropped on an encoder already found broken */
+};
+
+void mtl_encoder_guard_stats(struct mtl_encoder_guard_stats *out);
+
+/* limina: tell the guard which pooled allocator KK began this encoder's command buffer on, and
+ * how worn that allocator was, so a broken context can be correlated with a just-reset allocator
+ * versus a warm one. Also checks the encoder's own allocator is that one. */
+void mtl_encoder_note_allocator(void *encoder, void *allocator, uint32_t resets,
+                                uint32_t ops_since_reset);
+
+/* limina: dump what the table knows about whoever holds this address now -- the generation, and
+ * the recorded frames that created and ended the incarnation. Called from a refusal, where both
+ * the code holding the stale pointer and the code that took the address are still alive, so the
+ * pair of stacks is the cause a post-mortem crash report cannot supply. */
+void mtl_encoder_report_incarnation(void *encoder, const char *why);
 void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
                               enum mtl_stages before_queue_stages);
 void mtl_barrier_after_encoder_stages(void *encoder,

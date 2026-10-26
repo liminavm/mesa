@@ -10,6 +10,7 @@
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_limina_work.h"
 #include "kk_physical_device.h"
 #include "kk_sync.h"
 
@@ -18,10 +19,68 @@
 
 #include "vk_cmd_queue.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 struct kk_commit_data {
    struct kk_queue *queue;
    struct kk_cmd_buffer *cmd;
+   /* limina: the serial of the pool the submitted command buffer came from, not the queue's
+    * own re-record pool, so a hang is charged to the client that recorded the work. */
+   uint64_t pool;
+   /* limina: the queue generation it was committed to (struct kk_queue::gen). */
+   uint64_t gen;
 };
+
+/* limina: what one plain commit submitted, so the device-loss report can mark the GPU's last
+ * work and a hang can be charged to the pool that recorded it. Allocated per commit and freed by
+ * the callback, which Metal invokes exactly once. */
+struct kk_commit_note {
+   struct kk_queue *queue;
+   uint64_t pool;
+   uint64_t gen;
+   uint64_t seq_lo, seq_hi;
+};
+
+/* limina: a Metal queue left behind by a hang; generation `gen`, drained once `swap_event`
+ * reaches gen + 1. */
+struct kk_retired_queue {
+   mtl_command_queue *handle;
+   uint64_t gen;
+};
+
+/* limina: a semaphore value signalled on the Metal queue of generation `gen` that the GPU has not
+ * reached yet. Kept so a queue the kernel stops serving can have its signals delivered from the
+ * CPU; the event is retained for as long as it is listed. */
+struct kk_pending_signal {
+   uint64_t gen;
+   mtl_shared_event *event;
+   uint64_t value;
+};
+
+/* limina: the hangs that ran on one queue generation. The kernel ignores a queue after its second
+ * GPU restart (`Deny submissions/ignore app[...] with 2 GPURestarts`), measured in
+ * spikes/timer-query-hang. */
+struct kk_gen_hangs {
+   uint64_t gen;
+   uint32_t ran;
+   bool dead;
+};
+#define KK_QUEUE_IGNORED_AFTER_HANGS 2u
+
+/* limina: LIMINA_KK_HANG_RECOVERY=0 turns a GPU-watchdog hang back into device loss. */
+static bool
+kk_hang_recovery_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *e = getenv("LIMINA_KK_HANG_RECOVERY");
+      enabled = !(e && strcmp(e, "0") == 0);
+   }
+   return enabled;
+}
 
 static void
 kk_queue_wait_for_commits(struct kk_queue *queue)
@@ -40,10 +99,120 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
 }
 
+/* limina: the kernel no longer serves generation `gen`: nothing queued on it runs and none of its
+ * signals fire. Deliver them from the CPU, so neither the client's semaphores nor the next
+ * generation's wait on `swap_event` wait forever; the work behind them is lost either way.
+ * Called with queue->mutex held. */
 static void
-check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
+kk_queue_abandon_gen_locked(struct kk_queue *queue, uint64_t gen)
 {
+   util_dynarray_foreach(&queue->signals, struct kk_pending_signal, s) {
+      if (s->gen == gen &&
+          mtl_shared_event_get_signaled_value(s->event) < s->value)
+         mtl_shared_event_set_signaled_value(s->event, s->value);
+   }
+   if (gen < queue->gen && queue->swap_event != NULL &&
+       mtl_shared_event_get_signaled_value(queue->swap_event) < gen + 1u)
+      mtl_shared_event_set_signaled_value(queue->swap_event, gen + 1u);
+   fprintf(stderr,
+           "[LIMINA-KK-HANG] the kernel stopped serving queue generation %" PRIu64
+           "; its pending signals were delivered from the CPU\n",
+           gen);
+}
+
+/* limina: count a hang that ran on `gen`; true when it is the one that gets the queue ignored. */
+static bool
+kk_queue_count_hang_locked(struct kk_queue *queue, uint64_t gen)
+{
+   struct kk_gen_hangs *h = NULL;
+   util_dynarray_foreach(&queue->gen_hangs, struct kk_gen_hangs, g) {
+      if (g->gen == gen)
+         h = g;
+   }
+   if (h == NULL) {
+      struct kk_gen_hangs fresh = {.gen = gen};
+      util_dynarray_append(&queue->gen_hangs, fresh);
+      h = util_dynarray_last_ptr(&queue->gen_hangs, struct kk_gen_hangs);
+   }
+   if (++h->ran >= KK_QUEUE_IGNORED_AFTER_HANGS && !h->dead) {
+      h->dead = true;
+      return true;
+   }
+   return false;
+}
+
+static bool
+kk_queue_gen_dead_locked(struct kk_queue *queue, uint64_t gen)
+{
+   util_dynarray_foreach(&queue->gen_hangs, struct kk_gen_hangs, g) {
+      if (g->gen == gen)
+         return g->dead;
+   }
+   return false;
+}
+
+static void
+check_device_lost(struct kk_queue *queue, uint64_t pool, uint64_t gen,
+                  struct mtl_feedback_data *data, uint64_t seq_lo, uint64_t seq_hi)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+
+   /* limina: a timeout is macOS's GPU watchdog stopping work that ran too long without yielding
+    * (a long fragment shader is enough). It costs the command buffer and, at the second, the
+    * queue; the device goes on working, so do not lose it. The command buffer that had run is
+    * the one that hung the GPU; one that never started (gpu time 0) was waiting behind it, and
+    * is not charged. */
+   if (data->error == MTL_COMMAND_QUEUE_ERROR_TIMEOUT && kk_hang_recovery_enabled()) {
+      const double ms = (data->gpu_end - data->gpu_start) * 1000.0;
+      const bool ran = data->gpu_end > data->gpu_start;
+      if (ran) {
+         kk_limina_charge_hang(dev, pool);
+         mtx_lock(&queue->mutex);
+         if (kk_queue_count_hang_locked(queue, gen))
+            kk_queue_abandon_gen_locked(queue, gen);
+         mtx_unlock(&queue->mutex);
+      }
+      p_atomic_set(&queue->hung, 1u);
+      fprintf(stderr,
+              "[LIMINA-KK-HANG] the GPU watchdog stopped a command buffer %s (%.3f ms on the "
+              "GPU, pool %" PRIu64 "); the next submission moves to a new queue\n",
+              ran ? "that ran" : "that was waiting behind it", ms, pool);
+      static uint32_t dumped = 0u;
+      if (ran && dumped < 3u) {
+         ++dumped;
+         kk_limina_work_dump(stderr, 24u, seq_lo, seq_hi);
+      }
+      fflush(stderr);
+      return;
+   }
+
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+      /* limina: vk_device_set_lost's report reaches nothing the worker log captures,
+       * so a device loss arrives as an unexplained abort several layers downstream.
+       * Metal names the fault here; say it. The first few in full — a loss cascades. */
+      static uint32_t reported = 0u;
+      if (reported < 3u) {
+         ++reported;
+         fprintf(stderr,
+                 "[LIMINA-DEVICE-LOST] %s (code %u) gpu=%.6f..%.6f (%.3f ms)\n"
+                 "  message: %s\n"
+                 "  details: %s\n",
+                 mtl_command_queue_error_to_string(data->error),
+                 (unsigned)data->error, data->gpu_start, data->gpu_end,
+                 (data->gpu_end - data->gpu_start) * 1000.0,
+                 data->error_message ? data->error_message : "(none)",
+                 data->error_details ? data->error_details : "(none)");
+         kk_limina_work_dump(stderr, 24u, seq_lo, seq_hi);
+
+         fprintf(stderr, "  residency set: %u heaps, %u buffers, %u textures\n",
+                 p_atomic_read(&kk_limina_resident_heaps),
+                 p_atomic_read(&kk_limina_resident_buffers),
+                 p_atomic_read(&kk_limina_resident_textures));
+         fprintf(stderr, "  sampler table: %u slots retired\n",
+                 p_atomic_read(&kk_limina_sampler_retires));
+         fflush(stderr);
+      }
+
       vk_device_set_lost(
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);
@@ -53,7 +222,9 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
-   check_device_lost((struct kk_device *)data->user_data, data);
+   struct kk_commit_note *note = (struct kk_commit_note *)data->user_data;
+   check_device_lost(note->queue, note->pool, note->gen, data, note->seq_lo, note->seq_hi);
+   free(note);
 }
 
 static void
@@ -63,7 +234,8 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    struct kk_queue *queue = commit->queue;
    struct kk_device *dev = kk_queue_device(queue);
 
-   check_device_lost(dev, data);
+   check_device_lost(queue, commit->pool, commit->gen, data, commit->cmd->work_seq_lo,
+                     commit->cmd->work_seq_hi);
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
@@ -89,18 +261,75 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
    return cmd->metal.cmd_buf;
 }
 
+/* limina: GPU completion for one commit: discharge the allocator charge its command buffer took
+ * at begin, which is what lets an over-budget allocator drain and be released. Metal
+ * snapshots the feedback-handler list per commit (measured, mtl4-repro T4), so this fires once. */
+struct kk_submit_discharge {
+   struct kk_device *dev;
+   struct kk_pooled_alloc *pa;
+};
+
 static void
+discharge_callback(struct mtl_feedback_data *data)
+{
+   struct kk_submit_discharge *d = (struct kk_submit_discharge *)data->user_data;
+   kk_alloc_pool_discharge(d->dev, d->pa);
+   free(d);
+}
+
+/* limina: fault injection for the discharge-payload allocation. It is a few dozen bytes and
+ * effectively never fails, which is exactly why its recovery path once carried a use-after-free
+ * unnoticed: an untestable error path is an unreviewed one. LIMINA_KK_FAIL_DISCHARGE_ALLOC=<n>
+ * fails the first <n>. The counter is deliberately plain: a race can only change how many
+ * injections land, never whether the path under test is correct. */
+static bool
+kk_discharge_alloc_should_fail(void)
+{
+   static int remaining = -1;
+   if (remaining < 0) {
+      const char *e = getenv("LIMINA_KK_FAIL_DISCHARGE_ALLOC");
+      remaining = (e && *e) ? atoi(e) : 0;
+   }
+   if (remaining > 0) {
+      remaining--;
+      fprintf(stderr, "[LIMINA-KK] injecting discharge-payload allocation failure\n");
+      return true;
+   }
+   return false;
+}
+
+/* On failure nothing has been committed and `user_data` still belongs to the caller. */
+static VkResult
 kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
                 mtl_feedback_handler_callback callback, void *user_data)
 {
    assert(kk_cmd_buffer_has_work(cmd));
 
+   /* limina: build the discharge payload BEFORE anything is committed. The charge must be
+    * released at GPU completion; if this allocation could fail after the commit, the charge
+    * would be left for command-buffer reset, which the rerecord path reaches while this
+    * submission is still executing, and the pool could then release heaps the GPU is
+    * reading. Failing first means the GPU never receives the work, so the charge discharging at
+    * reset is exactly right. */
+   struct kk_submit_discharge *d = NULL;
+   if (cmd->charged) {
+      d = kk_discharge_alloc_should_fail() ? NULL : malloc(sizeof(*d));
+      if (d == NULL)
+         return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+      d->dev = kk_queue_device(queue);
+      d->pa = cmd->charged;
+      cmd->charged = NULL;
+   }
+
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, callback, user_data);
+   if (d)
+      mtl_commit_options_add_feedback_handler(options, discharge_callback, d);
 
    mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
                             options);
    mtl_release(options);
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -111,6 +340,14 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    struct vk_command_buffer *vk_cmd = NULL;
    struct kk_cmd_buffer *rerecord;
    VkResult result = VK_SUCCESS;
+
+   /* limina: take the allocator before queue->mutex. An acquire at the pool's ceiling waits for
+    * commits to complete, and rerecord_commit_callback takes queue->mutex, so waiting with it held
+    * could stall the very completions the wait needs. */
+   struct kk_pooled_alloc *pa = kk_alloc_pool_acquire(dev);
+   if (pa == NULL)
+      return vk_device_is_lost_no_report(&dev->vk) ? VK_ERROR_DEVICE_LOST
+                                                   : VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
@@ -123,11 +360,17 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    } else {
       result = kk_cmd_buffer_ops.create(
          &queue->cmd_pool->vk, VK_COMMAND_BUFFER_LEVEL_PRIMARY, &vk_cmd);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         kk_alloc_pool_release(dev, pa);
          goto unlock;
+      }
    }
 
    rerecord = container_of(vk_cmd, struct kk_cmd_buffer, vk);
+   /* kk_BeginCommandBuffer uses an allocator already in place instead of acquiring one. */
+   assert(rerecord->metal.pa == NULL);
+   rerecord->metal.pa = pa;
+   rerecord->metal.allocator = pa->handle;
    VkCommandBuffer rerecord_handle = kk_cmd_buffer_to_handle(rerecord);
    const VkCommandBufferBeginInfo begin_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -155,12 +398,19 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    }
    commit->queue = queue;
    commit->cmd = rerecord;
+   commit->pool = kk_cmd_buffer_pool(cmd)->limina_serial;
+   commit->gen = queue->gen;
 
    /* Need to ensure the new buffers allocated at record are resident. */
    kk_device_make_resources_resident(dev);
 
    queue->commits_in_flight++;
-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   result = kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   if (result != VK_SUCCESS) {
+      queue->commits_in_flight--;
+      vk_free(&dev->vk.alloc, commit);
+      goto release;
+   }
 
    mtx_unlock(&queue->mutex);
    return VK_SUCCESS;
@@ -172,14 +422,97 @@ unlock:
    return result;
 }
 
+/* limina: drop the pending signals the GPU has reached, and release the queues left behind by a
+ * hang once everything committed to them ran. */
+static void
+kk_queue_reap(struct kk_queue *queue)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+
+   mtx_lock(&queue->mutex);
+   struct kk_pending_signal *out = util_dynarray_begin(&queue->signals);
+   util_dynarray_foreach(&queue->signals, struct kk_pending_signal, s) {
+      if (mtl_shared_event_get_signaled_value(s->event) >= s->value)
+         mtl_release(s->event);
+      else
+         *out++ = *s;
+   }
+   queue->signals.size = (char *)out - (char *)queue->signals.data;
+
+   if (queue->swap_event != NULL) {
+      const uint64_t reached = mtl_shared_event_get_signaled_value(queue->swap_event);
+      struct kk_retired_queue *r = util_dynarray_begin(&queue->retired);
+      while (r < (struct kk_retired_queue *)util_dynarray_end(&queue->retired)) {
+         if (r->gen + 1u <= reached) {
+            mtl_command_queue_remove_residency_set(r->handle, dev->residency_set.handle);
+            mtl_release(r->handle);
+            *r = util_dynarray_pop(&queue->retired, struct kk_retired_queue);
+         } else {
+            r++;
+         }
+      }
+   }
+   mtx_unlock(&queue->mutex);
+}
+
+/* limina: move to a new Metal queue after a GPU-watchdog hang. The kernel ignores a queue's
+ * submissions once it has hung twice, and from then on even the event signals queued on it never
+ * fire, so a timeline semaphore would never signal again; a new queue in the same process is not
+ * affected. The new queue waits for the old one through `swap_event`, which keeps one in-order
+ * VkQueue in front of the client. On failure the old queue stays and the next submission tries
+ * again. */
+static void
+kk_queue_recover(struct kk_queue *queue)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+
+   if (queue->swap_event == NULL) {
+      queue->swap_event = mtl_new_shared_event(dev->mtl_handle);
+      if (queue->swap_event == NULL)
+         return;
+   }
+   mtl_command_queue *next = mtl_new_command_queue(dev->mtl_handle);
+   if (next == NULL)
+      return;
+   mtl_command_queue_add_residency_set(next, dev->residency_set.handle);
+
+   p_atomic_set(&queue->hung, 0u);
+   mtx_lock(&queue->mutex);
+   const uint64_t old_gen = queue->gen;
+   /* A generation the kernel already stopped serving cannot signal its own drain; mark it from
+    * the CPU instead (its work is lost either way). */
+   if (kk_queue_gen_dead_locked(queue, old_gen))
+      mtl_shared_event_set_signaled_value(queue->swap_event, old_gen + 1u);
+   else
+      mtl_signal_event(queue->mtl_handle, queue->swap_event, old_gen + 1u);
+   mtl_wait_for_event(next, queue->swap_event, old_gen + 1u);
+   struct kk_retired_queue r = {.handle = queue->mtl_handle, .gen = old_gen};
+   util_dynarray_append(&queue->retired, r);
+   queue->mtl_handle = next;
+   queue->gen = old_gen + 1u;
+   const unsigned left = util_dynarray_num_elements(&queue->retired, struct kk_retired_queue);
+   mtx_unlock(&queue->mutex);
+
+   fprintf(stderr,
+           "[LIMINA-KK-HANG] moved to queue generation %" PRIu64 " (%u left to drain)\n",
+           old_gen + 1u, left);
+   fflush(stderr);
+}
+
 static VkResult
 kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
    struct kk_device *dev = kk_queue_device(queue);
 
-   if (vk_queue_is_lost(&queue->vk))
+   /* limina: the device is marked lost from the commit feedback handler, which does not mark
+    * the queue. Without this the queue keeps accepting submissions that can never complete. */
+   if (vk_queue_is_lost(&queue->vk) || vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
+
+   if (p_atomic_read(&queue->hung))
+      kk_queue_recover(queue);
+   kk_queue_reap(queue);
 
    for (struct vk_sync_wait *wait = submit->waits,
                             *end = submit->waits + submit->wait_count;
@@ -210,7 +543,20 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          if (result != VK_SUCCESS)
             return result;
       } else if (kk_cmd_buffer_has_work(cmd_buffer)) {
-         kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
+         /* limina: a failing commit has to say which encoders it carried. */
+         struct kk_commit_note *note = malloc(sizeof(*note));
+         if (note == NULL)
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         note->queue = queue;
+         note->pool = kk_cmd_buffer_pool(cmd_buffer)->limina_serial;
+         note->gen = queue->gen;
+         note->seq_lo = cmd_buffer->work_seq_lo;
+         note->seq_hi = cmd_buffer->work_seq_hi;
+         VkResult result = kk_queue_commit(queue, cmd_buffer, commit_callback, note);
+         if (result != VK_SUCCESS) {
+            free(note);
+            return result;
+         }
       }
 
       cmd_buffer->submitted = true;
@@ -229,6 +575,16 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          container_of(signal->sync, struct kk_sync_timeline, base);
       mtl_signal_event(queue->mtl_handle, sync->mtl_handle,
                        signal->signal_value);
+      /* limina: kept until the GPU reaches it, for kk_queue_abandon_gen_locked. */
+      struct kk_pending_signal pending = {
+         .gen = queue->gen,
+         .event = sync->mtl_handle,
+         .value = signal->signal_value,
+      };
+      mtl_retain(pending.event);
+      mtx_lock(&queue->mutex);
+      util_dynarray_append(&queue->signals, pending);
+      mtx_unlock(&queue->mutex);
    }
 
    return VK_SUCCESS;
@@ -282,6 +638,12 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
    queue->cmd_pool = kk_cmd_pool_from_handle(pool_handle);
 
    queue->free_cmd_buffers = UTIL_DYNARRAY_INIT;
+   queue->retired = UTIL_DYNARRAY_INIT;
+   queue->signals = UTIL_DYNARRAY_INIT;
+   queue->gen_hangs = UTIL_DYNARRAY_INIT;
+   queue->hung = 0u;
+   queue->gen = 0u;
+   queue->swap_event = NULL;
    queue->commits_in_flight = 0u;
    mtx_init(&queue->mutex, mtx_plain);
    cnd_init(&queue->cond);
@@ -304,6 +666,17 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
    mtl_command_queue_remove_residency_set(queue->mtl_handle,
                                           dev->residency_set.handle);
    mtl_release(queue->mtl_handle);
+   util_dynarray_foreach(&queue->retired, struct kk_retired_queue, r) {
+      mtl_command_queue_remove_residency_set(r->handle, dev->residency_set.handle);
+      mtl_release(r->handle);
+   }
+   util_dynarray_fini(&queue->retired);
+   util_dynarray_foreach(&queue->signals, struct kk_pending_signal, s)
+      mtl_release(s->event);
+   util_dynarray_fini(&queue->signals);
+   util_dynarray_fini(&queue->gen_hangs);
+   if (queue->swap_event != NULL)
+      mtl_release(queue->swap_event);
 
    kk_DestroyCommandPool(kk_device_to_handle(dev),
                          kk_cmd_pool_to_handle(queue->cmd_pool), NULL);

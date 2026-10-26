@@ -54,6 +54,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_device_group = true,
       .KHR_external_fence = true,
       .KHR_external_memory = true,
+      .KHR_external_memory_fd = !DETECT_OS_APPLE,
       .KHR_external_semaphore = true,
       .KHR_get_memory_requirements2 = true,
       .KHR_maintenance1 = true,
@@ -180,11 +181,21 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_depth_clip_control = true,
       .EXT_depth_clip_enable = true,
       .EXT_extended_dynamic_state3 = true,
+      .EXT_external_memory_dma_buf = !DETECT_OS_APPLE,
       .EXT_external_memory_metal = true,
-      .EXT_external_memory_host = true,
+      /* Wrapping arbitrary host pages needs the Metal bridge's bytes-no-copy buffers: a bridge
+       * that is not Metal itself has no way to make them. */
+      .EXT_external_memory_host = DETECT_OS_APPLE,
       .EXT_hdr_metadata = true,
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_view_min_lod = KK_EXPERIMENTAL(IMAGE_VIEW_MIN_LOD),
+      /* limina: LINEAR-only. In the VM stack this is what lets upstream venus's
+       * passthrough gate advertise the extension to the guest, deleting the
+       * guest-side fabrication (mesa 0010(b)). The LINEAR claim is genuine: the
+       * shareable images are IOSurface-backed (linear at the surface's rowBytes)
+       * or buffer-backed linear Metal textures, and both render (measured —
+       * spikes/modifier-necessity/RESULTS.md, kk 0002 origin-class checkpoint). */
+      .EXT_image_drm_format_modifier = true,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = true,
@@ -193,8 +204,14 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_nested_command_buffer = true,
       .EXT_post_depth_coverage = true,
       .EXT_primitive_restart_index = true,
+      .EXT_primitives_generated_query = true,
       .EXT_primitive_topology_list_restart = true,
       .EXT_provoking_vertex = true,
+      /* Constant-only (VK_QUEUE_FAMILY_FOREIGN_EXT, no entry points). One queue
+       * family and shared storage: acquire/release to a foreign family is a
+       * no-op here, so this is an honest claim, and compositors' dma-buf paths
+       * (via venus in a VM) require it. */
+      .EXT_queue_family_foreign = true,
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_shader_atomic_float = true,
@@ -204,6 +221,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
 #ifdef KK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
 #endif
+      .EXT_transform_feedback = true,
       .EXT_vertex_attribute_robustness = true,
 
       .GOOGLE_decorate_string = true,
@@ -215,6 +233,15 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .AMD_shader_image_load_store_lod = true,
       .AMD_buffer_marker = true,
    };
+}
+
+/* limina: geometry shaders run on poly's compute emulation;
+ * LIMINA_KK_GEOMETRY_SHADER=0 stops advertising them. */
+static bool
+kk_limina_geometry_shader(void)
+{
+   const char *e = getenv("LIMINA_KK_GEOMETRY_SHADER");
+   return !e || e[0] != '0';
 }
 
 static void
@@ -233,6 +260,7 @@ kk_get_device_features(
       .dualSrcBlend = true,
       .fragmentStoresAndAtomics = true,
       .fullDrawIndexUint32 = true,
+      .geometryShader = kk_limina_geometry_shader(),
       .imageCubeArray = true,
       .independentBlend = true,
       .inheritedQueries = true,
@@ -490,6 +518,12 @@ kk_get_device_features(
       /* VK_EXT_primitive_restart_index */
       .primitiveRestartIndex = true,
 
+      /* VK_EXT_primitives_generated_query (CPU-side accumulation; rasterizer
+       * discard is emulated via an empty scissor so the VS still runs). */
+      .primitivesGeneratedQuery = true,
+      .primitivesGeneratedQueryWithRasterizerDiscard = true,
+      .primitivesGeneratedQueryWithNonZeroStreams = false,
+
       /* VK_EXT_primitive_topology_list_restart */
       .primitiveTopologyListRestart = true,
       .primitiveTopologyPatchListRestart = false,
@@ -499,6 +533,10 @@ kk_get_device_features(
 
       /* VK_EXT_shader_replicated_composites */
       .shaderReplicatedComposites = true,
+
+      /* VK_EXT_transform_feedback (no geometry shaders => single stream) */
+      .transformFeedback = true,
+      .geometryStreams = false,
 
       /* VK_KHR_shader_subgroup_uniform_control_flow */
       .shaderSubgroupUniformControlFlow = true,
@@ -558,7 +596,7 @@ kk_get_device_properties(
       .maxImageDimension3D = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_3D),
       .maxImageDimensionCube = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_2D),
       .maxImageArrayLayers = 2048,
-      .maxTexelBufferElements = 16384 * 16384,
+      .maxTexelBufferElements = KK_MAX_TEXEL_BUFFER_ELEMENTS,
       .maxUniformBufferRange = 65536,
       .maxStorageBufferRange = UINT32_MAX,
       .maxPushConstantsSize = KK_MAX_PUSH_SIZE,
@@ -605,7 +643,13 @@ kk_get_device_properties(
       .maxFragmentDualSrcAttachments = 1,
       .maxFragmentCombinedOutputResources = KK_MAX_DESCRIPTORS,
       .maxComputeSharedMemorySize = pdev->info.max_compute_shared_memory_size,
-      .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
+      /* limina: Metal takes far more threadgroups per grid dimension than
+       * 65535: on an M1 Max, 2^24 + 1 in y or z each ran every workgroup
+       * exactly once (limina spikes/kk-workgroup-count), and ggml sizes
+       * row-wise dispatches to this limit and aborts above it. y and z stop
+       * where a dispatch of the largest workgroup still counts its threads
+       * in 32 bits, which is how vkCmdDispatch hands Metal its grid. */
+      .maxComputeWorkGroupCount = {0x7fffffff, 0x3fffff, 0x3fffff},
       .maxComputeWorkGroupInvocations = pdev->info.max_workgroup_invocations,
       .maxComputeWorkGroupSize = {pdev->info.max_workgroup_count[0],
                                   pdev->info.max_workgroup_count[1],
@@ -646,7 +690,7 @@ kk_get_device_properties(
       .sampledImageStencilSampleCounts = sample_counts,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
-      .timestampComputeAndGraphics = true,
+      .timestampComputeAndGraphics = pdev->timestamps,
       .timestampPeriod = timestamp_period,
       .maxClipDistances = 8,
       .maxCullDistances = 8,
@@ -878,7 +922,7 @@ kk_get_device_properties(
       .shaderBinaryVersion = 0,
 
       /* VK_EXT_transform_feedback */
-      .maxTransformFeedbackStreams = 4,
+      .maxTransformFeedbackStreams = 1,
       .maxTransformFeedbackBuffers = 4,
       .maxTransformFeedbackBufferSize = UINT32_MAX,
       .maxTransformFeedbackStreamDataSize = 2048,
@@ -886,7 +930,7 @@ kk_get_device_properties(
       .maxTransformFeedbackBufferDataStride = 2048,
       .transformFeedbackQueries = true,
       .transformFeedbackStreamsLinesTriangles = false,
-      .transformFeedbackRasterizationStreamSelect = true,
+      .transformFeedbackRasterizationStreamSelect = false,
       .transformFeedbackDraw = true,
 
       /* VK_KHR_vertex_attribute_divisor */
@@ -1141,6 +1185,11 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    }
 
    pdev->mtl_dev_handle = mtl_device_create();
+#if DETECT_OS_APPLE
+   pdev->timestamps = true;
+#else
+   pdev->timestamps = pdev->mtl_dev_handle && mtl_device_supports_timestamps(pdev->mtl_dev_handle);
+#endif
    if (!pdev->mtl_dev_handle) {
       result = VK_SUCCESS;
       goto fail_alloc;
@@ -1156,6 +1205,11 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
 
    struct vk_device_extension_table supported_extensions;
    kk_get_device_extensions(instance, pdev, &supported_extensions);
+   /* A bridge onto a DRM device (limina's) names its render node, which is how a GL driver on
+    * the same node (zink) finds this device. */
+   int64_t drm_major, drm_minor;
+   supported_extensions.EXT_physical_device_drm =
+      mtl_device_get_drm_render_node(pdev->mtl_dev_handle, &drm_major, &drm_minor);
 
    struct vk_features supported_features;
    kk_get_device_features(pdev, &supported_extensions, &supported_features);
@@ -1163,7 +1217,14 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    struct vk_properties properties;
    kk_get_device_properties(pdev, instance, &supported_extensions, &properties);
 
-   properties.drmHasRender = false;
+   int64_t render_major, render_minor;
+   properties.drmHasRender = supported_extensions.EXT_physical_device_drm &&
+                             mtl_device_get_drm_render_node(pdev->mtl_dev_handle, &render_major,
+                                                            &render_minor);
+   if (properties.drmHasRender) {
+      properties.drmRenderMajor = render_major;
+      properties.drmRenderMinor = render_minor;
+   }
 
    result = vk_physical_device_init(&pdev->vk, &instance->vk,
                                     &supported_extensions, &supported_features,
@@ -1207,6 +1268,10 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
 
    pdev->sync_binary_type = vk_sync_binary_get_type(&kk_sync_type);
+#if !DETECT_OS_APPLE
+   pdev->sync_binary_type.sync.export_sync_file = kk_binary_export_sync_file;
+   pdev->sync_binary_type.sync.import_sync_file = kk_binary_import_sync_file;
+#endif
    unsigned st_idx = 0;
    pdev->sync_types[st_idx++] = &kk_sync_type;
    pdev->sync_types[st_idx++] = &pdev->sync_binary_type.sync;
@@ -1214,6 +1279,20 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    assert(st_idx <= ARRAY_SIZE(pdev->sync_types));
    pdev->vk.supported_sync_types = pdev->sync_types;
 
+#if !DETECT_OS_APPLE
+   pdev->shareable_textures = mtl_device_supports_shareable_textures(pdev->mtl_dev_handle);
+   /* An imported dma-buf is a host surface whose pixels this guest's CPU cannot see: mapping it
+    * would show its guest backing, not the picture. Its memory is device-local only, so an app
+    * that maps whatever is host-visible (libplacebo does) leaves it alone. */
+   if (pdev->shareable_textures) {
+      pdev->import_mem_type = pdev->mem_type_count;
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+      assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+   }
+#endif
    result = kk_init_wsi(pdev);
    if (result != VK_SUCCESS)
       goto fail_disk_cache;
@@ -1338,7 +1417,7 @@ kk_GetPhysicalDeviceQueueFamilyProperties2(
       {
          p->queueFamilyProperties.queueFlags = queue_family->queue_flags;
          p->queueFamilyProperties.queueCount = queue_family->queue_count;
-         p->queueFamilyProperties.timestampValidBits = 64;
+         p->queueFamilyProperties.timestampValidBits = pdev->timestamps ? 64 : 0;
          p->queueFamilyProperties.minImageTransferGranularity =
             (VkExtent3D){1, 1, 1};
 

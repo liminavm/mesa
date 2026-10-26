@@ -170,6 +170,7 @@ struct lower_gs_state {
    int count_index[POLY_MAX_VERTEX_STREAMS];
 
    struct poly_gs_info *info;
+   const struct poly_gs_options *opts;
 };
 
 /* Helpers for loading from the vertex state buffer */
@@ -210,6 +211,9 @@ load_geometry_param_offset(nir_builder *b, uint32_t offset, uint8_t bytes)
 struct lower_output_to_var_slot {
    nir_variable *output_var;
    nir_variable *selected_var;
+   /* The output of the vertex whose flat outputs this vertex carries, when
+    * emulating last-vertex provoking */
+   nir_variable *flat_selected_var;
    nir_alu_type type;
    unsigned nr_components;
 };
@@ -516,6 +520,8 @@ create_geometry_count_shader(nir_shader *gs, struct lower_gs_state *state)
 struct lower_gs_rast_state {
    nir_def *raw_instance_id;
    nir_def *instance_id, *primitive_id, *output_id, *stream;
+   /* Vertex whose flat outputs to carry, or NULL if not emulating */
+   nir_def *flat_output_id;
    struct lower_output_to_var_slot outputs[NUM_TOTAL_VARYING_SLOTS];
    bool points;
 
@@ -539,6 +545,22 @@ select_rast_output(nir_builder *b, nir_intrinsic_instr *intr,
 
       nir_store_var(b, state->outputs[slot].selected_var, value,
                     nir_component_mask(value->num_components));
+   }
+
+   if (state->flat_output_id) {
+      nir_def *flat_us = nir_ieq(b, intr->src[0].ssa, state->flat_output_id);
+      flat_us =
+         nir_iand(b, flat_us,
+                  nir_ieq_imm(b, state->stream, nir_intrinsic_stream_id(intr)));
+
+      u_foreach_bit64(slot, b->shader->info.outputs_written) {
+         nir_variable *var = state->outputs[slot].flat_selected_var;
+         nir_def *orig = nir_load_var(b, var);
+         nir_def *data = nir_load_var(b, state->outputs[slot].output_var);
+         nir_def *value = nir_bcsel(b, flat_us, data, orig);
+         nir_store_var(b, var, value,
+                       nir_component_mask(value->num_components));
+      }
    }
 }
 
@@ -743,6 +765,19 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       UNREACHABLE("invalid shape");
    }
 
+   /* A strip primitive starting at vertex i is provoked by vertex i + n - 1
+    * under the last-vertex convention. Vertices of one strip are consecutive,
+    * and a vertex too close to the end of its strip starts no primitive. */
+   unsigned verts_per_prim =
+      mesa_vertices_per_prim(gs->info.gs.output_primitive);
+   if (state->opts && state->opts->emulate_provoking_last &&
+       verts_per_prim > 1) {
+      nir_def *shift =
+         nir_bcsel(b, nir_i2b(b, nir_load_provoking_last(b)),
+                   nir_imm_int(b, verts_per_prim - 1), nir_imm_int(b, 0));
+      rs.flat_output_id = nir_iadd(b, rs.output_id, shift);
+   }
+
    nir_shader_intrinsics_pass(shader, collect_output_types, nir_metadata_all,
                               rs.outputs);
 
@@ -761,6 +796,13 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       output->selected_var = nir_variable_create(
          shader, nir_var_shader_temp, glsl_vector_type(type, output->nr_components),
          ralloc_asprintf(shader, "%s-selected", slot_name));
+
+      if (rs.flat_output_id) {
+         output->flat_selected_var = nir_variable_create(
+            shader, nir_var_shader_temp,
+            glsl_vector_type(type, output->nr_components),
+            ralloc_asprintf(shader, "%s-flat-selected", slot_name));
+      }
    }
 
    nir_shader_intrinsics_pass(shader, lower_to_gs_rast,
@@ -853,6 +895,14 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
        * type. If no writes occurred, the output shouldn't be in outputs_written
        */
       assert(output->type != nir_type_invalid);
+
+      if (rs.flat_output_id) {
+         nir_def *flat = nir_load_var(b, output->flat_selected_var);
+         nir_def *flat_mask = load_geometry_param(b, flat_outputs);
+         nir_def *is_flat =
+            nir_ine_imm(b, nir_iand_imm(b, flat_mask, BITFIELD64_BIT(slot)), 0);
+         value = nir_bcsel(b, is_flat, flat, value);
+      }
 
       /* We must only rasterize vertices from the rasterization stream. Since we
        * shade vertices across all streams, we do this by throwing away vertices
@@ -1227,6 +1277,16 @@ bool
 poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
                   nir_shader **pre_gs, struct poly_gs_info *info)
 {
+   const struct poly_gs_options opts = {0};
+   return poly_nir_lower_gs_opts(gs, gs_count, gs_copy, pre_gs, info, &opts);
+}
+
+bool
+poly_nir_lower_gs_opts(nir_shader *gs, nir_shader **gs_count,
+                       nir_shader **gs_copy, nir_shader **pre_gs,
+                       struct poly_gs_info *info,
+                       const struct poly_gs_options *opts)
+{
    /* Lower I/O as assumed by the rest of GS lowering */
    if (gs->xfb_info != NULL) {
       /* Fold constant offset srcs for IO. */
@@ -1289,7 +1349,7 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    /* If we know counts at compile-time we can simplify, so try to figure out
     * the counts statically.
     */
-   struct lower_gs_state gs_state = {.info = info};
+   struct lower_gs_state gs_state = {.info = info, .opts = opts};
 
    *info = (struct poly_gs_info){
       .mode = gs->info.gs.output_primitive,
