@@ -199,6 +199,8 @@ zink_render_attachment_shadow(struct zink_context *ctx, uint32_t attachment_shad
             (ctx->rp_clears_enabled >> 2) & BITFIELD_BIT(i)) {
          transient->valid |= zink_fb_clear_full_exists(ctx, i);
       }
+      populated[i] = transient;
+      populated_mask |= BITFIELD_BIT(i);
       if (transient->valid)
          continue;
       struct pipe_surface dst_view = ctx->fb_state.cbufs[i];
@@ -252,8 +254,6 @@ zink_render_attachment_shadow(struct zink_context *ctx, uint32_t attachment_shad
       }
       ctx->blitting = blitting;
       pipe_sampler_view_reference(&src_view, NULL);
-      populated[i] = transient;
-      populated_mask |= BITFIELD_BIT(i);
    }
    /* each blit rebinds the fb, which marks the transients populated before it invalid,
     * but nothing has rendered to them since
