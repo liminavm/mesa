@@ -1770,7 +1770,7 @@ gather_graphics_pipeline_create_info(
 }
 
 /* limina: a content hash over every stage's generated MSL. Stable across runs, so a
- * validation report, a shader dump and a second run's report all name the same thing. */
+ * validation report and a second run's report name the same thing. */
 uint64_t
 kk_limina_msl_hash(const struct kk_shader *sh)
 {
@@ -1872,8 +1872,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
     * shader pair instead of a UID we cannot map back. The label must be a hash of
     * the generated MSL, not the kk_shader pointer: the label is hashed INTO the
     * pipeline UID, so a per-run pointer makes every UID per-run too, and two runs
-    * of the same workload cannot be joined. KK_LIMINA_SHADER_DUMP names its files
-    * by the same hash. */
+    * of the same workload cannot be joined. */
    {
       char label[64];
       snprintf(label, sizeof(label), "msl=%016llx",
