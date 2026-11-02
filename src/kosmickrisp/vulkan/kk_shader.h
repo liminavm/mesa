@@ -120,6 +120,8 @@ struct kk_shader_info {
 
       struct {
          bool uses_flat_varyings;
+         /* Varying slots read flat */
+         uint64_t flat_inputs;
       } fs;
 
       struct {

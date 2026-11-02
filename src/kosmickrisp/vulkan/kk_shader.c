@@ -904,6 +904,17 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 static bool
+gather_flat_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_input)
+      return false;
+
+   uint64_t *mask = data;
+   *mask |= BITFIELD64_BIT(nir_intrinsic_io_semantics(intr).location);
+   return false;
+}
+
+static bool
 fs_uses_flat_varying(nir_shader *nir)
 {
    nir_foreach_function_impl(impl, nir) {
@@ -946,6 +957,8 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
       if (nir->info.fs.depth_layout == FRAG_DEPTH_LAYOUT_NONE)
          nir->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_ANY;
       shader->info.fs.uses_flat_varyings = fs_uses_flat_varying(nir);
+      nir_shader_intrinsics_pass(nir, gather_flat_input, nir_metadata_all,
+                                 &shader->info.fs.flat_inputs);
    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
@@ -1332,9 +1345,13 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
        * 32-bit, which we support. Lower GS inputs to scalar. */
       NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
 
+      /* Metal provokes from the first vertex only */
+      const struct poly_gs_options gs_opts = {
+         .emulate_provoking_last = true,
+      };
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
-      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &shader->info.gs);
+      NIR_PASS(_, nir, poly_nir_lower_gs_opts, &count, &rast, &pre_gs,
+               &shader->info.gs, &gs_opts);
 
       /* Only transform feedback and pipeline statistics need these, and KK
        * exposes neither */
