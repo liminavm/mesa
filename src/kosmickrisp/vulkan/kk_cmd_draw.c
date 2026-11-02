@@ -1900,6 +1900,18 @@ kk_set_unrolled_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    data->indirect_command.stride = sizeof(VkDrawIndexedIndirectCommand);
 }
 
+/* Metal provokes from the first vertex. Under the last-vertex convention, an
+ * unroll puts each primitive's provoking vertex first, but only when the
+ * fragment shader reads flat inputs: a line drawn reversed covers slightly
+ * different pixels than the same line drawn directly. */
+static bool
+kk_emulates_flatshade_last(struct kk_cmd_buffer *cmd,
+                           const struct kk_draw_command *data)
+{
+   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   return !data->flatshade_first && fs && fs->info.fs.uses_flat_varyings;
+}
+
 /* Unrolling will always be done through indirect rendering, so if this is
  * called from non-indirect calls, we will fake it. */
 static bool
@@ -1933,6 +1945,7 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       .in_el_size_B = data->index_buffer_el_size_B,
       .out_el_size_B = 4u,
       .flatshade_first = data->flatshade_first,
+      .emulate_flatshade_last = kk_emulates_flatshade_last(cmd, data),
       .mode = data->prim,
    };
 
@@ -1971,6 +1984,7 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                        : 0u,
       .in_el_size_B = data->index_buffer_el_size_B,
       .flatshade_first = data->flatshade_first,
+      .emulate_flatshade_last = kk_emulates_flatshade_last(cmd, data),
       .mode = data->prim,
    };
 
@@ -2226,11 +2240,9 @@ static bool
 requires_unroll_flatshade(struct kk_cmd_buffer *cmd,
                           struct kk_draw_command *data)
 {
-   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
-
    /* If the last vertex is provoking and the fragment shader uses flat inputs,
     * we need to unroll to correct the vertex order */
-   return !data->flatshade_first && fs && fs->info.fs.uses_flat_varyings;
+   return kk_emulates_flatshade_last(cmd, data);
 }
 
 static bool
