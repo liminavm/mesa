@@ -1408,6 +1408,11 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    struct poly_geometry_params params;
    poly_geometry_params_init(&params, mode, wg_size);
 
+   /* The rasterization VS carries the provoking vertex's flat outputs under
+    * the last-vertex convention (poly_gs_options::emulate_provoking_last) */
+   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   params.flat_outputs = fs ? fs->info.fs.flat_inputs : 0u;
+
    if (indirect) {
       /* The indirect setup kernel writes the draw and allocates from the
        * heap, including the index buffer */
