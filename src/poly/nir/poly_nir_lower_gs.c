@@ -798,6 +798,13 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
    nir_shader_intrinsics_pass(shader, collect_output_types, nir_metadata_all,
                               rs.outputs);
 
+   /* The rasterizer takes a whole position, however few of its components the
+    * geometry shader wrote: the dummy primitive of a shader with side effects
+    * may write only the NaN that discards it. */
+   bool writes_pos = shader->info.outputs_written & VARYING_BIT_POS;
+   if (writes_pos)
+      rs.outputs[VARYING_SLOT_POS].nr_components = 4;
+
    u_foreach_bit64(slot, shader->info.outputs_written) {
       struct lower_output_to_var_slot *output = &rs.outputs[slot];
       const char *slot_name =
@@ -820,6 +827,17 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
             glsl_vector_type(type, output->nr_components),
             ralloc_asprintf(shader, "%s-flat-selected", slot_name));
       }
+   }
+
+   /* Components the geometry shader leaves unwritten must still be defined,
+    * or a later pass narrows the position store to the ones it wrote. */
+   if (writes_pos) {
+      struct lower_output_to_var_slot *pos = &rs.outputs[VARYING_SLOT_POS];
+      nir_def *init = nir_imm_vec4(b, 0.0, 0.0, 0.0, 1.0);
+      nir_store_var(b, pos->output_var, init, 0xf);
+      nir_store_var(b, pos->selected_var, init, 0xf);
+      if (pos->flat_selected_var)
+         nir_store_var(b, pos->flat_selected_var, init, 0xf);
    }
 
    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_to_gs_rast,
