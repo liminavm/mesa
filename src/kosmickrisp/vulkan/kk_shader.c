@@ -873,6 +873,13 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i)
          mtl_release(pipe->gfx.pre_render[i]);
 
+      if (pipe->gfx.gs_count)
+         mtl_release(pipe->gfx.gs_count);
+      if (pipe->gfx.gs_pre)
+         mtl_release(pipe->gfx.gs_pre);
+      pipe->gfx.gs_count = NULL;
+      pipe->gfx.gs_pre = NULL;
+
       /* Serialization data. */
       u_foreach_bit(i, shader->info.vs.additional_stages_bits) {
          struct msl_compile_data *data = &shader->msl_data[i];
@@ -887,6 +894,10 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
 
    ralloc_free((void *)shader->gs_main.entrypoint_name);
    ralloc_free((void *)shader->gs_main.code);
+   ralloc_free((void *)shader->gs_count.entrypoint_name);
+   ralloc_free((void *)shader->gs_count.code);
+   ralloc_free((void *)shader->gs_pre.entrypoint_name);
+   ralloc_free((void *)shader->gs_pre.code);
 
    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
 }
@@ -944,8 +955,10 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
       shader->info.outputs_written = nir->info.outputs_written;
 
       /* Transform feedback is captured by VS stores (kk_nir_lower_xfb); the
-       * tessellation path drops xfb_info (unsupported there). */
-      if (nir->xfb_info && nir->info.next_stage != MESA_SHADER_TESS_CTRL) {
+       * tessellation path drops xfb_info (unsupported there), and a GS
+       * captures its own output. */
+      if (nir->xfb_info && nir->info.next_stage != MESA_SHADER_TESS_CTRL &&
+          nir->info.next_stage != MESA_SHADER_GEOMETRY) {
          shader->info.vs.has_xfb = true;
          shader->info.vs.xfb_buffers_written = nir->xfb_info->buffers_written;
          for (unsigned i = 0; i < 4; i++)
@@ -1234,6 +1247,32 @@ kk_nir_bound_gs(nir_shader *nir)
    return kk_nir_bound_invocations(nir, kk_input_primitives);
 }
 
+/* poly builds the GS programs out of variables, after msl_preprocess_nir
+ * lowered the application's; lower them the same way. */
+static void
+kk_lower_poly_vars(nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_split_array_vars, nir_var_function_temp);
+   NIR_PASS(_, nir, nir_lower_vars_to_scratch, 32,
+            glsl_get_natural_size_align_bytes, glsl_get_word_size_align_bytes);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_function_temp, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+}
+
+/* A GS program that runs as compute before the draw */
+static void
+kk_nir_make_compute(nir_shader *nir)
+{
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+   nir->xfb_info = NULL;
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
@@ -1353,14 +1392,22 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, poly_nir_lower_gs_opts, &count, &rast, &pre_gs,
                &shader->info.gs, &gs_opts);
 
-      /* Only transform feedback and pipeline statistics need these, and KK
-       * exposes neither */
-      ralloc_free(count);
-      ralloc_free(pre_gs);
+      /* Transform feedback and the primitive queries need the count program
+       * (per input primitive, when the counts are not static) and the pre-GS
+       * program (once, before the compute pass) */
+      if (count) {
+         kk_lower_poly_vars(count);
+         kk_nir_make_compute(count);
+         NIR_PASS(_, count, kk_nir_bound_gs);
+         kk_compile_msl(pdev, count, state, &shader->gs_count);
+      }
+      if (pre_gs) {
+         kk_lower_poly_vars(pre_gs);
+         kk_compile_msl(pdev, pre_gs, state, &shader->gs_pre);
+      }
 
-      nir->info.stage = MESA_SHADER_COMPUTE;
-      memset(&nir->info.cs, 0, sizeof(nir->info.cs));
-      nir->xfb_info = NULL;
+      kk_lower_poly_vars(nir);
+      kk_nir_make_compute(nir);
       NIR_PASS(_, nir, kk_nir_bound_gs);
       kk_compile_msl(pdev, nir, state, &shader->gs_main);
 
@@ -1680,6 +1727,10 @@ gather_graphics_pipeline_create_info(
 
       if (s->info.stage == MESA_SHADER_GEOMETRY) {
          kk_msl_copy(&vs->gs_main, &s->gs_main);
+         if (s->gs_count.code)
+            kk_msl_copy(&vs->gs_count, &s->gs_count);
+         if (s->gs_pre.code)
+            kk_msl_copy(&vs->gs_pre, &s->gs_pre);
          gs = s;
       }
    }
@@ -1773,6 +1824,22 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
          &pipe->gfx.pre_render[pipe->gfx.pre_render_count++]);
       if (result != VK_SUCCESS)
          return VK_ERROR_INVALID_SHADER_NV;
+
+      /* The count program runs per input primitive like the compute pass, the
+       * pre-GS program in a single thread */
+      if (vs->gs_count.code) {
+         result = kk_compile_compute_pipeline(device, &vs->gs_count,
+                                              KK_POLY_WG_SIZE,
+                                              &pipe->gfx.gs_count);
+         if (result != VK_SUCCESS)
+            return VK_ERROR_INVALID_SHADER_NV;
+      }
+      if (vs->gs_pre.code) {
+         result = kk_compile_compute_pipeline(device, &vs->gs_pre, 1u,
+                                              &pipe->gfx.gs_pre);
+         if (result != VK_SUCCESS)
+            return VK_ERROR_INVALID_SHADER_NV;
+      }
    }
 
    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
@@ -2156,8 +2223,16 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
          kk_msl_serialize(&shader->msl_data[stage], blob);
       }
    }
-   if (kk_has_gs_main(&shader->info))
+   if (kk_has_gs_main(&shader->info)) {
       kk_msl_serialize(&shader->gs_main, blob);
+      const struct msl_compile_data *optional[] = {&shader->gs_count,
+                                                   &shader->gs_pre};
+      for (uint32_t i = 0u; i < ARRAY_SIZE(optional); ++i) {
+         blob_write_uint8(blob, optional[i]->code != NULL);
+         if (optional[i]->code)
+            kk_msl_serialize(optional[i], blob);
+      }
+   }
 
    return !blob->out_of_memory;
 }
@@ -2255,6 +2330,21 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
       result = kk_msl_deserialize(blob, &shader->gs_main);
       if (result != VK_SUCCESS)
          goto fail;
+
+      struct msl_compile_data *optional[] = {&shader->gs_count,
+                                             &shader->gs_pre};
+      for (uint32_t i = 0u; i < ARRAY_SIZE(optional); ++i) {
+         uint8_t present = blob_read_uint8(blob);
+         if (blob->overrun || present > 1u) {
+            result = vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+            goto fail;
+         }
+         if (!present)
+            continue;
+         result = kk_msl_deserialize(blob, optional[i]);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
    }
 
    if (info.stage == MESA_SHADER_COMPUTE) {
