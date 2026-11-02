@@ -118,6 +118,11 @@ struct kk_per_draw_data {
    /* Address of geometry param buffer if a GS is used, else 0 */
    uint64_t geometry_params;
 
+   /* Writable scratch for the GS counters nothing reads: the statistics,
+    * primitives-generated and overflow counters of inactive queries and
+    * transform feedback */
+   uint64_t gs_sink;
+
    /* Whether the last vertex of a primitive is its provoking vertex */
    uint32_t provoking_last;
 };
@@ -237,6 +242,10 @@ struct kk_graphics_state {
       struct kk_addr_range index;
       uint32_t index_count;
       uint32_t instance_count;
+
+      /* Primitives the draw generated and wrote (uint32_t[2]) while a query
+       * is active, else 0 */
+      uint64_t counts;
    } gs;
 
    /* Transform feedback state (CPU-tracked; command replay is sequential).
@@ -263,6 +272,15 @@ struct kk_graphics_state {
       uint32_t tf_query;
       uint64_t tf_written, tf_needed;
       bool warned_indirect;
+
+      /* A GS draw counts primitives and appends captured vertices on the GPU
+       * (poly's pre-GS program). Once a session or query has seen one, its
+       * values continue in these GPU words; the CPU fields above hold only
+       * what other draws added. 0 = not on the GPU. */
+      uint64_t gpu_offsets; /* uint32_t[4] append offsets, by buffer */
+      uint64_t pg_gpu;      /* uint32_t primitives generated */
+      uint64_t tf_gpu;      /* uint32_t[2] primitives written, needed */
+      bool warned_gpu_offsets;
 
       /* The remap the draw in flight was issued with (kk_xfb_draw); mode 0
        * outside it. Mirrors the root table's xfb_remap* fields. */

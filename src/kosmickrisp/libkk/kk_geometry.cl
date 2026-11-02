@@ -63,13 +63,62 @@ libkk_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
                         uint32_t index_size_B, uint32_t index_buffer_range_el,
                         uint32_t prim, uint32_t max_indices,
                         enum poly_gs_shape shape, uint32_t vs_local_size,
-                        uint32_t gs_local_size)
+                        uint32_t gs_local_size, int is_prefix_summing)
 {
-   /* Prefix summing only serves transform feedback */
    poly_gs_setup_indirect(index_buffer, draw, vp, p, heap, vs_outputs,
                           index_size_B, index_buffer_range_el, prim,
-                          false /* is_prefix_summing */, max_indices, shape);
+                          is_prefix_summing, max_indices, shape);
 
    libkk_grid_threadgroups(vp->grid, vs_local_size);
    libkk_grid_threadgroups(p->grid, gs_local_size);
+}
+
+/* One workgroup per count word: the offsets of each input primitive's
+ * outputs, for transform feedback from a GS whose counts are not static. */
+KERNEL(1024)
+libkk_prefix_sum_geom(constant struct poly_geometry_params *p)
+{
+   local uint scratch[32];
+   poly_prefix_sum(scratch, p->count_buffer, p->input_primitives,
+                   p->count_buffer_stride / 4, cl_group_id.x, 1024);
+}
+
+/* Adds the primitives a GS draw generated and wrote (counts[0], counts[1]) to
+ * the accumulators of the queries active around it. */
+KERNEL(1)
+libkk_gs_accumulate_counts(constant uint32_t *counts,
+                           global uint32_t *generated /* nullable */,
+                           global uint32_t *written_needed /* nullable */)
+{
+   if (generated)
+      generated[0] += counts[0];
+
+   if (written_needed) {
+      written_needed[0] += counts[1];
+      written_needed[1] += counts[0];
+   }
+}
+
+/* Copies 32-bit words, for transform feedback offsets moving between a counter
+ * buffer and the GPU-tracked append offsets. */
+KERNEL(1)
+libkk_copy_u32(global uint32_t *dst, constant uint32_t *src)
+{
+   dst[cl_global_id.x] = src[cl_global_id.x];
+}
+
+/* The draw vkCmdDrawIndirectByteCountEXT makes from a counter buffer whose
+ * value only the GPU holds, because a session that captured from a GS wrote
+ * it. Laid out as a VkDrawIndirectCommand. */
+KERNEL(1)
+libkk_xfb_byte_count_draw(global uint32_t *out, constant uint32_t *counter,
+                          uint32_t counter_offset, uint32_t vertex_stride,
+                          uint32_t instance_count, uint32_t first_instance)
+{
+   uint32_t bytes = *counter;
+   out[0] =
+      bytes > counter_offset ? (bytes - counter_offset) / vertex_stride : 0;
+   out[1] = instance_count;
+   out[2] = 0;
+   out[3] = first_instance;
 }
