@@ -1387,6 +1387,111 @@ kk_gs_in_prim(struct kk_cmd_buffer *cmd)
       cmd->vk.dynamic_graphics_state.ia.primitive_topology);
 }
 
+static void
+kk_init_gs_sink(const void *data)
+{
+   struct kk_device *dev = (struct kk_device *)data;
+   const uint32_t size_B = 256u;
+
+   if (kk_alloc_bo(dev, &dev->vk.base, size_B, 0, &dev->gs_sink) !=
+       VK_SUCCESS) {
+      dev->gs_sink = NULL;
+      return;
+   }
+   memset(dev->gs_sink->cpu, 0, size_B);
+}
+
+static uint64_t
+kk_gs_sink(struct kk_cmd_buffer *cmd)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   util_call_once_data(&dev->gs_sink_once, kk_init_gs_sink, dev);
+   return dev->gs_sink ? dev->gs_sink->gpu : 0u;
+}
+
+static uint64_t
+kk_zeroed_alloc(struct kk_cmd_buffer *cmd, uint32_t size_B)
+{
+   struct kk_ptr ptr = kk_pool_alloc(cmd, size_B, 4u);
+   if (ptr.cpu)
+      memset(ptr.cpu, 0, size_B);
+   return ptr.gpu;
+}
+
+/* Moves the transform feedback session's append offsets to the GPU, where a
+ * geometry shader's pre-GS program advances them, seeded from the offsets the
+ * CPU tracked so far. */
+static uint64_t
+kk_xfb_gpu_offsets(struct kk_cmd_buffer *cmd)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->xfb.gpu_offsets)
+      return gfx->xfb.gpu_offsets;
+
+   struct kk_ptr ptr = kk_pool_alloc(cmd, 4u * sizeof(uint32_t), 4u);
+   if (unlikely(!ptr.cpu))
+      return 0u;
+
+   uint32_t *offsets = ptr.cpu;
+   for (unsigned i = 0; i < 4; i++)
+      offsets[i] = (uint32_t)gfx->xfb.buf[i].offset_B;
+
+   gfx->xfb.gpu_offsets = ptr.gpu;
+   return ptr.gpu;
+}
+
+/* Points poly's transform feedback and query counters at the session's
+ * buffers and the active queries' accumulators, or at the sink. */
+static void
+kk_geometry_params_set_counters(struct kk_cmd_buffer *cmd,
+                                struct poly_geometry_params *params)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+
+   uint64_t sink = kk_gs_sink(cmd);
+   for (unsigned i = 0; i < POLY_MAX_VERTEX_STREAMS; ++i) {
+      params->prims_generated_counter[i] = sink;
+      params->xfb_prims_generated_counter[i] = sink;
+      params->xfb_overflow[i] = sink;
+   }
+   for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS; ++i) {
+      params->xfb_offs_ptrs[i] = sink;
+      params->xfb_base_original[i] = sink;
+      params->xfb_size[i] = 0u;
+   }
+   params->xfb_any_overflow = sink;
+
+   /* Active queries get the draw's stream 0 counts, which
+    * kk_launch_gs_prerast adds to their accumulators */
+   gfx->gs.counts = 0u;
+   if (gfx->xfb.pg_pool || gfx->xfb.tf_pool) {
+      gfx->gs.counts = kk_zeroed_alloc(cmd, 2u * sizeof(uint32_t));
+      if (gfx->gs.counts) {
+         params->prims_generated_counter[0] = gfx->gs.counts;
+         params->xfb_prims_generated_counter[0] =
+            gfx->gs.counts + sizeof(uint32_t);
+      }
+   }
+
+   if (gfx->xfb.enabled && gs->info.gs.xfb) {
+      uint64_t offsets = kk_xfb_gpu_offsets(cmd);
+      for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS && offsets; ++i) {
+         if (!gfx->xfb.buf[i].gpu_base)
+            continue;
+         params->xfb_base_original[i] = gfx->xfb.buf[i].gpu_base;
+         params->xfb_size[i] = gfx->xfb.buf[i].size;
+         params->xfb_offs_ptrs[i] = offsets + i * sizeof(uint32_t);
+      }
+   }
+
+   /* Without a prefix sum, the count program accumulates one word per
+    * count */
+   params->count_buffer_stride = gs->info.gs.count_words * 4u;
+   if (!gs->info.gs.prefix_sum && params->count_buffer_stride)
+      params->count_buffer = kk_zeroed_alloc(cmd, 16u);
+}
+
 static uint64_t
 kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
                           const struct kk_draw_data *draw, bool restart)
@@ -1413,6 +1518,8 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
    params.flat_outputs = fs ? fs->info.fs.flat_inputs : 0u;
 
+   kk_geometry_params_set_counters(cmd, &params);
+
    if (indirect) {
       /* The indirect setup kernel writes the draw and allocates from the
        * heap, including the index buffer */
@@ -1424,6 +1531,11 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
 
       gfx->gs.index_count = params.draw.index_count;
       gfx->gs.instance_count = params.draw.instance_count;
+
+      /* The indirect setup kernel allocates it from the heap */
+      uint32_t counts_B = params.input_primitives * params.count_buffer_stride;
+      if (gs->info.gs.prefix_sum && counts_B)
+         params.count_buffer = kk_pool_alloc(cmd, counts_B, 4u).gpu;
 
       if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          uint32_t size_B = gfx->gs.index_count * sizeof(uint32_t);
@@ -2220,6 +2332,7 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
    if (geom) {
       gfx->per_draw_data.geometry_params =
          kk_upload_geometry_params(cmd, draw, gs_restart);
+      gfx->per_draw_data.gs_sink = kk_gs_sink(cmd);
 
       const struct vk_dynamic_graphics_state *dyn =
          &cmd->vk.dynamic_graphics_state;
@@ -2412,6 +2525,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          .shape = shape,
          .vs_local_size = KK_POLY_WG_SIZE,
          .gs_local_size = KK_POLY_WG_SIZE,
+         .is_prefix_summing = gs->info.gs.prefix_sum,
       };
 
       if (draw.index.el_size_B) {
@@ -2448,6 +2562,47 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    mtl_compute_set_pipeline_state(
       enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
    kk_dispatch_compute(enc, grid_vs, local_size);
+
+   /* Transform feedback and queries need the primitive counts first: the
+    * count program and its prefix sum when they are not static, then the
+    * pre-GS program, which counts, places each buffer's captures and advances
+    * the append offsets. */
+   if (gs->info.gs.xfb || gfx->gs.counts) {
+      if (vs->pipeline.gfx.gs_count) {
+         mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                          MTL_STAGE_DISPATCH);
+         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_count);
+         kk_dispatch_compute(enc, grid_gs, local_size);
+      }
+
+      if (gs->info.gs.prefix_sum) {
+         libkk_prefix_sum_geom(cmd,
+                               kk_grid_1d(1024u * gs->info.gs.count_words),
+                               true, geometry_params);
+         enc = cs_get_compute(cmd);
+      }
+
+      if (vs->pipeline.gfx.gs_pre) {
+         mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                          MTL_STAGE_DISPATCH);
+         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_pre);
+         kk_dispatch_compute(enc, kk_grid_1d(1u), (struct mtl_size){1, 1, 1});
+      }
+
+      if (gfx->gs.counts) {
+         if (gfx->xfb.pg_pool && !gfx->xfb.pg_gpu)
+            gfx->xfb.pg_gpu = kk_zeroed_alloc(cmd, sizeof(uint32_t));
+         if (gfx->xfb.tf_pool && !gfx->xfb.tf_gpu)
+            gfx->xfb.tf_gpu = kk_zeroed_alloc(cmd, 2u * sizeof(uint32_t));
+
+         mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                          MTL_STAGE_DISPATCH);
+         libkk_gs_accumulate_counts(cmd, kk_grid_1d(1u), true, gfx->gs.counts,
+                                    gfx->xfb.pg_pool ? gfx->xfb.pg_gpu : 0u,
+                                    gfx->xfb.tf_pool ? gfx->xfb.tf_gpu : 0u);
+         enc = cs_get_compute(cmd);
+      }
+   }
 
    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
@@ -2541,6 +2696,10 @@ kk_prims_for_vertices(enum mesa_prim mode, uint32_t count)
    }
 }
 
+/* Shadow value of a counter buffer written on the GPU, by the end of a session
+ * that captured from a geometry shader */
+#define KK_XFB_COUNTER_ON_GPU UINT64_MAX
+
 static void
 kk_xfb_counter_shadow_store(struct kk_device *dev, mtl_buffer *buffer,
                             uint64_t offset, uint64_t value)
@@ -2630,6 +2789,7 @@ kk_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
    gfx->xfb.enabled = true;
+   gfx->xfb.gpu_offsets = 0u;
    for (unsigned i = 0; i < 4; i++) {
       gfx->xfb.buf[i].offset_B = 0;
       gfx->xfb.buf[i].counter_handle = NULL;
@@ -2650,11 +2810,23 @@ kk_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
       gfx->xfb.buf[idx].counter_handle = buffer->metal.handle;
       gfx->xfb.buf[idx].counter_offset = kk_buffer_mtl_offset(buffer, off);
 
-      /* Resume from the shadowed counter value (see kk_device.h). */
+      /* Resume from the shadowed counter value (see kk_device.h). A session
+       * that captured from a geometry shader left its value on the GPU only:
+       * resume with the offsets there. */
       uint64_t value;
       if (kk_xfb_counter_shadow_load(dev, buffer->metal.handle,
-                                     kk_buffer_mtl_offset(buffer, off), &value))
-         gfx->xfb.buf[idx].offset_B = value;
+                                     kk_buffer_mtl_offset(buffer, off),
+                                     &value)) {
+         if (value == KK_XFB_COUNTER_ON_GPU) {
+            uint64_t offsets = kk_xfb_gpu_offsets(cmd);
+            if (offsets)
+               libkk_copy_u32(cmd, kk_grid_1d(1u), true,
+                              offsets + idx * sizeof(uint32_t),
+                              kk_buffer_addr_range(buffer, off, 4u).addr);
+         } else {
+            gfx->xfb.buf[idx].offset_B = value;
+         }
+      }
       if (kk_limina_rtlog())
          fprintf(stderr, "[LIMINA-KK-XFB] Begin buf%u counter=%p+%llu resume=%llu\n",
                  idx, (void *)buffer->metal.handle, (unsigned long long)off,
@@ -2688,6 +2860,15 @@ kk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
          continue;
 
       uint64_t off = pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0;
+      if (gfx->xfb.gpu_offsets) {
+         libkk_copy_u32(cmd, kk_grid_1d(1u), true,
+                        kk_buffer_addr_range(buffer, off, 4u).addr,
+                        gfx->xfb.gpu_offsets + idx * sizeof(uint32_t));
+         kk_xfb_counter_shadow_store(dev, buffer->metal.handle,
+                                     kk_buffer_mtl_offset(buffer, off),
+                                     KK_XFB_COUNTER_ON_GPU);
+         continue;
+      }
       kk_xfb_counter_shadow_store(dev, buffer->metal.handle,
                                   kk_buffer_mtl_offset(buffer, off),
                                   gfx->xfb.buf[idx].offset_B);
@@ -2698,10 +2879,13 @@ kk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
    }
 
    gfx->xfb.enabled = false;
+   gfx->xfb.gpu_offsets = 0u;
    gfx->descriptors.root.draw.xfb_active_mask = 0;
    gfx->descriptors.root.draw.xfb_remap = 0;
    gfx->descriptors.root_dirty = true;
 }
+
+static void kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data);
 
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
@@ -2721,6 +2905,37 @@ kk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
       vk_logw(VK_LOG_OBJS(&cmd->vk.base),
               "DrawIndirectByteCount: counter buffer value unknown, "
               "skipping draw");
+      return;
+   }
+
+   /* Only the GPU knows how much a geometry shader captured: build the draw
+    * there and issue it indirectly. */
+   if (counter == KK_XFB_COUNTER_ON_GPU) {
+      struct kk_ptr args =
+         kk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4u);
+      if (unlikely(!args.gpu))
+         return;
+      libkk_xfb_byte_count_draw(
+         cmd, kk_grid_1d(1u), true, args.gpu,
+         kk_buffer_addr_range(buffer, counterBufferOffset, 4u).addr,
+         counterOffset, vertexStride, instanceCount, firstInstance);
+
+      const struct vk_dynamic_graphics_state *dyn =
+         &cmd->vk.dynamic_graphics_state;
+      struct kk_draw_command data = {
+         .prim = vk_topology_to_mesa(dyn->ia.primitive_topology),
+         .upload_mask = build_per_draw_upload_mask(cmd),
+         .indirect = true,
+         .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
+         .predicate_op[0] = cmd->state.cond_render.inverted
+                               ? KK_PREDICATE_EQ_ZERO
+                               : KK_PREDICATE_NEQ_ZERO,
+         .draw_count = 1u,
+         .predicate_addr[0] = cmd->state.cond_render.address,
+         .indirect_command.addr = args.gpu,
+         .indirect_command.stride = sizeof(VkDrawIndirectCommand),
+      };
+      kk_draw(cmd, &data);
       return;
    }
 
@@ -2775,6 +2990,18 @@ kk_xfb_pre_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
 
    bool capturable = gfx->xfb.remap.mode && vs && vs->info.vs.has_xfb &&
                      !data->indirect && !data->indexed;
+
+   /* After a geometry shader draw in the same session, the append offsets
+    * are only known to the GPU. */
+   if (capturable && gfx->xfb.gpu_offsets) {
+      if (!gfx->xfb.warned_gpu_offsets) {
+         vk_logw(VK_LOG_OBJS(&cmd->vk.base),
+                 "transform feedback capture skipped: the session already "
+                 "captured from a geometry shader");
+         gfx->xfb.warned_gpu_offsets = true;
+      }
+      capturable = false;
+   }
 
    if (!capturable) {
       if (!gfx->xfb.warned_indirect && gfx->xfb.enabled && data->indirect) {
@@ -2901,8 +3128,11 @@ kk_draw_impl(struct kk_cmd_buffer *cmd, struct kk_draw_command *data, bool fan_s
       return;
 
    bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   /* A geometry shader draw counts and captures on the GPU
+    * (kk_launch_gs_prerast) */
    bool xfb_track =
-      unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool);
+      unlikely(cmd->state.gfx.xfb.enabled || cmd->state.gfx.xfb.pg_pool) &&
+      !cmd->state.shaders[MESA_SHADER_GEOMETRY];
 
    /* Unroll geometry. Skip draw if we fail. The unroll turns the draw
     * indirect, so count its primitives for the queries first. */
