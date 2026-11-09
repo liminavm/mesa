@@ -584,8 +584,15 @@ vn_physical_device_sanitize_properties(struct vn_physical_device *physical_dev)
    props->driverID = VK_DRIVER_ID_MESA_VENUS;
 
    snprintf(props->driverName, sizeof(props->driverName), "venus");
+#ifdef LIMINA_VENDOR
+   /* Marks limina's vendor build, which installs beside the system's venus: its Vulkan layer
+    * hides the system's device by this. */
+   snprintf(props->driverInfo, sizeof(props->driverInfo),
+            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " (limina)");
+#else
    snprintf(props->driverInfo, sizeof(props->driverInfo),
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+#endif
 
    props->conformanceVersion.major = 1;
    props->conformanceVersion.minor = 4;
@@ -1397,7 +1404,13 @@ vn_physical_device_get_passthrough_extensions(
       .EXT_legacy_vertex_attributes = true,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
+#ifdef LIMINA_VENDOR
+      /* limina's host answers the budget query from its own ledger, the cap a guest is held to,
+       * not a passthrough of the GPU's heap: worth the round trip, so on by default. */
+      .EXT_memory_budget = true,
+#else
       .EXT_memory_budget = VN_DEBUG(MEM_BUDGET),
+#endif
       .EXT_mesh_shader = true,
       .EXT_multi_draw = true,
       .EXT_multisampled_render_to_single_sampled = true,

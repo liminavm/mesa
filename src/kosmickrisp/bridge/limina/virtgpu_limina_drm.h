@@ -25,6 +25,7 @@ extern "C" {
 #define DRM_VIRTGPU_LIMINA_FENCE         0x26
 #define DRM_VIRTGPU_LIMINA_SURFACE_CREATE 0x27
 #define DRM_VIRTGPU_LIMINA_SURFACE_IMPORT 0x28
+#define DRM_VIRTGPU_LIMINA_INFO          0x29
 
 /* Arena ids are below this. */
 #define VIRTGPU_LIMINA_MAX_ARENAS 4096
@@ -79,10 +80,14 @@ struct drm_virtgpu_limina_arena_import {
 };
 
 /*
- * A fence that signals once this context's ring has completed commit `seqno` (or the context is
- * gone). It is added, as a write, to the reservation of each GEM object in `handles` (implicit
- * sync for whoever reads them as dma-bufs), and with VIRTGPU_LIMINA_FENCE_FD it is returned as a
- * sync_file too. Fences of one context signal in the order they were made.
+ * A fence that signals once the u64 at offset `completed_at` of the ring's arena reaches `seqno`
+ * (or the context is gone): a queue's completed value, or with `completed_at` 0 the ring's own.
+ * A nonzero `completed_at` must be 8-aligned and inside the ring's arena, and a fence whose
+ * value is already reached signals at once. A context can fence at most 63 distinct nonzero
+ * `completed_at`s (ENOSPC after). It is added, as a write, to the reservation of each
+ * GEM object in `handles` (implicit sync for whoever reads them as dma-bufs), and with
+ * VIRTGPU_LIMINA_FENCE_FD it is returned as a sync_file too. Fences on one `completed_at` signal
+ * in the order they were made.
  */
 #define VIRTGPU_LIMINA_FENCE_FD 1
 
@@ -92,7 +97,7 @@ struct drm_virtgpu_limina_fence {
 	__u32 num_handles;
 	__u32 flags;		/* VIRTGPU_LIMINA_FENCE_* */
 	__s32 fence_fd;		/* out, with VIRTGPU_LIMINA_FENCE_FD */
-	__u32 pad;
+	__u32 completed_at;
 };
 
 /*
@@ -124,6 +129,15 @@ struct drm_virtgpu_limina_surface_import {
 	__u32 drm_fourcc;	/* out */
 	__u32 stride;		/* out */
 	__u32 res_handle;	/* out */
+};
+
+/*
+ * What the host speaks, without creating a context: a driver declines a host whose protocol it
+ * does not speak before it costs the host anything. ENODEV without the extension.
+ */
+struct drm_virtgpu_limina_info {
+	__u32 wire_version;	/* out: the protocol a context's ring speaks */
+	__u32 flags;		/* out: none defined yet */
 };
 
 /* Starts the host consuming the command ring userspace initialised in an arena. */
@@ -160,6 +174,9 @@ struct drm_virtgpu_limina_ring_attach {
 #define DRM_IOCTL_VIRTGPU_LIMINA_SURFACE_IMPORT \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_LIMINA_SURFACE_IMPORT, \
 		 struct drm_virtgpu_limina_surface_import)
+#define DRM_IOCTL_VIRTGPU_LIMINA_INFO \
+	DRM_IOR(DRM_COMMAND_BASE + DRM_VIRTGPU_LIMINA_INFO, \
+		struct drm_virtgpu_limina_info)
 
 #if defined(__cplusplus)
 }
