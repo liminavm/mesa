@@ -88,14 +88,18 @@ kk_files = files(
   'kk_image.c',
   'kk_instance.h',
   'kk_instance.c',
+  'kk_limina_work.h',
+  'kk_limina_work.c',
   'kk_nir_lower_custom_border.c',
   'kk_nir_lower_descriptors.c',
   'kk_nir_lower_image_view_min_lod.c',
+  'kk_nir_lower_texel_buffer_rgb32.c',
   'kk_nir_lower_multiview.c',
   'kk_nir_lower_null_images.c',
   'kk_nir_lower_textures.c',
   'kk_nir_lower_vbo.h',
   'kk_nir_lower_vbo.c',
+  'kk_nir_lower_xfb.c',
   'kk_physical_device.h',
   'kk_physical_device.c',
   'kk_query_pool.h',
@@ -158,12 +162,21 @@ libkk = static_library(
   gnu_symbol_visibility : 'hidden',
 )
 
-# Happens with macOS ld linker:
-# "-Wl,-undefined,dynamic_lookup" required, otherwise, linker will complain about undefined symbols
+kk_link_args = [ld_args_build_id]
+if host_machine.system() == 'darwin'
+  # Happens with macOS ld linker:
+  # "-Wl,-undefined,dynamic_lookup" required, otherwise, linker will complain about undefined
+  # symbols.
+  # limina: IOSurface for the IOSurfaceRef import path (mtl_device.m); explicit
+  # because -undefined,dynamic_lookup would otherwise defer a missing framework
+  # to runtime.
+  kk_link_args += ['-Wl,-undefined,dynamic_lookup', '-Wl,-framework,IOSurface']
+endif
+
 libvulkan_kosmickrisp = shared_library(
   'vulkan_kosmickrisp',
   link_whole: [libkk],
-  link_args: [ld_args_build_id, '-Wl,-undefined,dynamic_lookup'],
+  link_args: kk_link_args,
   gnu_symbol_visibility : 'hidden',
   install : true,
 )

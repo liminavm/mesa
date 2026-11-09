@@ -10,6 +10,13 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#include "vk_sync_binary.h"
+
+#if !DETECT_OS_APPLE
+#include <errno.h>
+#include <poll.h>
+#endif
+
 static VkResult
 kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
                  uint64_t initial_value)
@@ -81,6 +88,48 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
 
    return completed != 0 ? VK_SUCCESS : VK_TIMEOUT;
 }
+
+#if !DETECT_OS_APPLE
+VkResult
+kk_binary_export_sync_file(struct vk_device *device, struct vk_sync *sync, int *pFd)
+{
+   struct vk_sync_binary *binary = container_of(sync, struct vk_sync_binary, sync);
+   struct kk_sync_timeline *timeline =
+      container_of(&binary->timeline, struct kk_sync_timeline, base);
+
+   /* The runtime has waited for the signal to be submitted (WAIT_PENDING). */
+   int fd = mtl_shared_event_export_sync_file(timeline->mtl_handle, binary->next_point);
+   if (fd >= 0) {
+      *pFd = fd;
+      return VK_SUCCESS;
+   }
+   VkResult result = vk_sync_wait(device, &binary->timeline, binary->next_point, 0,
+                                  OS_TIMEOUT_INFINITE);
+   /* Reached now, so the bridge's answer is a signaled fence: a real fd, which consumers like the
+    * window system pass on to a dma-buf, where -1 is refused. */
+   *pFd = result == VK_SUCCESS
+             ? mtl_shared_event_export_sync_file(timeline->mtl_handle, binary->next_point)
+             : -1;
+   return result;
+}
+
+/* A queue cannot wait on a guest fence yet, so the fence is waited for here, on the CPU, and the
+ * binary is signaled once it has passed. */
+VkResult
+kk_binary_import_sync_file(struct vk_device *device, struct vk_sync *sync, int fd)
+{
+   struct vk_sync_binary *binary = container_of(sync, struct vk_sync_binary, sync);
+   struct pollfd p = {.fd = fd, .events = POLLIN};
+   int r;
+   do {
+      r = poll(&p, 1, -1);
+   } while (r < 0 && (errno == EINTR || errno == EAGAIN));
+   if (r < 0 || (p.revents & (POLLERR | POLLNVAL)))
+      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   binary->next_point++;
+   return vk_sync_signal(device, &binary->timeline, binary->next_point);
+}
+#endif
 
 const struct vk_sync_type kk_sync_type = {
    .size = sizeof(struct kk_sync_timeline),

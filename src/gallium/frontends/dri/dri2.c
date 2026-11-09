@@ -30,6 +30,9 @@
 
 #include "util/libdrm.h"
 #include "git_sha1.h"
+#ifdef __APPLE__
+#include <IOSurface/IOSurfaceRef.h>
+#endif
 #include "GL/mesa_glinterop.h"
 #include "mesa_interface.h"
 #include "util/disk_cache.h"
@@ -791,6 +794,129 @@ dri_create_image_from_winsys(struct dri_screen *screen,
 
    return img;
 }
+
+#ifdef __APPLE__
+/* limina: create a DRIimage whose pipe resource adopts an IOSurface (zink →
+ * KK MTLTEXTURE metal-handle import). Reached via the EGL_IOSURFACE_LIMINA
+ * EGLImage target — the door virglrenderer's vrend uses to composite a venus
+ * client's window buffer. BGRA/RGBA 8-bit only, matching what the venus
+ * scanout exporter allocates. */
+PUBLIC struct dri_image *
+dri2_from_iosurface_limina(struct dri_screen *screen, void *iosurface,
+                           unsigned plane, enum pipe_format plane_format,
+                           void *loaderPrivate)
+{
+   struct pipe_screen *pscreen = screen->base.screen;
+   struct dri_image *img;
+   struct pipe_resource templ;
+   struct winsys_handle whandle;
+   enum pipe_format pf;
+   unsigned width, height;
+
+   if (!pscreen->resource_from_handle) {
+      mesa_loge("dri2_from_iosurface_limina: driver has no resource_from_handle");
+      return NULL;
+   }
+
+   if (plane_format != PIPE_FORMAT_NONE) {
+      /* Caller named the plane and its format. Do NOT consult the surface's
+       * own pixel format: a biplanar decode target reports '420v'/'420f',
+       * which describes the pair and matches neither plane's texture format.
+       * Geometry is per-plane for the same reason. */
+      if (plane >= IOSurfaceGetPlaneCount((IOSurfaceRef)iosurface)) {
+         mesa_loge("dri2_from_iosurface_limina: plane %u of a %zu-plane "
+                   "surface", plane,
+                   IOSurfaceGetPlaneCount((IOSurfaceRef)iosurface));
+         return NULL;
+      }
+      pf = plane_format;
+      width = IOSurfaceGetWidthOfPlane((IOSurfaceRef)iosurface, plane);
+      height = IOSurfaceGetHeightOfPlane((IOSurfaceRef)iosurface, plane);
+   } else {
+      const uint32_t osfmt = IOSurfaceGetPixelFormat((IOSurfaceRef)iosurface);
+      switch (osfmt) {
+      case 0x42475241: /* 'BGRA' */
+         pf = PIPE_FORMAT_B8G8R8A8_UNORM;
+         break;
+      case 0x52474241: /* 'RGBA' */
+         pf = PIPE_FORMAT_R8G8B8A8_UNORM;
+         break;
+      /* One plane of a picture a guest's video decoder shares plane by plane. */
+      case 0x4c303038: /* 'L008' */
+         pf = PIPE_FORMAT_R8_UNORM;
+         break;
+      case 0x32433038: /* '2C08' */
+         pf = PIPE_FORMAT_R8G8_UNORM;
+         break;
+      default:
+         mesa_loge("dri2_from_iosurface_limina: unhandled IOSurface pixel format "
+                   "0x%08x", osfmt);
+         return NULL;
+      }
+      plane = 0;
+      width = IOSurfaceGetWidth((IOSurfaceRef)iosurface);
+      height = IOSurfaceGetHeight((IOSurfaceRef)iosurface);
+   }
+
+   memset(&whandle, 0, sizeof(whandle));
+   whandle.type = WINSYS_HANDLE_TYPE_IOSURFACE_LIMINA;
+   whandle.com_obj = iosurface;
+   whandle.modifier = DRM_FORMAT_MOD_INVALID;
+   whandle.format = pf;
+   whandle.plane = plane;
+
+   memset(&templ, 0, sizeof(templ));
+   templ.target = screen->target;
+   templ.format = pf;
+   templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+   templ.last_level = 0;
+   templ.depth0 = 1;
+   templ.array_size = 1;
+   templ.width0 = width;
+   templ.height0 = height;
+
+   img = CALLOC_STRUCT(dri_image);
+   if (!img)
+      return NULL;
+
+   img->texture = pscreen->resource_from_handle(
+      pscreen, &templ, &whandle, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   if (!img->texture) {
+      mesa_loge("dri2_from_iosurface_limina: resource_from_handle refused "
+                "%ux%u %s", (unsigned)templ.width0, (unsigned)templ.height0,
+                util_format_name(pf));
+      FREE(img);
+      return NULL;
+   }
+
+   img->level = 0;
+   img->layer = 0;
+   img->use = 0;
+   img->in_fence_fd = -1;
+   img->loader_private = loaderPrivate;
+   img->screen = screen;
+   /* A texture over an image with no internal format is typed RGB or RGBA, which GLES will not
+    * upload one or two channels into: name the sized format a one- or two-channel plane is. */
+   switch (pf) {
+   case PIPE_FORMAT_R8_UNORM:
+      img->internal_format = GL_R8;
+      break;
+   case PIPE_FORMAT_R8G8_UNORM:
+      img->internal_format = GL_RG8;
+      break;
+   case PIPE_FORMAT_R16_UNORM:
+      img->internal_format = GL_R16;
+      break;
+   case PIPE_FORMAT_R16G16_UNORM:
+      img->internal_format = GL_RG16;
+      break;
+   default:
+      break;
+   }
+
+   return img;
+}
+#endif /* __APPLE__ */
 
 static unsigned
 dri2_get_modifier_num_planes(struct dri_screen *screen,

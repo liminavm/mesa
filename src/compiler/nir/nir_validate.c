@@ -1059,6 +1059,10 @@ validate_tex_src_texture_deref(nir_tex_instr *instr, validate_state *state,
       validate_assert(state, instr->dest_type == nir_type_float16 ||
                                 instr->dest_type == nir_type_uint16);
       break;
+   case nir_texop_texel_buffer_flags_kk:
+      validate_assert(state, instr->sampler_dim == GLSL_SAMPLER_DIM_BUF);
+      validate_assert(state, instr->dest_type == nir_type_uint32);
+      break;
    case nir_texop_samples_identical:
    case nir_texop_has_custom_border_color_agx:
       validate_assert(state, nir_alu_type_get_base_type(instr->dest_type) == nir_type_bool);

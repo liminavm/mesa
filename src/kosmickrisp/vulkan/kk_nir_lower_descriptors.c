@@ -521,6 +521,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       return true;
    }
 
+   if (tex->op == nir_texop_texel_buffer_flags_kk) {
+      unsigned offs = offsetof(struct kk_texel_buffer_descriptor, flags);
+
+      nir_def *flags = load_resource_deref_desc(
+         b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)), offs, ctx);
+
+      nir_def_replace(&tex->def, flags);
+      return true;
+   }
+
    if (tex->op == nir_texop_has_custom_border_color_agx) {
       unsigned offs = offsetof(struct kk_sampled_image_descriptor,
                                clamp_0_sampler_index_or_negative);
@@ -825,6 +835,20 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       return lower_sysval_to_per_draw(b, intrin, geometry_params);
    case nir_intrinsic_load_provoking_last:
       return lower_sysval_to_per_draw(b, intrin, provoking_last);
+   case nir_intrinsic_load_stat_query_address_poly:
+      /* KK has no pipeline statistics queries */
+      return lower_sysval_to_per_draw(b, intrin, gs_sink);
+   case nir_intrinsic_load_rasterization_stream:
+      /* Only stream 0 is rasterized (no rasterizationStreamSelect) */
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def_rewrite_uses(&intrin->def,
+                           nir_imm_intN_t(b, 0, intrin->def.bit_size));
+      return true;
+   case nir_intrinsic_ro_to_rw_poly:
+      /* Every counter the driver hands poly points at writable memory
+       * (kk_upload_geometry_params) */
+      nir_def_replace(&intrin->def, intrin->src[0].ssa);
+      return true;
    case nir_intrinsic_load_index_size_poly:
       return lower_sysval_to_per_draw(b, intrin, index_size);
    case nir_intrinsic_load_first_vertex:

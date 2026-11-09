@@ -15,7 +15,14 @@ fun:lp_fence_signal
 # Keeping track of tc->last_completed is an optimization and it is of no
 # consequence to read a stale value there, so surpress the warning about the
 # race condition
-fun:tc_batch_execute
+#
+# limina: DISABLED. This suppresses every race inside tc_batch_execute, not
+# just the last_completed one -- and tc_batch_execute is where our gpu-worker
+# thread executes deferred draws when a fence forces a tc sync, which is the
+# frame the notification-text crash faulted in. Blanket-suppressing the one
+# function we need to see defeats the purpose of the build. Restore it before
+# using this tree to chase an unrelated race.
+# fun:tc_batch_execute
 
 # This is a debug feature and ATM it is simpler to surpress the race warning
 fun:tc_set_driver_thread
@@ -24,3 +31,8 @@ fun:tc_set_driver_thread
 # Even with the data race the returned value is always the same
 fun:get_max_abs_timeout_ns
 
+
+# limina: Apple clang 21 cannot assemble this file with -fsanitize=thread
+# ("error: invalid CFI advance_loc expression"). It is a straight-line SIMD
+# memcpy with no threading in it, so excluding it costs no race coverage.
+src:*streaming-load-memcpy.c

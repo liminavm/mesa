@@ -41,6 +41,30 @@ mtl_device_get_gpu_apple_family(mtl_device *dev)
    return 0u;
 }
 
+bool
+mtl_pixel_format_is_shareable(enum mtl_pixel_format format)
+{
+   return false;
+}
+
+bool
+mtl_device_supports_shareable_textures(mtl_device *dev)
+{
+   return false;
+}
+
+bool
+mtl_device_supports_timestamps(mtl_device *dev)
+{
+   return false;
+}
+
+bool
+mtl_device_get_drm_render_node(mtl_device *dev, int64_t *major, int64_t *minor)
+{
+   return false;
+}
+
 uint64_t
 mtl_device_get_registry_id(mtl_device *dev)
 {

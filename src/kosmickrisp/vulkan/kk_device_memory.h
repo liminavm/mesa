@@ -26,7 +26,14 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
 
 extern const VkExternalMemoryProperties kk_mtlheap_mem_props;
+extern const VkExternalMemoryProperties kk_mtltexture_mem_props;
 extern const VkExternalMemoryProperties kk_host_mem_props;
+extern const VkExternalMemoryProperties kk_fd_mem_props;
+
+/* The fd handle types: a dma-buf either way, as the bridge shares heaps through DRM. */
+#define KK_FD_HANDLE_TYPES                                                                       \
+   (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |                                               \
+    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
 
 void kk_device_memory_set_label(struct kk_device_memory *dev_mem,
                                 const char *label);

@@ -22,6 +22,7 @@
  */
 
 #include "zink_batch.h"
+#include "util/u_atomic.h"
 #include "zink_clear.h"
 #include "zink_context.h"
 #include "zink_format.h"
@@ -108,7 +109,7 @@ clear_in_rp(struct pipe_context *pctx,
    cr.layerCount = util_framebuffer_get_num_layers(fb);
    assert(ctx->in_rp);
    VKCTX(CmdClearAttachments)(ctx->bs->cmdbuf, num_attachments, attachments, 1, &cr);
-   ctx->bs->has_work = true;
+   p_atomic_set(&ctx->bs->has_work, true);
    /*
        Rendering within a subpass containing a feedback loop creates a data race, except in the following
        cases:
@@ -530,8 +531,10 @@ zink_clear_texture_dynamic(struct pipe_context *pctx,
       if (res->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)
          info.pStencilAttachment = &att;
    }
-   if (needs_rp)
+   if (needs_rp) {
       VKCTX(CmdBeginRendering)(cmdbuf, &info);
+      zink_limina_rp_count(ctx, ZINK_LIMINA_RP_BEGIN, ZINK_LIMINA_SITE);
+   }
    if (!full_clear || !needs_rp) {
       VkClearRect rect;
       rect.rect = info.renderArea;
@@ -548,8 +551,10 @@ zink_clear_texture_dynamic(struct pipe_context *pctx,
 
       VKCTX(CmdClearAttachments)(cmdbuf, 1, &clear_att, 1, &rect);
    }
-   if (needs_rp)
+   if (needs_rp) {
       VKCTX(CmdEndRendering)(cmdbuf);
+      zink_limina_rp_count(ctx, ZINK_LIMINA_RP_END, ZINK_LIMINA_SITE);
+   }
 }
 
 void

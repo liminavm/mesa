@@ -8,6 +8,7 @@
 #ifndef KK_SHADER_H
 #define KK_SHADER_H 1
 
+#include <stdio.h>
 #include "kk_device_memory.h"
 #include "kk_private.h"
 
@@ -57,6 +58,15 @@ struct kk_shader_info {
    /* Outputs a VS, or a TES followed by a GS, writes for the next stage */
    uint64_t outputs_written;
 
+   /* limina: upper bound (bytes) on the root-descriptor-table prefix this
+    * shader can address — offsetof(sets) + set_layout_count * 8 when the
+    * pipeline layout has no dynamic descriptors (nothing past sets[] is
+    * addressable then), full table size otherwise. 0 = unknown (compiled
+    * without layout info) -> upload the full table. Consumed by
+    * kk_upload_descriptor_root to skip the dynamic_buffers tail (~half the
+    * table) on the per-draw upload. */
+   uint16_t root_used_size;
+
    union {
       /* Vertex shader is the pipeline, store all relevant data here. */
       struct {
@@ -90,6 +100,11 @@ struct kk_shader_info {
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
+
+         /* Transform feedback (capture lowered to VS global stores). */
+         bool has_xfb;
+         uint8_t xfb_buffers_written; /* mask */
+         uint16_t xfb_stride_B[4];    /* per-buffer stride in bytes */
       } vs;
 
       struct {
@@ -105,6 +120,8 @@ struct kk_shader_info {
 
       struct {
          bool uses_flat_varyings;
+         /* Varying slots read flat */
+         uint64_t flat_inputs;
       } fs;
 
       struct {
@@ -125,6 +142,10 @@ struct kk_pipeline_handles {
          /* VS, TCS, TES and the GS compute pass at most run before the render
           * pipeline. */
          mtl_compute_pipeline_state *pre_render[4];
+         /* The GS's count and pre-GS programs, which transform feedback and
+          * queries run around its compute pass; NULL if poly made none */
+         mtl_compute_pipeline_state *gs_count;
+         mtl_compute_pipeline_state *gs_pre;
          mtl_depth_stencil_state *ds_handle;
          uint32_t pre_render_count;
       } gfx;
@@ -146,6 +167,9 @@ struct kk_shader {
    /* Compute pass of a GS. Its rasterization VS is in
     * msl_data[MESA_SHADER_GEOMETRY]. */
    struct msl_compile_data gs_main;
+   /* The GS's count and pre-GS programs; code is NULL if poly made none */
+   struct msl_compile_data gs_count;
+   struct msl_compile_data gs_pre;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
@@ -153,9 +177,43 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
 
+/* limina A/B sizing knob: LIMINA_KK_NOROBUST=1 drops ALL robust-access lowering
+ * (bounded UBO/SSBO loads, vertex-attrib clamps). NOT spec-conformant — for
+ * measuring the cost of per-scalar bounds checks only. */
+static inline bool
+kk_limina_norobust(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("LIMINA_KK_NOROBUST") != NULL;
+   return v;
+}
+
+/* limina A/B lever, LIMINA_KK_FORCE_ROBUST=1: clamp every vertex-attribute fetch to its bound
+ * buffer range whatever the pipeline asked for. The device-loss faults on this stack are scattered
+ * *read* faults across the whole GPU address space, which is what an out-of-range fetch looks
+ * like -- an index scaling into an arbitrary address -- rather than a stale pointer. Clamping
+ * discriminates "an out-of-range fetch" from "a bad pointer" without needing to know what
+ * produced the index. It is a diagnostic: it hides the symptom rather than fixing the cause, and
+ * it costs a bounds check per attribute read. */
+static inline bool
+kk_limina_force_robust(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_KK_FORCE_ROBUST");
+      v = e && e[0] && e[0] != '0';
+      if (v)
+         fprintf(stderr, "[LIMINA] KK vertex fetch FORCED ROBUST (LIMINA_KK_FORCE_ROBUST)\n");
+   }
+   return v != 0;
+}
+
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
 {
+   if (kk_limina_norobust())
+      return nir_address_format_64bit_global_32bit_offset;
    switch (robustness) {
    case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED:
       return nir_address_format_64bit_global_32bit_offset;
@@ -176,6 +234,18 @@ kk_nir_lower_descriptors(nir_shader *nir,
 /* KK_WORKAROUND_18 */
 bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 
+/* kk_root_descriptor_table::draw.xfb_remap: the original draw's topology
+ * (enum mesa_prim, POINTS..TRIANGLE_FAN) in the low bits, its index size in
+ * bytes (0 = non-indexed), and whether the last vertex provokes. */
+#define KK_XFB_REMAP_ON            (1u << 31)
+#define KK_XFB_REMAP_PRIM_MASK     0xfu
+#define KK_XFB_REMAP_INDEX_SHIFT   4
+#define KK_XFB_REMAP_INDEX_MASK    (0x7u << KK_XFB_REMAP_INDEX_SHIFT)
+#define KK_XFB_REMAP_PROVOKE_LAST  (1u << 8)
+
+bool
+kk_nir_lower_xfb(nir_shader *nir);
+
 bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
@@ -189,6 +259,7 @@ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
 
 bool kk_nir_lower_custom_border(nir_shader *nir);
 bool kk_nir_lower_image_view_min_lod(nir_shader *nir);
+bool kk_nir_lower_texel_buffer_rgb32(nir_shader *nir);
 
 VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
                                const VkAllocationCallbacks *alloc,
@@ -196,5 +267,7 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
 
 void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
                                 struct kk_shader *shader);
+
+uint64_t kk_limina_msl_hash(const struct kk_shader *sh);
 
 #endif /* KK_SHADER_H */
